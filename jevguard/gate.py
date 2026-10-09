@@ -44,6 +44,27 @@ _LONG_URL = 300  # a fetch can carry data out in its address
 _UNREADABLE = "could not be read as a command, so what it does cannot be ruled out"
 
 
+# Programs that only read what they are pointed at. They matter for one question: a command that
+# names a directory above the guard's files (`ls ~`, `du -sh ~/.claude`) is not a change to them.
+_READ_ONLY = {"ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag", "du", "df", "stat",
+              "file", "wc", "tree", "pwd", "cd", "pushd", "echo", "printf", "test", "[", "realpath", "readlink",
+              "basename", "dirname", "sort", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "jq", "cut",
+              "tr", "nl", "od", "strings", "which", "type", "true", "false", "date", "id", "whoami",
+              "hostname", "uname", "ps"}  # not uniq or xxd: their second file argument is written
+_FIND_ACTS = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
+_SETTINGS_NAMES = ("settings.json", "settings.local.json")
+
+
+def _reads_only(argv: list[str]) -> bool:
+    program = os.path.basename(argv[0])
+    if program == "find":
+        return not _FIND_ACTS & set(argv)
+    if program == "sed":
+        return not any(a == "--in-place" or a.startswith("--in-place=") or
+                       (a.startswith("-") and not a.startswith("--") and "i" in a) for a in argv[1:])
+    return program in _READ_ONLY
+
+
 def _method(value: str) -> bool:
     return bool(value) and value.upper() not in _SAFE_METHODS
 
@@ -88,6 +109,23 @@ def _git_subcommand(args: list[str]) -> str:
     return ""
 
 
+def _git_config_writes(args: list[str]) -> bool:
+    rest = args[args.index("config") + 1:]
+    if {"--add", "--replace-all", "--unset", "--unset-all", "--rename-section", "--remove-section", "--edit", "-e"} & set(rest):
+        return True
+    if any(a in ("--list", "-l") or a.startswith("--get") for a in rest):
+        return False
+    names, skip = 0, False
+    for a in rest:
+        if skip:
+            skip = False
+        elif a in ("-f", "--file", "--type", "--default", "--blob"):
+            skip = True
+        elif not a.startswith("-"):
+            names += 1
+    return names >= 2  # a name and a value
+
+
 def _gh_changes(args: list[str]) -> bool:
     words = [a for a in args if not a.startswith("-")]
     if not words:
@@ -110,6 +148,8 @@ def _gh_changes(args: list[str]) -> bool:
 
 
 _HTTP_CLIENTS = {"curl", "wget", "xh", "http", "https", "httpie", "aria2c"}
+_RISK_PROGRAMS = _HTTP_CLIENTS | _CONNECT | _MAIL | {"git", "gh", "rsync", "himalaya", "npm", "pnpm", "yarn", "cargo",
+                                                     "twine", "docker", "crontab", "systemctl"}
 
 
 def _program_risk(argv: list[str]) -> str:
@@ -129,6 +169,8 @@ def _program_risk(argv: list[str]) -> str:
             return "fetches a very long address, which can carry data out"
     if program == "git" and _git_subcommand(args) == "push":
         return "git push"
+    if program == "git" and _git_subcommand(args) == "config" and _git_config_writes(args):
+        return "changes git configuration, which can make git run commands later"
     if program == "gh" and _gh_changes(args):
         return "changes something on GitHub"
     if program in _CONNECT or (program == "rsync" and any(":" in a for a in args if not a.startswith("-"))):
@@ -153,6 +195,10 @@ def risky(tool: str, tool_input: dict, cwd: str = "") -> str:
             return _UNREADABLE
         for argv in c.programs:
             why = _program_risk(argv)
+            if not why and not _reads_only(argv):
+                # proxychains curl ..., strace -f git push ...: the program that counts is further in
+                why = next((w for i in range(1, len(argv)) if os.path.basename(argv[i]) in _RISK_PROGRAMS
+                            for w in [_program_risk(argv[i:])] if w), "")
             if why:
                 return why
         if any(_STARTUP.search(p) for p in c.paths):
@@ -168,27 +214,6 @@ def risky(tool: str, tool_input: dict, cwd: str = "") -> str:
         name = tool.rsplit("__", 1)[-1]
         return "MCP tool that changes or sends something" if _MCP_WRITE.search(name) else ""
     return ""
-
-
-# Programs that only read what they are pointed at. They matter for one question: a command that
-# names a directory above the guard's files (`ls ~`, `du -sh ~/.claude`) is not a change to them.
-_READ_ONLY = {"ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag", "du", "df", "stat",
-              "file", "wc", "tree", "pwd", "cd", "pushd", "echo", "printf", "test", "[", "realpath", "readlink",
-              "basename", "dirname", "sort", "uniq", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "jq", "cut",
-              "tr", "nl", "od", "xxd", "strings", "which", "type", "true", "false", "date", "id", "whoami",
-              "hostname", "uname", "ps"}
-_FIND_ACTS = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
-_SETTINGS_NAMES = ("settings.json", "settings.local.json")
-
-
-def _reads_only(argv: list[str]) -> bool:
-    program = os.path.basename(argv[0])
-    if program == "find":
-        return not _FIND_ACTS & set(argv)
-    if program == "sed":
-        return not any(a == "--in-place" or a.startswith("--in-place=") or
-                       (a.startswith("-") and not a.startswith("--") and "i" in a) for a in argv[1:])
-    return program in _READ_ONLY
 
 
 def _settings_glob(pattern: str) -> bool:
@@ -231,17 +256,27 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
             return "changes Claude Code settings"
     if _ADMIN_TEXT.search(cmd):
         return "runs a jevguard administration command"
-    for argv, dirs, paths, globs in zip(c.programs, c.program_dirs, c.program_paths, c.program_globs):
+    if any(protected(p) for p in shell.written_paths(c)):
+        return f"writes to {what}"  # -o/path, --output-dir with -O, cd there and download, cp -t, dd of=
+    for argv, dirs, paths, globs, fed in zip(c.programs, c.program_dirs, c.program_paths, c.program_globs,
+                                             c.program_fed):
+        if fed:  # xargs, $(...): what this program is given is named elsewhere in the command, if at all
+            paths, globs = c.paths, c.globs
         if os.path.basename(argv[0]) == "jevguard":
             # Its other subcommands change nothing; of their arguments only real paths count
             # (`jevguard scan <file>`), not words like "status" resolved against the directory.
             paths = {p for a in argv[1:] if "/" in a or a.startswith("~") for p in shell.resolve(a, dirs)}
         elif not _reads_only(argv) and any(under(d, r) for d in dirs for r in roots):
             return f"runs inside {what}"  # `git reset --hard` there names no file and changes them all
-        if any(protected(p) for p in paths) or any(_settings_glob(g) or any(shell.glob_reaches(g, r) for r in roots)
-                                                   for g in globs):
+        # The guard's own directories hold the API key and the release list: any program counts.
+        if any(under(p, r) for p in paths for r in roots) or any(shell.glob_reaches(g, r) for g in globs for r in roots):
             return f"touches {what}"
-        if not _reads_only(argv) and (any(above(p) for p in paths) or
-                                      any(shell.glob_reaches_above(g, t) for g in globs for t in targets)):
+        if _reads_only(argv):
+            continue  # cat .claude/settings.json, ls ~: looking is not a change
+        if any(_SETTINGS.search(p) for p in paths) or any(_settings_glob(g) for g in globs):
+            return f"touches {what}"
+        if any(above(p) or os.path.basename(p) == ".claude" for p in paths) or \
+                any(shell.glob_reaches_above(g, t) for g in globs for t in targets):
+            # also any project's .claude directory: unpacking or copying into it can plant a settings file
             return f"acts on a directory that holds {what}"
     return ""

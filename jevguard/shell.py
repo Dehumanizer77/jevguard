@@ -15,9 +15,13 @@ import shlex
 
 _SEPARATORS = set("();|&")
 _REDIRECT_CHARS = set("<>&|")
-# Programs that only run another program: the command after them is what counts.
-_WRAPPERS = {"rtk", "sudo", "doas", "env", "time", "nohup", "command", "builtin", "exec", "nice", "ionice",
-             "stdbuf", "setsid", "timeout", "xargs", "watch"}
+# Programs that only run another program: the command after them is what counts. For each, the
+# options whose value is a separate word, so that the value is not taken for the program.
+_WRAPPERS = {"rtk": "", "sudo": "ughpCDRTU", "doas": "uC", "env": "uCS", "time": "fo", "nohup": "", "command": "",
+             "builtin": "", "exec": "a", "nice": "n", "ionice": "cnp", "stdbuf": "ioe", "setsid": "",
+             "timeout": "sk", "xargs": "IEnPLdsa", "watch": "n", "busybox": "", "toybox": "", "chronic": "",
+             "unbuffer": "", "caffeinate": ""}
+_WRAPPER_CHDIR = {("env", "C"), ("sudo", "D"), ("doas", "C")}
 # Programs that take a command line as the string after -c (bash -lc '...', script -qc '...').
 _TAKES_COMMAND = {"bash", "sh", "zsh", "dash", "ksh", "su", "script"}
 _ASSIGN = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S)
@@ -58,6 +62,7 @@ class Command:
         self.program_dirs: list[list[str]] = []  # for each program, the directories it may be running in
         self.program_paths: list[set[str]] = []  # for each program, the paths its arguments name
         self.program_globs: list[list[str]] = []  # and the glob patterns
+        self.program_fed: list[bool] = []    # its arguments come from elsewhere: xargs, $(...), a variable
         self.writes: set[str] = set()        # canonical targets of > >> &> redirections
         self.dirs: list[str] = [canonical(cwd)] if cwd else []  # the starting directory and every `cd` target
         self.paths: set[str] = set()         # canonical paths the command names
@@ -130,16 +135,25 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> None:
         while argv and (m := _ASSIGN.fullmatch(argv[0])):  # FOO=bar cmd, or FOO=bar on its own
             env[m.group(1)] = m.group(2)
             argv.pop(0)
+        fed = False
         while argv and os.path.basename(argv[0]) in _WRAPPERS:
-            argv.pop(0)
+            wrapper = os.path.basename(argv.pop(0))
+            fed = fed or wrapper == "xargs"
             while argv and (argv[0].startswith("-") or argv[0].replace(".", "").isdigit()
                             or argv[0] == "{}" or _ASSIGN.fullmatch(argv[0])):
-                argv.pop(0)
+                option = argv.pop(0)
+                if len(option) == 2 and option[0] == "-" and option[1] in _WRAPPERS[wrapper] and argv:
+                    value = argv.pop(0)  # sudo -u root, timeout -s KILL, env -C dir
+                    if (wrapper, option[1]) in _WRAPPER_CHDIR:
+                        out.dirs.extend([canonical(value, d) for d in out.dirs[:8]])
+                elif len(option) > 2 and option[0] == "-" and option[1] != "-" and (wrapper, option[1]) in _WRAPPER_CHDIR:
+                    out.dirs.extend([canonical(option[2:], d) for d in out.dirs[:8]])
         if argv:
-            _program(argv)
+            _program(argv, fed)
 
-    def _program(argv: list[str]) -> None:
+    def _program(argv: list[str], fed: bool = False) -> None:
         out.programs.append(argv)
+        out.program_fed.append(fed or any("$" in a for a in argv[1:]))
         out.program_dirs.append(list(out.dirs))
         paths: set[str] = set()
         globs: list[str] = []
@@ -194,12 +208,18 @@ def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
     """Record the paths one argument names."""
     if "://" in arg and " " not in arg:
         return
-    if arg.startswith("-"):
-        if "=" not in arg:
-            return
-        arg = arg.split("=", 1)[1]
     if arg and len(arg) <= 300 and not re.search(r"[\s'\"();]", arg):
-        candidates = expand_braces(arg)
+        if arg.startswith("--"):
+            forms = [arg.split("=", 1)[1]] if "=" in arg else []
+        elif arg.startswith("-"):
+            # A short option with its value attached: -o/path, and after other flags -sSLo/path.
+            # Which letter takes the value depends on the program, so every tail is tried; a
+            # tail that is not a path names nothing that exists and costs nothing.
+            forms = [arg[k:] for k in range(2, min(len(arg), 14)) if len(arg) - k >= 2]
+            forms += [arg.split("=", 1)[1]] if "=" in arg else []
+        else:
+            forms = [arg] + ([arg.split("=", 1)[1]] if "=" in arg else [])  # dd of=/path
+        candidates = [c for form in forms if form for c in expand_braces(form)]
     else:
         candidates = _EMBEDDED.findall(arg[:20000])
     for cand in candidates:
@@ -209,3 +229,155 @@ def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
                 globs.append(os.path.normpath(os.path.join(d, expanded)))
         else:
             paths.update(resolve(cand, dirs))
+
+
+# ---- what a command writes -----------------------------------------------------------------------
+_CURL_VALUE_OPTS = set("AbcCdDeEFhHKmoPQrtTuUwxXyYz")  # short options whose value may be attached
+_WGET_VALUE_OPTS = set("oaitTwQeUARDIXlBO P".replace(" ", ""))
+_COPY = {"cp", "mv", "install", "ln", "rsync", "scp"}
+_UNPACKERS = {"unzip", "7z", "bsdtar"}
+_OUTPUT_LONG = {"--output", "--out", "--output-file", "--outfile", "--output-document", "--dir", "--directory",
+                "--output-dir", "--destination", "--target-directory"}
+
+
+def _url_name(url: str) -> str:
+    """The file name curl -O and wget give a download."""
+    path = re.sub(r"^[a-z]+://[^/]*", "", url.split("?", 1)[0].split("#", 1)[0], flags=re.I)
+    return path.rstrip("/").rsplit("/", 1)[-1] if path.strip("/") else "index.html"
+
+
+def _curl_saves(args: list[str]) -> list[str]:
+    names, out_dir, remote = [], "", False
+    for i, a in enumerate(args):
+        following = args[i + 1] if i + 1 < len(args) else ""
+        if a.startswith("--"):
+            name, eq, value = a[2:].partition("=")
+            value = value if eq else following
+            if name == "output-dir":
+                out_dir = value
+            elif name in ("output", "dump-header", "cookie-jar", "trace", "trace-ascii"):
+                names.append(value)
+            elif name in ("remote-name", "remote-name-all"):
+                remote = True
+        elif a.startswith("-") and len(a) > 1:
+            for j, c in enumerate(a[1:], 1):
+                if c == "O":
+                    remote = True
+                elif c in "oDc":
+                    names.append(a[j + 1:] or following)
+                    break
+                elif c in _CURL_VALUE_OPTS:
+                    break
+    if remote:
+        names += [_url_name(a) for a in args if "://" in a]
+    return [os.path.join(out_dir, n) for n in names] if out_dir else names
+
+
+def _wget_saves(args: list[str]) -> list[str]:
+    document, prefix, recursive = "", "", False
+    for i, a in enumerate(args):
+        following = args[i + 1] if i + 1 < len(args) else ""
+        name, eq, value = a.partition("=")
+        if name == "--output-document":
+            document = value if eq else following
+        elif name == "--directory-prefix":
+            prefix = value if eq else following
+        elif name in ("--recursive", "--mirror", "--page-requisites"):
+            recursive = True
+        elif a.startswith("-") and not a.startswith("--"):
+            for j, c in enumerate(a[1:], 1):
+                if c == "O":
+                    document = a[j + 1:] or following
+                    break
+                if c == "P":
+                    prefix = a[j + 1:] or following
+                    break
+                if c in "rmp":
+                    recursive = True
+                elif c in _WGET_VALUE_OPTS:
+                    break
+    if document:
+        return [document]
+    urls = [a for a in args if "://" in a]
+    names = [_url_name(u) for u in urls]
+    if recursive:  # a tree named after the host
+        names += [re.sub(r"^[a-z]+://([^/:]+).*", r"\1", u, flags=re.I) for u in urls]
+    return [os.path.join(prefix, n) for n in names] if prefix else names
+
+
+def _copy_destinations(args: list[str], dirs: list[str]) -> list[str]:
+    target, names, skip = "", [], False
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+        elif a in ("-t", "--target-directory"):
+            target, skip = (args[i + 1] if i + 1 < len(args) else ""), True
+        elif a.startswith("--target-directory="):
+            target = a.split("=", 1)[1]
+        elif a.startswith("-t") and not a.startswith("--") and len(a) > 2:
+            target = a[2:]
+        elif not a.startswith("-"):
+            names.append(a)
+    if target:
+        return [os.path.join(target, os.path.basename(src.rstrip("/"))) for src in names]
+    if len(names) < 2:
+        return []
+    *sources, dest = names
+    into_dir = dest.endswith("/") or len(sources) > 1 or any(os.path.isdir(p) for p in resolve(dest, dirs))
+    return [os.path.join(dest, os.path.basename(src.rstrip("/"))) for src in sources] if into_dir else [dest]
+
+
+def _output_options(program: str, args: list[str]) -> list[str]:
+    """Where other programs are told to write: pandoc -o, sort -o, tar -C, unzip -d, gh ... -D."""
+    names = []
+    for i, a in enumerate(args):
+        following = args[i + 1] if i + 1 < len(args) else ""
+        name, eq, value = a.partition("=")
+        if name in _OUTPUT_LONG:
+            names.append(value if eq else following)
+        elif a in ("-o", "-O", "-D", "-C", "-t") or (a == "-d" and program in _UNPACKERS):
+            names.append(following)
+        elif not a.startswith("--") and len(a) > 2 and (a[:2] in ("-o", "-O", "-D", "-C", "-t") or
+                                                       (a[:2] == "-d" and program in _UNPACKERS)):
+            names.append(a[2:])
+    return names
+
+
+def _clone_destination(program: str, args: list[str]) -> list[str]:
+    names = [a for a in args if not a.startswith("-")]
+    if program == "git" and "clone" in names:
+        names = names[names.index("clone") + 1:]
+    elif program == "gh" and names[:2] == ["repo", "clone"]:
+        names = names[2:]
+    else:
+        return []
+    if not names:
+        return []
+    return [names[1] if len(names) > 1 else re.sub(r"\.git$", "", names[0].rstrip("/").rsplit("/", 1)[-1])]
+
+
+def written_paths(c: Command, clones: bool = True) -> set[str]:
+    """Canonical paths the command says it writes: download options in every spelling (-o f, -of,
+    --output=f, --output-dir, -O, wget's default name and -P), redirections and tee, the
+    destination of cp/mv/dd, and the output options of other programs. A relative name is given
+    under every directory the command may have been in at that point."""
+    found = set(c.writes)
+    for argv, dirs in zip(c.programs, c.program_dirs):
+        program, args = os.path.basename(argv[0]), argv[1:]
+        if program == "curl":
+            names = _curl_saves(args)
+        elif program == "wget":
+            names = _wget_saves(args)
+        elif program == "tee":
+            names = [a for a in args if not a.startswith("-")]
+        elif program in _COPY:
+            names = _copy_destinations(args, dirs)
+        elif program == "dd":
+            names = [a[3:] for a in args if a.startswith("of=")]
+        else:
+            names = _output_options(program, args) + (_clone_destination(program, args) if clones else [])
+        for name in names:
+            for one in expand_braces(name):
+                if one and not one.startswith("-"):
+                    found.update(resolve(one, dirs))
+    return found

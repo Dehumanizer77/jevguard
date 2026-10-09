@@ -58,9 +58,12 @@ Two checks that read the call itself, no model:
 - *Changes to the guard.* A call that would change the guard's settings, state, release list
   or code, run `jevguard mode|gate|install|uninstall|release|show`, or touch a Claude Code
   `settings*.json` (the hooks live there) is held for your approval. That holds whether the
-  file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`), or
-  through a directory above it (`rm -rf ~/.claude`), and for commands run from inside the
-  guard's directories. In every session, whatever `gate` says. Switch off with
+  file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`),
+  through a directory above it (`rm -rf ~/.claude`), or as the place a command writes to in
+  any spelling (`curl -o/path`, `--output-dir` with `-O`, `cd` there and download,
+  `cp -t`, `dd of=`), and for commands run from inside the guard's directories. Reading a
+  settings file (`cat`, `jq`, `grep`) is not held; reading the guard's own directory is,
+  because the API key is there. In every session, whatever `gate` says. Switch off with
   `protect_guard: false`.
 - *Risky actions after outside content.* An HTTP request with a body, or one whose address
   or headers are filled in when it runs, `git push`, `ssh`/`scp`, sending mail, publishing,
