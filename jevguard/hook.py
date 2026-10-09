@@ -34,6 +34,12 @@ def _evidence(v: dict) -> dict:
             "signals": v.get("signals") or None, "n_chunks": v.get("n_chunks"), "tokens": v.get("tokens")}
 
 
+def _existing(cfg, paths: list[str]) -> list[str]:
+    """Tracked files that are really there. A name the command did not create (an option value
+    taken for a file name) or a download that has since been deleted is not outside content."""
+    return list(paths) if cfg.track_missing_files else [p for p in paths if os.path.lexists(p)]
+
+
 def _fields(d: dict) -> tuple[str, dict, str, str]:
     tool_input = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
     return str(d.get("tool_name") or ""), tool_input, str(d.get("session_id") or ""), str(d.get("cwd") or "")
@@ -48,7 +54,7 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
         session = store.session(cfg, sid)
     except (ValueError, OSError):
         session = None  # which files this session downloaded is not known
-    mode = provenance.classify(tool, tool_input, cfg, cwd, (session or {}).get("paths", []), text)
+    mode = provenance.classify(tool, tool_input, cfg, cwd, _existing(cfg, (session or {}).get("paths", [])), text)
     if session is None and mode in ("local", "warn"):
         mode = "external"  # it may be one of them
     ctx["mode"] = mode  # what the error path needs to know if anything below fails
@@ -57,7 +63,7 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     if mode == "external":
         if not session:
             store.prune_sessions(cfg)  # first outside content of a session: drop old session files
-        paths = provenance.saved_paths(str(tool_input.get("command") or ""), cwd, cfg.track_clones) if tool == "Bash" else []
+        paths = _existing(cfg, provenance.saved_paths(str(tool_input.get("command") or ""), cwd, cfg.track_clones)) if tool == "Bash" else []
         store.session_update(cfg, sid, paths=paths, external=True)
     elif not cfg.scan_local:
         return None
@@ -183,7 +189,7 @@ def _after_error(d: dict, cfg, ctx: dict, exc: BaseException) -> dict | None:
     if mode == _UNKNOWN:
         try:
             text, _ = toolio.text_of(tool, d.get("tool_response"))
-            mode = provenance.classify(tool, tool_input, cfg, cwd, store.session(cfg, sid).get("paths", []), text)
+            mode = provenance.classify(tool, tool_input, cfg, cwd, _existing(cfg, store.session(cfg, sid).get("paths", [])), text)
         except Exception:
             mode = "external"
     if mode != "external":

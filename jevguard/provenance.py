@@ -109,15 +109,28 @@ def mentions(text: str, roots: list[str], bases: list[str]) -> bool:
     home = os.path.expanduser("~")
     for root in roots:
         # A directory counts when something inside it is named; its bare name in a listing does not.
-        tail = "/" if os.path.isdir(root) else ""
+        is_dir, is_file = os.path.isdir(root), os.path.isfile(root)
+        tail = "/" if is_dir else ""
         if root + tail in text or (under(root, home) and root != home and "~" + root[len(home):] + tail in text):
             return True
         for base in bases:
-            if base and root != base and under(root, base):
-                rel = root[len(base.rstrip("/")) + 1:] + tail
-                if len(rel) > 2 and rel in text and re.search(r"(?<![\w.-])" + re.escape(rel) + (r"(?![\w-])" if not tail else ""), text):
-                    return True
+            if not (base and root != base and under(root, base)):
+                continue
+            rel = root[len(base.rstrip("/")) + 1:]
+            if rel not in text:
+                continue
+            # A relative name counts only where a listing or a search would print it: at the start
+            # of a line, as `name:12:...`, `name-12-...`, `name/inside` or on a line of its own.
+            # The same word in the middle of a sentence ("on branch main") is not that file.
+            name = r"(?m)^\s*(?:\./)?" + re.escape(rel)
+            as_file = re.search(name + r"(?:[:-]|\s*$)", text) if not is_dir else None
+            as_dir = re.search(name + "/", text) if not is_file else None
+            if as_file or as_dir:
+                return True
     return False
+
+
+_file_name = re.compile(r"[\w@%+-][\w@%+.-]{2,}\.[A-Za-z0-9]{1,8}")  # page.html, data-2.json; not "main" or "out"
 
 
 def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: list[str], output: str) -> bool:
@@ -131,8 +144,8 @@ def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: lis
         return True  # a command that cannot be read is not assumed to be local
     if any(c.names(r) for r in roots):
         return True
-    if any(len(os.path.basename(p)) >= 5 and os.path.basename(p) in cmd for p in session_paths):
-        return True  # named in a way the reader did not resolve
+    if any(_file_name.fullmatch(os.path.basename(p)) and os.path.basename(p) in cmd for p in session_paths):
+        return True  # named in a way the reader did not resolve; only for names that read as a file's
     if session_paths and c.dynamic:
         return True
     return mentions(output, roots, c.dirs)

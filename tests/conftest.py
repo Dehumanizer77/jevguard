@@ -68,7 +68,9 @@ class Guard:
         self.configure()
 
     def configure(self, **settings):
-        self.settings = {"url": self.url, "timeout": 2.0, "deadline": 6.0, **settings}
+        self.settings = {"url": self.url, "timeout": 2.0, "deadline": 6.0,
+                         "track_missing_files": True,  # the paths in these tests are made up
+                         **settings}
         (self.home / "config" / "config.json").write_text(json.dumps(self.settings))
 
     def hook(self, event: str, tool: str, tool_input: dict, tool_response=None, session="s1", cwd="/work"):

@@ -44,6 +44,10 @@ DEFAULTS = {
     "breaker_seconds": 60.0,  # pause after the API failed
     "daily_token_budget": 5_000_000,  # about $0.21 a day at $0.042 per million tokens
     "min_words": 3,
+    # A file counts as written by a command only if it is there afterwards. Names a command did
+    # not really create (an option value read as a file name) would otherwise be tracked too, and
+    # every later output that happens to contain such a word would be sent for scoring.
+    "track_missing_files": False,
 }
 
 

@@ -254,7 +254,8 @@ def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
 _CURL_VALUE_OPTS = set("AbcCdDeEFhHKmoPQrtTuUwxXyYz")  # short options whose value may be attached
 _WGET_VALUE_OPTS = set("oaitTwQeUARDIXlBO P".replace(" ", ""))
 _COPY = {"cp", "mv", "install", "ln", "rsync", "scp"}
-_UNPACKERS = {"unzip", "7z", "bsdtar"}
+_UNPACKERS = {"unzip", "7z"}
+_TAR = {"tar", "bsdtar", "gtar"}
 _OUTPUT_LONG = {"--output", "--out", "--output-file", "--outfile", "--output-document", "--dir", "--directory",
                 "--output-dir", "--destination", "--target-directory"}
 
@@ -347,17 +348,22 @@ def _copy_destinations(args: list[str], dirs: list[str]) -> list[str]:
 
 
 def _output_options(program: str, args: list[str]) -> list[str]:
-    """Where other programs are told to write: pandoc -o, sort -o, tar -C, unzip -d, gh ... -D."""
+    """Where other programs are told to write: pandoc -o, sort -o, tar -C, unzip -d, gh ... -D.
+    The letters mean something else elsewhere (`git -C dir` runs in dir, it does not write a
+    file called dir), so each is taken only from the programs that use it for output."""
+    def writes(option: str) -> bool:
+        return (option in ("-o", "-O") or (option == "-C" and program in _TAR)
+                or (option == "-D" and program == "gh") or (option == "-d" and program in _UNPACKERS))
+
     names = []
     for i, a in enumerate(args):
         following = args[i + 1] if i + 1 < len(args) else ""
         name, eq, value = a.partition("=")
         if name in _OUTPUT_LONG:
             names.append(value if eq else following)
-        elif a in ("-o", "-O", "-D", "-C", "-t") or (a == "-d" and program in _UNPACKERS):
+        elif writes(a):
             names.append(following)
-        elif not a.startswith("--") and len(a) > 2 and (a[:2] in ("-o", "-O", "-D", "-C", "-t") or
-                                                       (a[:2] == "-d" and program in _UNPACKERS)):
+        elif not a.startswith("--") and len(a) > 2 and writes(a[:2]):
             names.append(a[2:])
     return names
 
