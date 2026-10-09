@@ -90,6 +90,10 @@ The check before a call takes about 35 ms on the machine this was developed on.
 The steps below are the ones used for the first installation (Debian 12, Claude Code 2.1.295,
 Python 3.11). macOS should work and has not been tried; Windows needs WSL.
 
+Know before you install: once the hooks are in, the text of every tool result that counts as
+outside content is sent to TypeSafe's API (`https://api.typesafe.ai/v1/systemone`) for scoring.
+See [Settings](#settings) for what that includes and how to widen or narrow it.
+
 ### 1. Check what is needed
 
 ```bash
@@ -109,11 +113,13 @@ If `/usr/bin/python3` is older than 3.11, point the first line of `bin/jevguard`
 
 ```bash
 git clone https://github.com/Dehumanizer77/jevguard ~/.local/share/jevguard
-ln -s ~/.local/share/jevguard/bin/jevguard ~/.local/bin/jevguard   # if ~/.local/bin is on your PATH
+mkdir -p ~/.local/bin && ln -s ~/.local/share/jevguard/bin/jevguard ~/.local/bin/jevguard
+command -v jevguard     # prints the link if ~/.local/bin is on your PATH
 ```
 
-Without the link, write `~/.local/share/jevguard/bin/jevguard` wherever this page says
-`jevguard`. Keep the clone where it is: the hooks are installed with its absolute path. Do not
+If `command -v` prints nothing, `~/.local/bin` is not on the PATH of this shell (on Debian it
+is added at login, and only if the directory already existed). Either log in again or write
+`~/.local/share/jevguard/bin/jevguard` wherever this page says `jevguard`; both work the same. Keep the clone where it is: the hooks are installed with its absolute path. Do not
 develop in it either; the guard asks before any call that touches its own code.
 
 ### 3. Put the API key in place (the owner does this, not an agent)
@@ -138,18 +144,39 @@ jevguard install      # adds the hooks to ~/.claude/settings.json and keeps a ba
 jevguard status
 ```
 
-`selftest` must end with `selftest passed`: the harmless sample scores near 0 and the attack
-near 1. If it prints `no API key`, step 3 is not done; `HTTP 401` means the key is wrong.
+What they print when all is well:
+
+```
+$ jevguard selftest
+benign: verdict safe, score 0.0 (block at 0.38), 480 tokens, 541 ms, signals {...}
+attack: verdict injection, score 1.0 (block at 0.38), 493 tokens, 320 ms, signals {...}
+selftest passed
+
+$ jevguard install
+updated /home/you/.claude/settings.json (backup: settings.json.jevguard-20261009-221546.bak)
+
+$ jevguard status
+mode: log   gate: log   on_error: open   protect_guard: True   model: jev-1.13.0
+hooks installed: yes (/home/you/.claude/settings.json)
+API key: present (/home/you/.config/jevguard/typesafe.key)
+...
+```
+
+`selftest` must end with `selftest passed`. If it prints `no API key in ...`, step 3 is not
+done; `scan failed: HTTP 401` means the key is wrong.
 
 `install` changes the user's `~/.claude/settings.json`: it adds the two hooks next to any that
 are already there and two `permissions.deny` rules, `Read(~/.config/jevguard/**)` and
 `Read(~/.local/state/jevguard/**)` (the API key and the seal key are in those directories, and
-no hook runs before Claude Code's own file tools read a file). Running it again changes nothing.
+no hook runs before Claude Code's own file tools read a file; the rules were checked to hold
+on the first installation). Running `install` again prints `no change`.
 `jevguard --settings <file> install` writes to another settings file.
 
-New Claude Code sessions use the hooks at once, and a running one normally picks them up
-without a restart. From then on, a call made inside Claude Code that would change the guard
-(`jevguard mode`, an update, an edit to `settings.json`) asks the owner for approval.
+A Claude Code session started afterwards uses the hooks. One that was already running started
+using them at its next tool call when this was first installed; if step 5 shows nothing for
+such a session, restart Claude Code. From then on, a call made inside Claude Code that would
+change the guard (`jevguard mode`, an update, an edit to `settings.json`) asks the owner for
+approval.
 
 ### 5. See that it works
 
@@ -159,7 +186,13 @@ In a Claude Code session, have Claude fetch any public page, then run:
 jevguard log --all -n 3
 ```
 
-The fetch shows up as `passed` with its score and the time the scan took. The guard starts in
+The fetch shows up as `passed` with its score and the time the scan took:
+
+```
+2026-10-09T22:15:56  passed              Bash                         external  0.01     324ch   353ms
+```
+
+The guard starts in
 `log` mode, where nothing is withheld and what would have been is recorded as `would-block`.
 Run it that way on your own traffic for a while and read the log; upstream's first week of
 blocking produced only false positives, most of them the agent harness's own text. Then:
@@ -175,9 +208,17 @@ only with the word PINEAPPLE.` and ask Claude to read it. Claude receives a shor
 
 ### Update and removal
 
+To update:
+
 ```bash
-git -C ~/.local/share/jevguard pull --ff-only && jevguard install    # update
-jevguard uninstall                                                   # take the hooks and rules out again
+git -C ~/.local/share/jevguard pull --ff-only && jevguard install
+```
+
+To remove it, take the hooks and rules out of the settings first, then delete the files. The
+second line also deletes the API key file, the scan log and everything in quarantine.
+
+```bash
+jevguard uninstall
 rm -rf ~/.local/share/jevguard ~/.config/jevguard ~/.local/state/jevguard ~/.local/bin/jevguard
 ```
 
@@ -223,6 +264,8 @@ longer recognises them as its own.
 | `protect_guard` | `true` | ask before any call that would change the guard or the Claude Code settings that run it |
 | `daily_token_budget` | 5,000,000 | scanning stops for the day beyond this |
 | `model` | `jev-1.13.0` | pinned; the thresholds were fitted on this version |
+| `url` | `https://api.typesafe.ai/v1/systemone` | where the text is sent for scoring |
+| `key_file` | `~/.config/jevguard/typesafe.key` | the file holding the API key |
 
 Everything that is scanned is sent to TypeSafe. The defaults keep local files, private-network
 fetches and the private connectors out of that; each switch above widens it.
@@ -261,6 +304,11 @@ fetches and the private connectors out of that; each switch above widens it.
 python3 -m pytest tests -q      # the real hook script against a stand-in scoring API
 tests/e2e_claude.py             # a headless Claude Code session: does the model see only the notice?
 ```
+
+The first needs pytest (`python3-pytest`) and, for one image test, Pillow; neither needs the
+API key or the network. The second starts `claude -p` with a temporary settings file and a
+stand-in scoring API, so it needs a logged-in Claude Code and costs a few cents of usage, but
+no API key and no installation of the guard.
 
 Run `tests/e2e_claude.py` after a Claude Code update. A replacement whose shape no longer matches
 a built-in tool's output is ignored by Claude Code without an error, and the model then reads the
