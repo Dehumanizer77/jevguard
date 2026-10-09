@@ -44,8 +44,13 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     tool, tool_input, sid, cwd = _fields(d)
     resp = d.get("tool_response")
     text, images = toolio.text_of(tool, resp)
-    session = store.session(cfg, sid)
-    mode = provenance.classify(tool, tool_input, cfg, cwd, session.get("paths", []), text)
+    try:
+        session = store.session(cfg, sid)
+    except (ValueError, OSError):
+        session = None  # which files this session downloaded is not known
+    mode = provenance.classify(tool, tool_input, cfg, cwd, (session or {}).get("paths", []), text)
+    if session is None and mode in ("local", "warn"):
+        mode = "external"  # it may be one of them
     ctx["mode"] = mode  # what the error path needs to know if anything below fails
     if mode is None:
         return None
@@ -138,7 +143,10 @@ def pre_tool_use(d: dict, cfg) -> dict | None:
     why = gate.risky(tool, tool_input, cwd)
     if not why:
         return None
-    s = store.session(cfg, sid)
+    try:
+        s = store.session(cfg, sid)
+    except (ValueError, OSError):
+        s = store.UNREADABLE_SESSION
     taint = "flagged" if s.get("flagged") else "external" if s.get("external") else ""
     if not taint:
         return None
@@ -156,10 +164,16 @@ def _on_alarm(*_):
     raise TimeoutError("jevguard watchdog")
 
 
-def _fail_closed(d: dict, cfg, ctx: dict) -> dict | None:
-    """After a guard error: withhold outside content if the owner chose on_error = closed. When
-    the failure came before the origin was known, and it still cannot be worked out, the result
-    is withheld rather than assumed to be local."""
+def _after_error(d: dict, cfg, ctx: dict, exc: BaseException) -> dict | None:
+    """What a guard error costs. Before a call: the check did not happen, so wherever the guard
+    is set to ask, the call is asked about (also when its settings could not be read). After a
+    call: outside content is withheld if the owner chose on_error = closed; when the failure
+    came before the origin was known, and it still cannot be worked out, the result is withheld
+    rather than assumed to be local."""
+    if d.get("hook_event_name") == "PreToolUse":
+        if cfg is None or cfg.protect_guard or cfg.gate.startswith("ask"):
+            return _ask(f"the guard hit an error and could not check this call ({type(exc).__name__}).")
+        return None
     if cfg is None or cfg.mode != "block" or cfg.on_error != "closed" or d.get("hook_event_name") != "PostToolUse":
         return None
     from . import firstparty, provenance, toolio
@@ -199,9 +213,10 @@ def main() -> None:
         print(f"jevguard: {type(exc).__name__}: {exc}", file=sys.stderr)
         try:
             signal.alarm(0)
-            out = _fail_closed(d, cfg, ctx)
+            out = _after_error(d, cfg, ctx, exc)
+            pre = d.get("hook_event_name") == "PreToolUse"
             store.audit(cfg or config.load(), event="error", tool=d.get("tool_name"), session=d.get("session_id"),
-                        action="blocked-error" if out else "passed-error",
+                        action=("asked-error" if pre else "blocked-error") if out else "passed-error",
                         error=f"{type(exc).__name__}: {exc}"[:300])
         except Exception:
             pass

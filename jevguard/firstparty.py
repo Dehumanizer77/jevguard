@@ -30,12 +30,16 @@ def use(cfg) -> None:
         _secret = path.read_bytes()
     except FileNotFoundError:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(os.urandom(32))
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(os.urandom(32))
-        except FileExistsError:  # another hook process created it first
+            os.link(tmp, path)  # appears complete or not at all; the first hook process to get here wins
+        except FileExistsError:
             pass
+        finally:
+            os.unlink(tmp)
         _secret = path.read_bytes()
     if len(_secret) < 16:
         raise ValueError(f"{path} is too short to be a seal key")

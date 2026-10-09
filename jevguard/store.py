@@ -24,35 +24,41 @@ def _private_dir(p: Path) -> Path:
 
 
 class _locked:
-    """Exclusive lock on a JSON file: `with _locked(path) as data` gives the parsed object and
-    writes it back on a clean exit."""
+    """Read-modify-write of a JSON file: `with _locked(path) as data`. Writers queue on a lock
+    file beside it, and the file itself is replaced in one step, so a reader, which takes no
+    lock, sees either the old content or the new and never a half-written one."""
 
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, path: Path, if_unreadable: dict | None = None):
+        self.path, self.if_unreadable = path, if_unreadable or {}
 
     def __enter__(self) -> dict:
         _private_dir(self.path.parent)
-        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.lock = os.open(f"{self.path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX)
-            raw = os.pread(self.fd, os.fstat(self.fd).st_size, 0).decode("utf-8", "replace")
+            fcntl.flock(self.lock, fcntl.LOCK_EX)
+            try:
+                self.data = json.loads(self.path.read_text())
+                if not isinstance(self.data, dict):
+                    raise ValueError("not an object")
+            except FileNotFoundError:
+                self.data = {}
+            except ValueError:
+                self.data = dict(self.if_unreadable)
         except BaseException:
-            os.close(self.fd)
+            os.close(self.lock)
             raise
-        try:
-            self.data = json.loads(raw) if raw.strip() else {}
-        except ValueError:
-            self.data = {}
         return self.data
 
     def __exit__(self, exc_type, *_):
         try:
             if exc_type is None:
-                out = json.dumps(self.data).encode()
-                os.ftruncate(self.fd, 0)
-                os.pwrite(self.fd, out, 0)
+                tmp = f"{self.path}.{os.getpid()}.tmp"
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self.data, f)
+                os.replace(tmp, self.path)
         finally:
-            os.close(self.fd)
+            os.close(self.lock)
 
 
 def audit(cfg, **rec) -> None:
@@ -117,18 +123,25 @@ def _session_file(cfg, session_id: str) -> Path:
     return cfg.sessions_dir / f"{sid}.json"
 
 
+# What an unreadable session file is taken to mean: the worst that it could have recorded.
+UNREADABLE_SESSION = {"external": 1, "flagged": 1, "flagged_reason": "session state was unreadable"}
+
+
 def session(cfg, session_id: str) -> dict:
-    """What the session has seen. A file that exists but cannot be read is an error, not an empty
-    session: treating it as empty would forget which files came from outside."""
+    """What the session has seen. Raises ValueError or OSError for a file that exists but cannot
+    be read: that is not an empty session, and callers decide what the unknown costs them."""
     try:
-        return json.loads(_session_file(cfg, session_id).read_text())
+        data = json.loads(_session_file(cfg, session_id).read_text())
     except FileNotFoundError:
         return {}
+    if not isinstance(data, dict):
+        raise ValueError("session state is not an object")
+    return data
 
 
 def session_update(cfg, session_id: str, *, paths: list = (), external: bool = False,
                    flagged: str = "") -> None:
-    with _locked(_session_file(cfg, session_id)) as s:
+    with _locked(_session_file(cfg, session_id), UNREADABLE_SESSION) as s:
         if paths:
             s["paths"] = list(dict.fromkeys([*s.get("paths", []), *paths]))[-500:]
         if external:
@@ -141,9 +154,10 @@ def session_update(cfg, session_id: str, *, paths: list = (), external: bool = F
 def prune_sessions(cfg, days: int = 14) -> None:
     cutoff = time.time() - days * 86400
     try:
-        for p in cfg.sessions_dir.iterdir():
+        for p in cfg.sessions_dir.glob("*.json"):
             if p.stat().st_mtime < cutoff:
                 p.unlink(missing_ok=True)
+                Path(f"{p}.lock").unlink(missing_ok=True)
     except OSError:
         pass
 

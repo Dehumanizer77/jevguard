@@ -29,7 +29,9 @@ Two Claude Code [hooks](https://code.claude.com/docs/en/hooks) run `bin/jevguard
    files a fetching command saved (`curl -o`, `> file`) and anything under `external_paths`.
    Such a file stays outside content however it is read back: `Read`, `cat page.html`,
    `cd dir && head f`, a glob, a variable the command sets, a path inside `python -c "..."`,
-   or a `Grep` over a parent directory whose result lists it.
+   or a `Grep` over a parent directory whose result lists it. So does a copy of it: what a
+   command that handles outside content writes (`cp`, `mv`, `> file`, `tee`, `-o file`) is
+   tracked the same way.
    Everything else is local and, by default, is not scanned and never leaves the machine.
 2. *Extract.* Plain code reveals what a human would not see: invisible Unicode tag characters,
    zero-width and bidi characters, hidden HTML, comments, attribute text, base64 blobs, image
@@ -55,14 +57,21 @@ Two checks that read the call itself, no model:
 
 - *Changes to the guard.* A call that would change the guard's settings, state, release list
   or code, run `jevguard mode|gate|install|uninstall|release|show`, or touch a Claude Code
-  `settings*.json` (the hooks live there) is held for your approval. In every session,
-  whatever `gate` says. Switch off with `protect_guard: false`.
-- *Risky actions after outside content.* An HTTP request with a body, `git push`,
-  `ssh`/`scp`, sending mail, publishing, an MCP tool that sends or changes something, or
-  touching `~/.ssh`, shell startup files and git hooks. If the session has read outside
-  content, the call is logged, or, with `gate` set to `ask-flagged` / `ask-external`, held
-  for approval. A session counts as flagged once a result scored as an injection or passed
-  without a full scan.
+  `settings*.json` (the hooks live there) is held for your approval. That holds whether the
+  file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`), or
+  through a directory above it (`rm -rf ~/.claude`), and for commands run from inside the
+  guard's directories. In every session, whatever `gate` says. Switch off with
+  `protect_guard: false`.
+- *Risky actions after outside content.* An HTTP request with a body, or one whose address
+  or headers are filled in when it runs, `git push`, `ssh`/`scp`, sending mail, publishing,
+  an MCP tool that sends or changes something, or touching `~/.ssh`, shell startup files and
+  git hooks. If the session has read outside content, the call is logged, or, with `gate`
+  set to `ask-flagged` / `ask-external`, held for approval. A session counts as flagged once
+  a result scored as an injection or passed without a full scan, and also when its recorded
+  state cannot be read.
+
+If the guard itself fails before a call (an error, unreadable settings), the call is held for
+approval rather than let through unchecked.
 
 Both read what a command says in plain sight: programs and their options, `bash -c '...'`,
 `find -exec`, `$(...)`, paths after `cd`. That is an approval step, not a wall; see the limits
@@ -135,6 +144,9 @@ fetches and the private connectors out of that; each switch above widens it.
   name. When a session has downloaded files, commands that pick their files at run time
   (`$(...)`, `xargs`, `find`) are scanned too. `scan_local` closes the rest, at the price of
   sending local content for scoring.
+- A download whose resting place the command does not say: a name chosen by the server
+  (`curl -J`), a destination held in a variable set elsewhere, an archive unpacked into the
+  current directory, files a script fetches on its own.
 - Text in the pixels of an image, unless `tesseract` is installed. Image metadata is read.
 - Results shorter than three words, and reports returned by subagents (their own tool calls are
   scanned).

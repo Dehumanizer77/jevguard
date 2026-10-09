@@ -30,12 +30,6 @@ _TRUSTED_CMDS = {"cd", "pwd", "echo", "printf", "which", "whoami", "id", "hostna
 _TRUSTED_GIT = {"status", "add", "commit", "checkout", "switch", "branch", "stash", "rev-parse", "init",
                 "restore", "tag"}
 
-_OUT_ARG = re.compile(r"(?:^|\s)(?:-o|-O|--output|--output-document|-P|--directory-prefix)(?:=|\s+)"
-                      r"(['\"]?)([^\s'\";|&<>]+)\1")
-_REDIRECT = re.compile(r"(?:>>?|\|\s*tee(?:\s+-a)?)\s*(['\"]?)([^\s'\";|&<>]+)\1")
-_CLONE = re.compile(r"\bgit\s+(?:-\S+\s+)*clone\b([^;|&\n]*)")
-
-
 def private_host(host: str) -> bool:
     host = host.rsplit("@", 1)[-1].lower()
     if host.startswith("["):  # [::1]:8080
@@ -81,29 +75,150 @@ def trusted_command(cmd: str, extra: set) -> bool:
     return True
 
 
+# ---- what a command that handles outside content writes ----------------------------------------
+_CURL_VALUE_OPTS = set("AbcCdDeEFhHKmoPQrtTuUwxXyYz")  # short options whose value may be attached
+_WGET_VALUE_OPTS = set("oaitTwQeUARDIXlBO P".replace(" ", ""))
+_COPY = {"cp", "mv", "install", "ln", "rsync", "scp"}
+_OUTPUT_LONG = {"--output", "--out", "--output-file", "--outfile", "--output-document", "--dir", "--directory",
+                "--output-dir", "--destination", "--target-directory"}
+
+
+def _url_name(url: str) -> str:
+    """The file name curl -O and wget give a download."""
+    path = re.sub(r"^[a-z]+://[^/]*", "", url.split("?", 1)[0].split("#", 1)[0], flags=re.I)
+    return path.rstrip("/").rsplit("/", 1)[-1] if path.strip("/") else "index.html"
+
+
+def _curl_saves(args: list[str]) -> list[str]:
+    names, out_dir, remote = [], "", False
+    for i, a in enumerate(args):
+        following = args[i + 1] if i + 1 < len(args) else ""
+        if a.startswith("--"):
+            name, eq, value = a[2:].partition("=")
+            value = value if eq else following
+            if name == "output-dir":
+                out_dir = value
+            elif name in ("output", "dump-header", "cookie-jar", "trace", "trace-ascii"):
+                names.append(value)
+            elif name in ("remote-name", "remote-name-all"):
+                remote = True
+        elif a.startswith("-") and len(a) > 1:
+            for j, c in enumerate(a[1:], 1):
+                if c == "O":
+                    remote = True
+                elif c in "oDc":
+                    names.append(a[j + 1:] or following)
+                    break
+                elif c in _CURL_VALUE_OPTS:
+                    break
+    if remote:
+        names += [_url_name(a) for a in args if "://" in a]
+    return [os.path.join(out_dir, n) for n in names] if out_dir else names
+
+
+def _wget_saves(args: list[str]) -> list[str]:
+    document, prefix, recursive = "", "", False
+    for i, a in enumerate(args):
+        following = args[i + 1] if i + 1 < len(args) else ""
+        name, eq, value = a.partition("=")
+        if name == "--output-document":
+            document = value if eq else following
+        elif name == "--directory-prefix":
+            prefix = value if eq else following
+        elif name in ("--recursive", "--mirror", "--page-requisites"):
+            recursive = True
+        elif a.startswith("-") and not a.startswith("--"):
+            for j, c in enumerate(a[1:], 1):
+                if c == "O":
+                    document = a[j + 1:] or following
+                    break
+                if c == "P":
+                    prefix = a[j + 1:] or following
+                    break
+                if c in "rmp":
+                    recursive = True
+                elif c in _WGET_VALUE_OPTS:
+                    break
+    if document:
+        return [document]
+    urls = [a for a in args if "://" in a]
+    names = [_url_name(u) for u in urls]
+    if recursive:  # a tree named after the host
+        names += [re.sub(r"^[a-z]+://([^/:]+).*", r"\1", u, flags=re.I) for u in urls]
+    return [os.path.join(prefix, n) for n in names] if prefix else names
+
+
+def _copy_destinations(args: list[str], dirs: list[str]) -> list[str]:
+    names = [a for a in args if not a.startswith("-")]
+    if len(names) < 2:
+        return []
+    *sources, dest = names
+    into_dir = dest.endswith("/") or len(sources) > 1 or any(os.path.isdir(p) for p in shell.resolve(dest, dirs))
+    return [os.path.join(dest, os.path.basename(src.rstrip("/"))) for src in sources] if into_dir else [dest]
+
+
+def _output_options(program: str, args: list[str]) -> list[str]:
+    """Where other programs are told to write: pandoc -o, sort -o, tar -C, unzip -d, gh ... -D."""
+    names = []
+    for i, a in enumerate(args):
+        following = args[i + 1] if i + 1 < len(args) else ""
+        name, eq, value = a.partition("=")
+        if name in _OUTPUT_LONG:
+            names.append(value if eq else following)
+        elif a in ("-o", "-O", "-D", "-C") or (a == "-d" and program in ("unzip", "7z", "bsdtar")):
+            names.append(following)
+        elif a.startswith("-o") and not a.startswith("--") and len(a) > 2:
+            names.append(a[2:])
+    return names
+
+
+def _clone_destination(program: str, args: list[str]) -> list[str]:
+    names = [a for a in args if not a.startswith("-")]
+    if program == "git" and "clone" in names:
+        names = names[names.index("clone") + 1:]
+    elif program == "gh" and names[:2] == ["repo", "clone"]:
+        names = names[2:]
+    else:
+        return []
+    if not names:
+        return []
+    return [names[1] if len(names) > 1 else re.sub(r"\.git$", "", names[0].rstrip("/").rsplit("/", 1)[-1])]
+
+
 def saved_paths(cmd: str, cwd: str, track_clones: bool) -> list[str]:
-    """Paths a fetching command writes (curl -o, wget -O/-P, > file, | tee file, git clone dir):
-    reading them later is reading outside content."""
-    out = []
-    for m in list(_OUT_ARG.finditer(cmd)) + list(_REDIRECT.finditer(cmd)):
-        target = m.group(2)
-        if target.startswith(("/dev/", "&")):
-            continue
-        if re.match(r"https?://", target, re.I):  # curl -O URL: saved under the URL's file name
-            target = target.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
-            if not target:
-                continue
-        out.append(canonical(target, cwd))
-    if track_clones:
-        for m in _CLONE.finditer(cmd):
-            args = [a.strip("'\"") for a in m.group(1).split() if not a.startswith("-")]
-            if not args:
-                continue
-            repo = args[0]
-            dest = args[1] if len(args) > 1 else re.sub(r"\.git$", "", repo.rstrip("/").rsplit("/", 1)[-1])
-            if dest:
-                out.append(canonical(dest, cwd))
-    return out
+    """Files written by a command that fetches from outside or reads an outside file: reading
+    them later is reading outside content. Download options in every spelling (-o f, -of,
+    --output=f, -O, wget's default name), redirections and tee anywhere in the command, the
+    destination of cp/mv, and the output options of other programs. A relative name is recorded
+    under every directory the command may have been in at that point. Not followed: an archive
+    unpacked into the current directory, and files a script writes on its own."""
+    try:
+        c = shell.read(cmd, cwd)
+    except Exception:
+        return []
+    found = set(c.writes)
+    for argv, dirs in zip(c.programs, c.program_dirs):
+        program, args = os.path.basename(argv[0]), argv[1:]
+        if program == "curl":
+            names = _curl_saves(args)
+        elif program == "wget":
+            names = _wget_saves(args)
+        elif program == "tee":
+            names = [a for a in args if not a.startswith("-")]
+        elif program in _COPY:
+            names = _copy_destinations(args, dirs)
+        elif program == "dd":
+            names = [a[3:] for a in args if a.startswith("of=")]
+        else:
+            names = _output_options(program, args) + (_clone_destination(program, args) if track_clones else [])
+        for name in names:
+            for one in shell.expand_braces(name):
+                if one and not one.startswith("-"):
+                    found.update(shell.resolve(one, dirs))
+    # A destination that is the working directory or above it would make the whole project
+    # outside content on the strength of one command; that is not what the command says.
+    return sorted(p for p in found if not p.startswith("/dev/")
+                  and not any(under(d, p) for d in c.dirs))
 
 
 def _matches(tool: str, patterns: list) -> bool:

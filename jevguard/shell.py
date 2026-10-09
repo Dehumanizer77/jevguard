@@ -14,6 +14,7 @@ import re
 import shlex
 
 _SEPARATORS = set("();|&")
+_REDIRECT_CHARS = set("<>&|")
 # Programs that only run another program: the command after them is what counts.
 _WRAPPERS = {"rtk", "sudo", "doas", "env", "time", "nohup", "command", "builtin", "exec", "nice", "ionice",
              "stdbuf", "setsid", "timeout", "xargs", "watch"}
@@ -54,6 +55,10 @@ def tokens(cmd: str) -> list[str]:
 class Command:
     def __init__(self, cwd: str = ""):
         self.programs: list[list[str]] = []  # argv of each simple command, wrappers removed
+        self.program_dirs: list[list[str]] = []  # for each program, the directories it may be running in
+        self.program_paths: list[set[str]] = []  # for each program, the paths its arguments name
+        self.program_globs: list[list[str]] = []  # and the glob patterns
+        self.writes: set[str] = set()        # canonical targets of > >> &> redirections
         self.dirs: list[str] = [canonical(cwd)] if cwd else []  # the starting directory and every `cd` target
         self.paths: set[str] = set()         # canonical paths the command names
         self.globs: list[str] = []           # absolute glob patterns it names
@@ -66,11 +71,41 @@ class Command:
         return any(glob_reaches(g, root) for g in self.globs)
 
 
+_BRACES = re.compile(r"\{([^{}]*)\}")
+
+
+def expand_braces(token: str, limit: int = 64) -> list[str]:
+    """`a/{b,c}.txt` as the shell expands it. A range ({1..9}) or an expansion past the limit
+    becomes a `*`, which is read as a glob: wider than the truth, never narrower."""
+    out = [token]
+    for _ in range(8):  # nesting depth
+        step = []
+        for t in out:
+            m = _BRACES.search(t)
+            if not m or ("," not in m.group(1) and ".." not in m.group(1)):
+                step.append(t)
+                continue
+            parts = m.group(1).split(",") if "," in m.group(1) else ["*"]
+            step.extend(t[:m.start()] + part + t[m.end():] for part in parts)
+        if step == out:
+            break
+        out = step
+        if len(out) > limit:
+            return [_BRACES.sub("*", token)]
+    return out
+
+
 def glob_reaches(pattern: str, path: str) -> bool:
     """The pattern can match the path or something inside it. A pattern that stops above the
     path (`ls /home/*` against a file three levels down) does not count."""
     pat, segs = pattern.split("/"), path.split("/")
     return len(pat) >= len(segs) and all(fnmatch.fnmatchcase(seg, p) for p, seg in zip(pat, segs))
+
+
+def glob_reaches_above(pattern: str, path: str) -> bool:
+    """The pattern can match a directory the path lies in (`rm -rf ~/.c*` against ~/.claude/x)."""
+    pat, segs = pattern.split("/"), path.split("/")
+    return len(pat) < len(segs) and all(fnmatch.fnmatchcase(seg, p) for p, seg in zip(pat, segs))
 
 
 def read(cmd: str, cwd: str = "") -> Command:
@@ -105,9 +140,20 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> None:
 
     def _program(argv: list[str]) -> None:
         out.programs.append(argv)
+        out.program_dirs.append(list(out.dirs))
+        paths: set[str] = set()
+        globs: list[str] = []
+        out.program_paths.append(paths)
+        out.program_globs.append(globs)
         program = os.path.basename(argv[0])
-        for arg in argv[1:]:
-            _note_paths(arg, out)
+        for i, arg in enumerate(argv[1:], 1):
+            _note_paths(arg, out.dirs, paths, globs)
+            if ">" in argv[i - 1] and set(argv[i - 1]) <= _REDIRECT_CHARS and not (
+                    argv[i - 1].endswith("&") and (arg.isdigit() or arg == "-")):  # 2>&1 writes no file
+                for target in expand_braces(arg):
+                    out.writes.update(resolve(target, out.dirs))
+        out.paths |= paths
+        out.globs += globs
         if program == "cd":
             target = next((a for a in argv[1:] if not a.startswith("-")), env["HOME"])
             out.dirs.extend([canonical(target, d) for d in out.dirs[:8]])
@@ -136,23 +182,30 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> None:
     finish()
 
 
-def _note_paths(arg: str, out: Command) -> None:
-    """Record the paths one argument names, resolved against every directory the command may be in
-    (after `cd` inside a subshell or a pipeline the real one is not known)."""
+def resolve(name: str, dirs: list[str]) -> list[str]:
+    """A file name as canonical paths: one if it is absolute, else one per directory the command
+    may be in (after `cd` inside a subshell or a pipeline the real one is not known)."""
+    if os.path.isabs(os.path.expanduser(name)):
+        return [canonical(name)]
+    return [canonical(name, d) for d in dirs]
+
+
+def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
+    """Record the paths one argument names."""
     if "://" in arg and " " not in arg:
         return
     if arg.startswith("-"):
         if "=" not in arg:
             return
         arg = arg.split("=", 1)[1]
-    if arg and len(arg) <= 300 and not re.search(r"[\s'\"(),;]", arg):
-        candidates = [arg]
+    if arg and len(arg) <= 300 and not re.search(r"[\s'\"();]", arg):
+        candidates = expand_braces(arg)
     else:
         candidates = _EMBEDDED.findall(arg[:20000])
     for cand in candidates:
-        absolute = os.path.isabs(os.path.expanduser(cand))
-        for d in [""] if absolute else out.dirs:
-            if _GLOB.search(cand):
-                out.globs.append(os.path.normpath(os.path.join(d, os.path.expanduser(cand))))
-            else:
-                out.paths.add(canonical(cand, d))
+        if _GLOB.search(cand):
+            expanded = os.path.expanduser(cand)
+            for d in [""] if os.path.isabs(expanded) else dirs:
+                globs.append(os.path.normpath(os.path.join(d, expanded)))
+        else:
+            paths.update(resolve(cand, dirs))
