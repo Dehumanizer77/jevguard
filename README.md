@@ -125,8 +125,10 @@ Run `tests/e2e_claude.py` after a Claude Code update. A replacement whose shape 
 a built-in tool's output is ignored by Claude Code without an error, and the model then reads the
 original.
 
-## Credits
+## License and credits
+
+MIT, see [`LICENSE`](LICENSE).
 
 `jevguard/core/` is copied unchanged from
-[jooray/hermes-firewall](https://github.com/jooray/hermes-firewall) by Juraj Bednár, MIT licensed
-(`jevguard/core/LICENSE`, source commit in `jevguard/core/UPSTREAM`).
+[jooray/hermes-firewall](https://github.com/jooray/hermes-firewall) by Juraj Bednár, also MIT,
+and keeps its own notice (`jevguard/core/LICENSE`, source commit in `jevguard/core/UPSTREAM`).
