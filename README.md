@@ -45,8 +45,11 @@ Two Claude Code [hooks](https://code.claude.com/docs/en/hooks) run `bin/jevguard
 5. *Act.* In `log` mode nothing changes for the model. In `block` mode the whole result is
    replaced by a short notice (`updatedToolOutput`) and the original goes to a quarantine file.
    Nothing is ever added to a result that passes. The notice carries a seal made with a key
-   kept on this machine; only a sealed notice is skipped when it turns up in a later result.
+   kept on this machine; only sealed text is skipped when it turns up in a later result.
    Text that merely looks like a notice, or like any other harness message, is scored.
+   The guard's own `log`, `status` and `scan` output is sealed the same way when it is not
+   going to a terminal (each line ends in a `#jg:` tag): it talks about injections, and
+   without the seal the guard blocked its own log on the first day it ran.
 
 Every scan is one line in `~/.local/state/jevguard/scans.jsonl`: tool, origin, verdict, score,
 size, timing, a hash. Never the content.
@@ -115,6 +118,10 @@ jevguard uninstall
 `show` and `release` are for you, reading what was blocked. They refuse to run without a
 terminal or when started from inside Claude Code, and the hook asks you before any call that
 runs them. Neither is a lock; see the limits below.
+
+`install` also adds two `permissions.deny` rules, `Read(~/.config/jevguard/**)` and
+`Read(~/.local/state/jevguard/**)`: the API key and the seal key are there, and no hook runs
+before Claude Code's own file tools read a file. `uninstall` removes them.
 
 ## Settings
 

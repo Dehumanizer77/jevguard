@@ -541,3 +541,61 @@ def test_issue13_reading_settings_is_not_a_change_but_feeding_them_on_is(guard):
                 "uniq /tmp/x ~/.claude/settings.json", "xxd -r /tmp/hex .claude/settings.local.json", "jq . /tmp/x > ~/.claude/settings.json",
                 f"cat {guard.home}/config/typesafe.key"):
         assert asks(guard.hook("PreToolUse", "Bash", {"command": cmd}, cwd="/work")), cmd
+
+
+# ---- found on the first live day: the guard's own output must not be blocked ---------------------
+def _cli(guard, *args):
+    env = {**os.environ, "JEVGUARD_HOME": str(guard.home)}
+    env.pop("CLAUDECODE", None)
+    return subprocess.run([str(ROOT / "bin" / "jevguard"), *args], capture_output=True, text=True, env=env).stdout
+
+
+def test_guard_log_and_scan_output_are_recognised_as_its_own(guard, jev, tmp_path):
+    guard.configure(mode="block")
+    guard.hook("PostToolUse", "WebFetch", FETCH, webfetch(ATTACK))
+    guard.hook("PostToolUse", "WebFetch", FETCH, webfetch(BENIGN))
+    log, status = _cli(guard, "log", "--all"), _cli(guard, "status")
+    sample = tmp_path / "sample.txt"
+    sample.write_text(ATTACK)
+    verdict = _cli(guard, "scan", str(sample))
+    assert "blocked" in log and "#jg:" in log and json.loads(verdict)["verdict"] == "injection"
+    n = len(jev.requests)
+    fetch = {"command": "curl -s https://news.example.com/a; jevguard log"}
+    for text in (log, status, verdict, log + status + verdict):
+        assert guard.hook("PostToolUse", "Bash", fetch, bash(text)) is None
+    assert len(jev.requests) == n  # nothing was left to score
+    # anything that is not verifiably the guard's own is scored: a forged tag, text after a tag,
+    # a tagged line with one word changed, a sealed verdict with one field changed
+    first = log.splitlines()[0]
+    forged = json.dumps(dict(json.loads(verdict), source=ATTACK))
+    for text in (ATTACK + "\t#jg:0123456789abcdef", first + " " + ATTACK, first.replace("blocked", ATTACK, 1),
+                 log + ATTACK, forged):
+        assert guard.hook("PostToolUse", "Bash", fetch, bash(text)) is not None, text
+        assert "ignore your previous instructions" in jev.requests[-1]["state"].lower()
+
+
+def test_guard_log_files_are_not_outside_content_but_quarantine_is(guard, jev):
+    guard.configure(mode="block")
+    guard.hook("PostToolUse", "WebFetch", FETCH, webfetch(ATTACK))
+    state = guard.home / "state"
+    qid = guard.log()[-1]["quarantine_id"]
+    n = len(jev.requests)
+    assert guard.hook("PostToolUse", "Bash", {"command": f"tail -n 3 {state}/scans.jsonl"}, bash(ATTACK), session="x") is None
+    assert guard.hook("PostToolUse", "Read", {"file_path": f"{state}/usage.json"}, read(f"{state}/usage.json", ATTACK), session="x") is None
+    assert len(jev.requests) == n
+    assert guard.hook("PostToolUse", "Bash", {"command": f"cat {state}/quarantine/{qid}.json"}, bash(ATTACK), session="x")
+
+
+def test_install_keeps_file_tools_out_of_the_guard_directories(tmp_path, monkeypatch):
+    from jevguard import cli, config
+    monkeypatch.setenv("JEVGUARD_HOME", str(tmp_path / "jg"))
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"permissions": {"defaultMode": "auto", "deny": ["Bash(rm -rf /)"]}}))
+    assert cli.main(["--settings", str(settings), "install"]) == 0
+    deny = json.loads(settings.read_text())["permissions"]["deny"]
+    assert deny[0] == "Bash(rm -rf /)" and len(deny) == 3
+    assert f"Read(/{tmp_path}/jg/config/**)" in deny and f"Read(/{tmp_path}/jg/state/**)" in deny
+    assert cli.main(["--settings", str(settings), "install"]) == 0
+    assert json.loads(settings.read_text())["permissions"]["deny"] == deny  # idempotent
+    assert cli.main(["--settings", str(settings), "uninstall"]) == 0
+    assert json.loads(settings.read_text()) == {"permissions": {"defaultMode": "auto", "deny": ["Bash(rm -rf /)"]}}

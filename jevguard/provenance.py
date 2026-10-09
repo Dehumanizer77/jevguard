@@ -96,8 +96,9 @@ def _matches(tool: str, patterns: list) -> bool:
 
 def outside_roots(cfg, session_paths: list[str]) -> list[str]:
     """Everything whose content counts as coming from outside: the configured directories, the
-    guard's own state (quarantined originals live there) and what this session downloaded."""
-    return [canonical(p) for p in cfg.external_paths] + [canonical(str(cfg.state_dir))] + list(session_paths)
+    quarantined originals and what this session downloaded. The rest of the guard's state (its
+    log, counters, session records) holds no content from outside."""
+    return [canonical(p) for p in cfg.external_paths] + [canonical(str(cfg.quarantine_dir))] + list(session_paths)
 
 
 def mentions(text: str, roots: list[str], bases: list[str]) -> bool:

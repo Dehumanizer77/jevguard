@@ -13,7 +13,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from . import config, scanner, store
+from . import config, firstparty, scanner, store
 
 HOOK = str(Path(__file__).resolve().parent.parent / "bin" / "jevguard-hook")
 SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -69,9 +69,32 @@ def installed(settings_path: Path) -> bool:
     return any(_ours(g) for ev in ("PostToolUse", "PreToolUse") for g in hooks.get(ev, []))
 
 
+def _read_deny_rules(cfg) -> list[str]:
+    """Permission rules that keep Claude Code's file tools out of the guard's directories: the
+    API key and the seal key are there, and no hook runs before a Read."""
+    home = str(Path.home())
+
+    def rule(path) -> str:
+        p = os.path.realpath(str(path))
+        return f"Read(~/{p[len(home) + 1:]}/**)" if p.startswith(home + "/") else f"Read(/{p}/**)"
+
+    return [rule(cfg.config_dir), rule(cfg.state_dir)]
+
+
 def install(cfg, settings_path: Path, remove: bool = False) -> str:
     settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
     before = json.dumps(settings, sort_keys=True)
+    rules = _read_deny_rules(cfg)
+    permissions = settings.get("permissions") if isinstance(settings.get("permissions"), dict) else {}
+    deny = [r for r in permissions.get("deny", []) if r not in rules]
+    if not remove and cfg.protect_guard:
+        deny += rules
+    if deny:
+        settings.setdefault("permissions", permissions)["deny"] = deny
+    elif "deny" in permissions:
+        del permissions["deny"]
+        if not permissions:
+            settings.pop("permissions", None)
     hooks = settings.setdefault("hooks", {})
     # A hook that may answer (replace a result, ask for approval) has to be waited for.
     plan = {"PostToolUse": (_POST, cfg.mode == "block", True),
@@ -244,7 +267,12 @@ def _scan_text(cfg, text: str) -> tuple[dict, float]:
 def cmd_scan(cfg, a) -> int:
     text = Path(a.file).read_text(errors="replace") if a.file != "-" else sys.stdin.read()
     verdict, ms = _scan_text(cfg, text)
-    print(json.dumps(dict(verdict, ms=round(ms)), indent=2, ensure_ascii=False))
+    result = dict(verdict, ms=round(ms))
+    if sys.stdout.isatty():
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:  # read by a program, likely the agent: one sealed line, so a later scan knows it is ours
+        firstparty.use(cfg)
+        print(json.dumps(firstparty.seal_object(result), ensure_ascii=False))
     return 0
 
 
@@ -291,5 +319,21 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd in ("install", "uninstall"):
         print(install(cfg, a.settings, remove=a.cmd == "uninstall"))
         return 0
-    return {"status": cmd_status, "log": cmd_log, "show": cmd_show, "release": cmd_release,
-            "scan": cmd_scan, "selftest": cmd_selftest}[a.cmd](cfg, a)
+    run = {"status": cmd_status, "log": cmd_log, "show": cmd_show, "release": cmd_release,
+           "scan": cmd_scan, "selftest": cmd_selftest}[a.cmd]
+    if sys.stdout.isatty() or a.cmd in ("show", "release", "scan"):
+        return run(cfg, a)
+    # Not a terminal: the output is most likely going to the agent, where it will be scanned like
+    # any other text. It talks about injections and blocked results, so each line is tagged with a
+    # seal that lets the scan recognise it as the guard's own. A terminal gets it untagged.
+    import contextlib
+    import io
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = run(cfg, a)
+    try:
+        firstparty.use(cfg)
+        sys.stdout.write("".join(firstparty.seal_line(line) + "\n" for line in buffer.getvalue().splitlines()))
+    except Exception:
+        sys.stdout.write(buffer.getvalue())
+    return code
