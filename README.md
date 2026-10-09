@@ -75,7 +75,7 @@ The check before a call takes about 35 ms on the machine this was developed on.
 Needs Python 3.11+ on Linux or macOS and a TypeSafe API key. No packages to install.
 
 ```bash
-git clone https://github.com/Dehumanizer77/claude-firewall ~/.local/share/jevguard
+git clone https://github.com/Dehumanizer77/jevguard ~/.local/share/jevguard
 mkdir -p ~/.config/jevguard && chmod 700 ~/.config/jevguard
 umask 077; cat > ~/.config/jevguard/typesafe.key      # paste the key, Enter, Ctrl-D
 
