@@ -137,7 +137,8 @@ def pre_tool_use(d: dict, cfg) -> dict | None:
         why = gate.guard_change(tool, tool_input, cfg, cwd)
         if why:
             store.audit(cfg, **ids, why=why, taint="guard", action="asked")
-            return _ask(f"this call {why}. Changes to the guard need your approval.")
+            return _ask(f"{why}. Approve only if you expect this session to be changing the guard "
+                        "or Claude Code's settings right now; you do not need to review the rest of the command.")
     if cfg.gate == "off":
         return None
     why = gate.risky(tool, tool_input, cwd)

@@ -229,7 +229,6 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
     roots = [canonical(str(cfg.config_dir)), canonical(str(cfg.state_dir)), CODE_ROOT]
     # What must not be removed from above either: the guard's directories and the user's settings.
     targets = roots + [canonical(os.path.join("~", ".claude", name)) for name in _SETTINGS_NAMES]
-    what = "the guard's own files or the Claude Code settings that run it"
 
     def protected(path: str) -> bool:
         return bool(_SETTINGS.search(path)) or any(under(path, r) for r in roots)
@@ -237,8 +236,11 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
     def above(path: str) -> bool:
         return any(path != t and under(t, path) for t in targets)
 
+    # Every reason names the program and the exact path that set it off. The person asked to
+    # approve cannot review a two-hundred-line command; they can check one named thing.
     if tool in ("Write", "Edit", "NotebookEdit"):
-        return f"writes to {what}" if protected(canonical(str(tool_input.get("file_path") or ""), cwd)) else ""
+        path = canonical(str(tool_input.get("file_path") or ""), cwd)
+        return f"{tool} writes to {_show(path)}, {_kind(path, roots)}" if protected(path) else ""
     if tool != "Bash":
         return ""
     cmd = str(tool_input.get("command") or "")
@@ -251,32 +253,63 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
         if program == "jevguard":
             sub = next((a for i, a in enumerate(argv[1:], 1) if not a.startswith("-") and argv[i - 1] != "--settings"), "")
             if sub in _ADMIN:
-                return f"runs `jevguard {sub}`"
+                return f"the command runs `jevguard {sub}`"
         if program == "claude" and "config" in argv[1:3]:
-            return "changes Claude Code settings"
-    if _ADMIN_TEXT.search(cmd):
-        return "runs a jevguard administration command"
-    if any(protected(p) for p in shell.written_paths(c)):
-        return f"writes to {what}"  # -o/path, --output-dir with -O, cd there and download, cp -t, dd of=
+            return "the command runs `claude config`, which changes Claude Code settings"
+    admin = _ADMIN_TEXT.search(cmd)
+    if admin:
+        return (f"the text of the command contains `{' '.join(admin.group(0).split())[:70]}`, "
+                "which reads like a jevguard administration command")
+    written = next((p for p in sorted(shell.written_paths(c)) if protected(p)), None)
+    if written:  # -o/path, --output-dir with -O, cd there and download, cp -t, dd of=
+        return f"the command writes to {_show(written)}, {_kind(written, roots)}"
     for argv, dirs, paths, globs, fed in zip(c.programs, c.program_dirs, c.program_paths, c.program_globs,
                                              c.program_fed):
+        program = os.path.basename(argv[0])
         if fed:  # xargs, $(...): what this program is given is named elsewhere in the command, if at all
             paths, globs = c.paths, c.globs
-        if os.path.basename(argv[0]) == "jevguard":
+        if program == "jevguard":
             # Its other subcommands change nothing; of their arguments only real paths count
             # (`jevguard scan <file>`), not words like "status" resolved against the directory.
             paths = {p for a in argv[1:] if "/" in a or a.startswith("~") for p in shell.resolve(a, dirs)}
-        elif not _reads_only(argv) and any(under(d, r) for d in dirs for r in roots):
-            return f"runs inside {what}"  # `git reset --hard` there names no file and changes them all
+        elif not _reads_only(argv):
+            inside = next((d for d in dirs for r in roots if under(d, r)), None)
+            if inside:  # `git reset --hard` there names no file and changes them all
+                return f"`{program}` runs inside {_show(inside)}, one of the guard's own directories"
         # The guard's own directories hold the API key and the release list: any program counts.
-        if any(under(p, r) for p in paths for r in roots) or any(shell.glob_reaches(g, r) for g in globs for r in roots):
-            return f"touches {what}"
+        hit = next((p for p in sorted(paths) if any(under(p, r) for r in roots)), None) or \
+            next((g for g in globs if any(shell.glob_reaches(g, r) for r in roots)), None)
+        if hit:
+            return f"`{program}` {_names(argv, hit)} {_show(hit)}, {_kind(hit, roots)}"
         if _reads_only(argv):
             continue  # cat .claude/settings.json, ls ~: looking is not a change
-        if any(_SETTINGS.search(p) for p in paths) or any(_settings_glob(g) for g in globs):
-            return f"touches {what}"
-        if any(above(p) or os.path.basename(p) == ".claude" for p in paths) or \
-                any(shell.glob_reaches_above(g, t) for g in globs for t in targets):
-            # also any project's .claude directory: unpacking or copying into it can plant a settings file
-            return f"acts on a directory that holds {what}"
+        hit = next((p for p in sorted(paths) if _SETTINGS.search(p)), None) or \
+            next((g for g in globs if _settings_glob(g)), None)
+        if hit:
+            return f"`{program}` {_names(argv, hit)} {_show(hit)}, {_kind(hit, roots)}"
+        # also any project's .claude directory: unpacking or copying into it can plant a settings file
+        hit = next((p for p in sorted(paths) if above(p) or os.path.basename(p) == ".claude"), None) or \
+            next((g for g in globs if any(shell.glob_reaches_above(g, t) for t in targets)), None)
+        if hit:
+            return (f"`{program}` {_names(argv, hit)} {_show(hit)}, a directory that holds the guard's files "
+                    "or Claude Code settings, and it is not a program that only reads")
     return ""
+
+
+def _show(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path != home and under(path, home) else path
+
+
+def _kind(path: str, roots: list[str]) -> str:
+    if any(under(path, r) or shell.glob_reaches(path, r) for r in roots):
+        return "one of the guard's own files"
+    return "a Claude Code settings file (the hooks that run the guard are set there)"
+
+
+def _names(argv: list[str], hit: str) -> str:
+    """Whether the path is an argument of its own or sits inside a longer text (a script passed
+    to python, a here-document): the second is where false alarms come from."""
+    leaf = os.path.basename(hit.rstrip("/"))
+    direct = any(leaf in a and len(a) <= 300 and not re.search(r"\s", a) for a in argv[1:])
+    return "is given" if direct else "is given a text that mentions"

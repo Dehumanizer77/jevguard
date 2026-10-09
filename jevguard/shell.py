@@ -23,7 +23,8 @@ _WRAPPERS = {"rtk": "", "sudo": "ughpCDRTU", "doas": "uC", "env": "uCS", "time":
              "unbuffer": "", "caffeinate": ""}
 _WRAPPER_CHDIR = {("env", "C"), ("sudo", "D"), ("doas", "C")}
 # Programs that take a command line as the string after -c (bash -lc '...', script -qc '...').
-_TAKES_COMMAND = {"bash", "sh", "zsh", "dash", "ksh", "su", "script"}
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+_TAKES_COMMAND = _SHELLS | {"su", "script"}
 _ASSIGN = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S)
 _VAR = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
 _SINGLE_QUOTED = re.compile(r"'[^']*'")
@@ -113,8 +114,24 @@ def glob_reaches_above(pattern: str, path: str) -> bool:
     return len(pat) < len(segs) and all(fnmatch.fnmatchcase(seg, p) for p, seg in zip(pat, segs))
 
 
+_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_]\w*)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+_SUBSTITUTION = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+
+
+def _inline_heredocs(cmd: str) -> str:
+    """`python3 - <<'EOF' ... EOF` as `python3 - '...'`. A here-document is text handed to the
+    program, not shell: read line by line as commands, its first word of each line would be
+    taken for a program and the paths it names would be lost. With an unquoted marker the shell
+    still runs the $(...) inside it, so those are kept as commands."""
+    def inline(m: re.Match) -> str:
+        body, rest = m.group(4), m.group(3)
+        runs = "" if m.group(1) else "".join(f" ; {a or b}" for a, b in _SUBSTITUTION.findall(body))
+        return f" {shlex.quote(body)} {rest}{runs}"
+    return _HEREDOC.sub(inline, cmd)
+
+
 def read(cmd: str, cwd: str = "") -> Command:
-    cmd = cmd.replace("\0", "")
+    cmd = _inline_heredocs(cmd.replace("\0", ""))
     out = Command(cwd)
     # The hook runs in the environment Claude Code gives its commands, so a variable set there
     # has the value the command saw. Only what neither that nor the command itself sets is unknown.
@@ -174,9 +191,11 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> None:
         if depth >= 3:
             return
         if program in _TAKES_COMMAND:
-            for i, arg in enumerate(argv[1:-1], 1):
-                if re.fullmatch(r"-\w*c", arg):
-                    _read(argv[i + 1], out, env, depth + 1)
+            for i, arg in enumerate(argv[1:], 1):
+                # the string after -c, and for a shell any argument with spaces in it: a script
+                # given as a here-document arrives that way
+                if re.fullmatch(r"-\w*c", argv[i - 1]) or (program in _SHELLS and re.search(r"\s", arg)):
+                    _read(arg, out, env, depth + 1)
         elif program == "eval":
             _read(" ".join(argv[1:]), out, env, depth + 1)
         elif program == "find":
@@ -221,7 +240,7 @@ def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
             forms = [arg] + ([arg.split("=", 1)[1]] if "=" in arg else [])  # dd of=/path
         candidates = [c for form in forms if form for c in expand_braces(form)]
     else:
-        candidates = _EMBEDDED.findall(arg[:20000])
+        candidates = _EMBEDDED.findall(arg[:200000])
     for cand in candidates:
         if _GLOB.search(cand):
             expanded = os.path.expanduser(cand)
