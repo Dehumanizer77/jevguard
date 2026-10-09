@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shutil
 import statistics
 import sys
@@ -71,11 +73,13 @@ def install(cfg, settings_path: Path, remove: bool = False) -> str:
     settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
     before = json.dumps(settings, sort_keys=True)
     hooks = settings.setdefault("hooks", {})
-    plan = {"PostToolUse": (_POST, cfg.mode == "block"),
-            "PreToolUse": (_PRE, cfg.gate.startswith("ask"))}
-    for event, (matchers, sync) in plan.items():
+    # A hook that may answer (replace a result, ask for approval) has to be waited for.
+    plan = {"PostToolUse": (_POST, cfg.mode == "block", True),
+            "PreToolUse": (_PRE, cfg.gate.startswith("ask") or cfg.protect_guard,
+                           cfg.gate != "off" or cfg.protect_guard)}
+    for event, (matchers, sync, wanted) in plan.items():
         groups = [g for g in hooks.get(event, []) if not _ours(g)]
-        if not remove and not (event == "PreToolUse" and cfg.gate == "off"):
+        if not remove and wanted:
             groups += [{"matcher": m, "hooks": [_hook_entry(sync)]} for m in matchers]
         if groups:
             hooks[event] = groups
@@ -117,7 +121,8 @@ def cmd_status(cfg, a) -> int:
     key = config.read_key(cfg)
     u = store.usage(cfg)
     today = u.get("tokens", 0) if u.get("day") == time.strftime("%Y-%m-%d") else 0
-    print(f"mode: {cfg.mode}   gate: {cfg.gate}   on_error: {cfg.on_error}   model: {cfg.model}")
+    print(f"mode: {cfg.mode}   gate: {cfg.gate}   on_error: {cfg.on_error}   "
+          f"protect_guard: {cfg.protect_guard}   model: {cfg.model}")
     print(f"hooks installed: {'yes' if installed(a.settings) else 'no'} ({a.settings})")
     print(f"API key: {'present' if key else 'MISSING'} ({cfg.key_file})")
     print(f"scan local content: {cfg.scan_local}   private hosts: {cfg.scan_private_hosts}   "
@@ -136,9 +141,9 @@ def cmd_status(cfg, a) -> int:
         print(f"  scan time: median {statistics.median(ms):.0f} ms, max {max(ms):.0f} ms")
     gates = [r for r in recs if r.get("event") == "gate"]
     if gates:
-        print(f"gate: {len(gates)} risky actions in sessions that read outside content")
+        print(f"gate: {len(gates)} calls looked at (risky after outside content, or a change to the guard)")
         for (action, taint), n in Counter((r.get("action"), r.get("taint")) for r in gates).most_common():
-            print(f"  {action:<10} taint={taint:<9} {n}")
+            print(f"  {action:<10} {taint or '':<9} {n}")
     errors = [r for r in recs if r.get("event") == "error"]
     if errors:
         print(f"guard errors: {len(errors)} (last: {errors[-1].get('error')})")
@@ -163,11 +168,39 @@ def cmd_log(cfg, a) -> int:
     return 0
 
 
+def _started_by_claude_code() -> str:
+    """Why this process looks like it was started by Claude Code, or an empty string."""
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "the Claude Code environment is set"
+    pid = os.getppid()
+    for _ in range(64):  # walk up the process tree (Linux; elsewhere only the environment is checked)
+        try:
+            stat = open(f"/proc/{pid}/stat").read()
+            cmdline = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            break
+        name = stat[stat.index("(") + 1:stat.rindex(")")]
+        if name == "claude" or "claude-code" in exe or re.search(r"(?:^|/)claude(?:\.exe)?(?:\s|$)|claude-code", cmdline):
+            return f"it runs under Claude Code (process {pid})"
+        pid = int(stat[stat.rindex(")") + 2:].split()[1])
+        if pid <= 1:
+            break
+    return ""
+
+
 def _owner_only() -> bool:
-    if sys.stdin.isatty() and sys.stdout.isatty():
+    """show and release are for the owner reading a blocked result, never for the agent. This
+    refuses the ways an agent would normally reach them (no terminal, or started from inside
+    Claude Code). It is not a lock: the agent runs as the same user, and a process that detaches
+    itself and fakes a terminal gets through. The hook that asks before any `jevguard release`
+    call is the approval step; this check is the second line."""
+    why = "" if sys.stdin.isatty() and sys.stdout.isatty() else "there is no terminal"
+    why = why or _started_by_claude_code()
+    if not why:
         return True
-    print("This command shows or releases quarantined content and only runs in the owner's own terminal.",
-          file=sys.stderr)
+    print(f"Refused: {why}. This command shows or releases quarantined content; run it yourself in "
+          "a terminal outside Claude Code.", file=sys.stderr)
     return False
 
 

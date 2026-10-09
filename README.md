@@ -27,6 +27,9 @@ Two Claude Code [hooks](https://code.claude.com/docs/en/hooks) run `bin/jevguard
    `WebFetch`, `WebSearch` and MCP tools are outside content; so is `Bash` when the command
    names a public URL or is a tool that only talks to a remote service (`gh`, ...); so are
    files a fetching command saved (`curl -o`, `> file`) and anything under `external_paths`.
+   Such a file stays outside content however it is read back: `Read`, `cat page.html`,
+   `cd dir && head f`, a glob, a variable the command sets, a path inside `python -c "..."`,
+   or a `Grep` over a parent directory whose result lists it.
    Everything else is local and, by default, is not scanned and never leaves the machine.
 2. *Extract.* Plain code reveals what a human would not see: invisible Unicode tag characters,
    zero-width and bidi characters, hidden HTML, comments, attribute text, base64 blobs, image
@@ -36,34 +39,52 @@ Two Claude Code [hooks](https://code.claude.com/docs/en/hooks) run `bin/jevguard
    request, or an instruction aimed at an AI model. The highest probability over all chunks is
    the score.
 4. *Decide.* Score ≥ 0.38: injection. Score ≥ 0.20, hidden text, or a part that could not be
-   read: logged as flagged, nothing else happens. The verdict is computed in code.
+   read (an image without OCR, undecodable data): flagged. The verdict is computed in code.
 5. *Act.* In `log` mode nothing changes for the model. In `block` mode the whole result is
    replaced by a short notice (`updatedToolOutput`) and the original goes to a quarantine file.
-   Nothing is ever added to a result that passes.
+   Nothing is ever added to a result that passes. The notice carries a seal made with a key
+   kept on this machine; only a sealed notice is skipped when it turns up in a later result.
+   Text that merely looks like a notice, or like any other harness message, is scored.
 
 Every scan is one line in `~/.local/state/jevguard/scans.jsonl`: tool, origin, verdict, score,
 size, timing, a hash. Never the content.
 
 **PreToolUse** (before a tool runs)
 
-A pattern check, no model: is this call one that could carry out an injected instruction
-(HTTP request with a body, `git push`, `ssh`/`scp`, sending mail, publishing, an MCP tool that
-sends or changes something, a write to `~/.ssh`, shell startup files or Claude Code's own
-settings)? If so, and the session has read outside content, the call is logged, or, with
-`gate` set to `ask-flagged` / `ask-external`, held for the user's approval.
+Two checks that read the call itself, no model:
+
+- *Changes to the guard.* A call that would change the guard's settings, state, release list
+  or code, run `jevguard mode|gate|install|uninstall|release|show`, or touch a Claude Code
+  `settings*.json` (the hooks live there) is held for your approval. In every session,
+  whatever `gate` says. Switch off with `protect_guard: false`.
+- *Risky actions after outside content.* An HTTP request with a body, `git push`,
+  `ssh`/`scp`, sending mail, publishing, an MCP tool that sends or changes something, or
+  touching `~/.ssh`, shell startup files and git hooks. If the session has read outside
+  content, the call is logged, or, with `gate` set to `ask-flagged` / `ask-external`, held
+  for approval. A session counts as flagged once a result scored as an injection or passed
+  without a full scan.
+
+Both read what a command says in plain sight: programs and their options, `bash -c '...'`,
+`find -exec`, `$(...)`, paths after `cd`. That is an approval step, not a wall; see the limits
+below.
+
+The check before a call takes about 35 ms on the machine this was developed on.
 
 ## Install
 
 Needs Python 3.11+ on Linux or macOS and a TypeSafe API key. No packages to install.
 
 ```bash
-git clone https://github.com/Dehumanizer77/claude-firewall ~/claude-firewall
+git clone https://github.com/Dehumanizer77/claude-firewall ~/.local/share/jevguard
 mkdir -p ~/.config/jevguard && chmod 700 ~/.config/jevguard
 umask 077; cat > ~/.config/jevguard/typesafe.key      # paste the key, Enter, Ctrl-D
 
-~/claude-firewall/bin/jevguard selftest               # one benign and one attack sample through the API
-~/claude-firewall/bin/jevguard install                # adds the hooks to ~/.claude/settings.json (backup kept)
+~/.local/share/jevguard/bin/jevguard selftest         # one benign and one attack sample through the API
+~/.local/share/jevguard/bin/jevguard install          # adds the hooks to ~/.claude/settings.json (backup kept)
 ```
+
+Install from a checkout nobody works in. The guard asks before any call that touches its own
+code, so developing inside the installed copy means approving every edit.
 
 It starts in `log` mode. Run it that way on your own traffic first and read what would have
 been blocked; upstream's first week of blocking produced only false positives, most of them the
@@ -79,7 +100,9 @@ jevguard gate ask-flagged       # ask before risky actions once something was fl
 jevguard uninstall
 ```
 
-`show` and `release` refuse to run without a terminal, so the agent cannot use them.
+`show` and `release` are for you, reading what was blocked. They refuse to run without a
+terminal or when started from inside Claude Code, and the hook asks you before any call that
+runs them. Neither is a lock; see the limits below.
 
 ## Settings
 
@@ -95,7 +118,8 @@ jevguard uninstall
 | `external_paths` | `["~/Downloads"]` | directories whose files are outside content |
 | `track_clones` | `false` | treat directories created by `git clone` as outside content |
 | `skip_tools` | claude.ai Gmail, Drive, Calendar, Docs connectors | tool-name patterns never scanned |
-| `on_error` | `open` | `closed` withholds outside content when scanning fails (block mode) |
+| `on_error` | `open` | `closed` withholds outside content that could not be fully scanned: the API failed, the guard hit an error, or part of the result was unreadable (block mode). Without `tesseract` that includes every image from outside |
+| `protect_guard` | `true` | ask before any call that would change the guard or the Claude Code settings that run it |
 | `daily_token_budget` | 5,000,000 | scanning stops for the day beyond this |
 | `model` | `jev-1.13.0` | pinned; the thresholds were fitted on this version |
 
@@ -106,6 +130,11 @@ fetches and the private connectors out of that; each switch above widens it.
 
 - Files pulled in with `@file`, `CLAUDE.md`, memory and skill files, MCP tool descriptions and
   server instructions, text you paste yourself: Claude Code runs no tool-result hook for these.
+- An outside file reached without being named: a script written earlier that opens it, or a
+  recursive search that prints matches without file names. The guard follows such files by
+  name. When a session has downloaded files, commands that pick their files at run time
+  (`$(...)`, `xargs`, `find`) are scanned too. `scan_local` closes the rest, at the price of
+  sending local content for scoring.
 - Text in the pixels of an image, unless `tesseract` is installed. Image metadata is read.
 - Results shorter than three words, and reports returned by subagents (their own tool calls are
   scanned).
@@ -113,6 +142,14 @@ fetches and the private connectors out of that; each switch above widens it.
 - An attack the model does not recognise. Upstream measured 88.5% of attacks blocked and 3.5% of
   benign items blocked on its 718-item test set, through Venice with `jev-latest`; those numbers
   have not been re-measured through this code path.
+- An agent that sets out to get around it. The agent runs as the same operating-system user
+  as you. The checks before a call read the command as written, so a command that hides what
+  it does (encoded, or put in a script first) is not recognised, and anything the agent can
+  run can also edit the guard's files or fake a terminal. To make the guard's files a real
+  boundary, take them away from that user: run Claude Code in its
+  [sandbox](https://code.claude.com/docs/en/sandboxing) with `~/.config/jevguard`,
+  `~/.local/state/jevguard`, the checkout and `~/.claude/settings.json` denied for writing, or
+  make them root-owned so that changing them takes `sudo`.
 
 ## Tests
 
@@ -132,3 +169,5 @@ MIT, see [`LICENSE`](LICENSE).
 `jevguard/core/` is copied unchanged from
 [jooray/hermes-firewall](https://github.com/jooray/hermes-firewall) by Juraj Bednár, also MIT,
 and keeps its own notice (`jevguard/core/LICENSE`, source commit in `jevguard/core/UPSTREAM`).
+One part of it is not used: its removal of the Hermes and BrowserOS harness messages before
+scoring is replaced by the sealed-notice check in `jevguard/firstparty.py`.

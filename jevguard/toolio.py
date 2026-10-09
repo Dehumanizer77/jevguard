@@ -15,12 +15,23 @@ from __future__ import annotations
 
 import base64
 import binascii
-from typing import Any
+import re
+import unicodedata
 
 _PLUMBING_KEYS = {"type", "tool_use_id", "mimeType"}
+_NL_WORD = re.compile(r"[^\W\d_]{2,}")
+_INVISIBLE = dict.fromkeys([0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x180E, *range(0x202A, 0x202F),
+                            *range(0x2066, 0x206A), 0x00AD])
 
 
-def _leaves(o: Any, out: list, images: list) -> None:
+def words(text: str) -> int:
+    """Words the model can read, counted after the same unhiding extraction does."""
+    if any(0xE0000 <= ord(c) <= 0xE007F for c in text):
+        text = "".join(chr(ord(c) - 0xE0000) if 0xE0000 <= ord(c) <= 0xE007F else c for c in text)
+    return len(_NL_WORD.findall(unicodedata.normalize("NFKC", text.translate(_INVISIBLE))))
+
+
+def _leaves(o, out: list, images: list) -> None:
     if isinstance(o, str):
         out.append(o)
     elif isinstance(o, dict):
@@ -37,7 +48,7 @@ def _leaves(o: Any, out: list, images: list) -> None:
             _leaves(v, out, images)
 
 
-def text_of(tool: str, resp: Any) -> tuple[str, list[bytes]]:
+def text_of(tool: str, resp) -> tuple[str, list[bytes]]:
     """(model-visible text, images as bytes) of a tool result."""
     texts: list = []
     b64: list = []
@@ -66,7 +77,7 @@ def text_of(tool: str, resp: Any) -> tuple[str, list[bytes]]:
     return "\n".join(t for t in texts if t), images
 
 
-def replaced(tool: str, resp: Any, note: str) -> Any:
+def replaced(tool: str, resp, note: str):
     """The tool result with its content replaced by note, in the shape the tool returns."""
     if isinstance(resp, dict) and tool == "Bash":
         return {**resp, "stdout": note, "stderr": "", "isImage": False}

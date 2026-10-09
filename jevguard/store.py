@@ -7,13 +7,10 @@ read-modify-write goes through an exclusive lock and the log is appended in sing
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import re
 import time
-import uuid
-from contextlib import contextmanager
 from pathlib import Path
 
 _MAX_LOG = 20 * 1024 * 1024
@@ -26,25 +23,36 @@ def _private_dir(p: Path) -> Path:
     return p
 
 
-@contextmanager
-def _locked(path: Path):
-    """Exclusive lock on path; yields the parsed JSON object and writes it back on exit."""
-    _private_dir(path.parent)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        with os.fdopen(os.dup(fd), "r+") as f:
-            raw = f.read()
-            try:
-                data = json.loads(raw) if raw.strip() else {}
-            except ValueError:
-                data = {}
-            yield data
-            f.seek(0)
-            f.truncate()
-            json.dump(data, f)
-    finally:
-        os.close(fd)
+class _locked:
+    """Exclusive lock on a JSON file: `with _locked(path) as data` gives the parsed object and
+    writes it back on a clean exit."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def __enter__(self) -> dict:
+        _private_dir(self.path.parent)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            raw = os.pread(self.fd, os.fstat(self.fd).st_size, 0).decode("utf-8", "replace")
+        except BaseException:
+            os.close(self.fd)
+            raise
+        try:
+            self.data = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            self.data = {}
+        return self.data
+
+    def __exit__(self, exc_type, *_):
+        try:
+            if exc_type is None:
+                out = json.dumps(self.data).encode()
+                os.ftruncate(self.fd, 0)
+                os.pwrite(self.fd, out, 0)
+        finally:
+            os.close(self.fd)
 
 
 def audit(cfg, **rec) -> None:
@@ -64,6 +72,7 @@ def audit(cfg, **rec) -> None:
 
 def content_hash(text: str, images: list) -> str:
     """Identity of what the model would see, for the owner's release list."""
+    import hashlib
     h = hashlib.sha256(text.encode("utf-8", "ignore"))
     for img in images:
         h.update(b"\0" + hashlib.sha256(img).digest())
@@ -71,7 +80,7 @@ def content_hash(text: str, images: list) -> str:
 
 
 def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str) -> str:
-    qid = f"fw-{time.strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}"
+    qid = f"fw-{time.strftime('%Y%m%d')}-{os.urandom(3).hex()}"
     p = _private_dir(cfg.quarantine_dir) / f"{qid}.json"
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -109,9 +118,11 @@ def _session_file(cfg, session_id: str) -> Path:
 
 
 def session(cfg, session_id: str) -> dict:
+    """What the session has seen. A file that exists but cannot be read is an error, not an empty
+    session: treating it as empty would forget which files came from outside."""
     try:
         return json.loads(_session_file(cfg, session_id).read_text())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
 
 

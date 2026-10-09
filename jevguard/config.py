@@ -36,6 +36,9 @@ DEFAULTS = {
     "trusted_commands": [],
     # When scanning fails: "open" passes the result, "closed" withholds outside content.
     "on_error": "open",
+    # Ask before any call that would change the guard: its settings, state, release list, code,
+    # or the Claude Code settings files that run it. Applies in every session, whatever gate says.
+    "protect_guard": True,
     "timeout": 5.0,           # one request
     "deadline": 20.0,         # one tool result, all chunks
     "breaker_seconds": 60.0,  # pause after the API failed
@@ -82,7 +85,8 @@ def load() -> SimpleNamespace:
 
 
 def read_key(cfg) -> str:
+    """The API key, or an empty string when the file is missing or is not text."""
     try:
         return Path(cfg.key_file).read_text().strip()
-    except OSError:
+    except (OSError, ValueError):
         return ""

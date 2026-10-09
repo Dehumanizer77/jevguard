@@ -1,7 +1,8 @@
 """Where a tool result came from. Content is judged by its origin, not by the tool that read it.
 
 "external": web pages, search results, MCP tools, commands that fetch from a public address,
-            files those commands saved, files under the configured external paths.
+            files those commands saved, files under the configured external paths, and whatever
+            a command or a search reads back out of those files.
 "local":    files on this machine and output of local commands.
 "warn":     output of commands that only report on the agent's own work; never blocked.
 None:       not scanned at all.
@@ -12,6 +13,9 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+
+from . import shell
+from .shell import canonical, under
 
 # Commands that only ever talk to a remote service.
 _REMOTE_TOOL = re.compile(r"(?:^|[\s;|&(])(?:rtk\s+)?(?:gh|himalaya|yt-dlp|lynx|w3m|notmuch)\b")
@@ -77,17 +81,6 @@ def trusted_command(cmd: str, extra: set) -> bool:
     return True
 
 
-def norm_path(p: str, base: str = "") -> str:
-    p = os.path.expanduser(p.strip().strip("'\""))
-    if base and not os.path.isabs(p):
-        p = os.path.join(base, p)
-    return os.path.normpath(p)
-
-
-def under(path: str, root: str) -> bool:
-    return path == root or path.startswith(root.rstrip("/") + "/")
-
-
 def saved_paths(cmd: str, cwd: str, track_clones: bool) -> list[str]:
     """Paths a fetching command writes (curl -o, wget -O/-P, > file, | tee file, git clone dir):
     reading them later is reading outside content."""
@@ -100,7 +93,7 @@ def saved_paths(cmd: str, cwd: str, track_clones: bool) -> list[str]:
             target = target.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
             if not target:
                 continue
-        out.append(norm_path(target, cwd))
+        out.append(canonical(target, cwd))
     if track_clones:
         for m in _CLONE.finditer(cmd):
             args = [a.strip("'\"") for a in m.group(1).split() if not a.startswith("-")]
@@ -109,7 +102,7 @@ def saved_paths(cmd: str, cwd: str, track_clones: bool) -> list[str]:
             repo = args[0]
             dest = args[1] if len(args) > 1 else re.sub(r"\.git$", "", repo.rstrip("/").rsplit("/", 1)[-1])
             if dest:
-                out.append(norm_path(dest, cwd))
+                out.append(canonical(dest, cwd))
     return out
 
 
@@ -117,7 +110,52 @@ def _matches(tool: str, patterns: list) -> bool:
     return any(re.fullmatch(p, tool) for p in patterns)
 
 
-def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str]) -> str | None:
+def outside_roots(cfg, session_paths: list[str]) -> list[str]:
+    """Everything whose content counts as coming from outside: the configured directories, the
+    guard's own state (quarantined originals live there) and what this session downloaded."""
+    return [canonical(p) for p in cfg.external_paths] + [canonical(str(cfg.state_dir))] + list(session_paths)
+
+
+def mentions(text: str, roots: list[str], bases: list[str]) -> bool:
+    """The text names an outside file or directory: by absolute path, or by its path relative to
+    one of the bases (a search prints `sub/page.html:12:...` for what it found there)."""
+    if not text:
+        return False
+    home = os.path.expanduser("~")
+    for root in roots:
+        # A directory counts when something inside it is named; its bare name in a listing does not.
+        tail = "/" if os.path.isdir(root) else ""
+        if root + tail in text or (under(root, home) and root != home and "~" + root[len(home):] + tail in text):
+            return True
+        for base in bases:
+            if base and root != base and under(root, base):
+                rel = root[len(base.rstrip("/")) + 1:] + tail
+                if len(rel) > 2 and rel in text and re.search(r"(?<![\w.-])" + re.escape(rel) + (r"(?![\w-])" if not tail else ""), text):
+                    return True
+    return False
+
+
+def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: list[str], output: str) -> bool:
+    """The command, as far as it can be read, takes its output from an outside file: it runs in an
+    outside directory, names an outside file (directly, relatively, after `cd`, through a variable
+    it set, by glob, or inside a quoted script), or prints one's name among its results. When the
+    session has downloaded files and the command picks its files at run time, it counts too."""
+    try:
+        c = shell.read(cmd, cwd)
+    except Exception:
+        return True  # a command that cannot be read is not assumed to be local
+    if any(c.names(r) for r in roots):
+        return True
+    if any(len(os.path.basename(p)) >= 5 and os.path.basename(p) in cmd for p in session_paths):
+        return True  # named in a way the reader did not resolve
+    if session_paths and c.dynamic:
+        return True
+    return mentions(output, roots, c.dirs)
+
+
+def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str], output: str = "") -> str | None:
+    """output is the text of the result: a search over local directories that returns lines from
+    an outside file is outside content, and only the result shows that."""
     if _matches(tool, cfg.skip_tools):
         return None
     if _matches(tool, cfg.warn_tools):
@@ -128,16 +166,18 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
             if m and private_host(m.group(1)):
                 return "local"
         return "external"
+    roots = outside_roots(cfg, session_paths)
     if tool == "Bash":
         cmd = str(tool_input.get("command") or "")
-        if fetches_outside(cmd, cfg.scan_private_hosts) or str(cfg.state_dir) in cmd:
+        if fetches_outside(cmd, cfg.scan_private_hosts) or _bash_reads_outside(cmd, cwd, roots, session_paths, output):
             return "external"
         return "warn" if trusted_command(cmd, set(cfg.trusted_commands)) else "local"
     if tool in ("Read", "Grep"):
-        raw = str(tool_input.get("file_path") or tool_input.get("path") or "")
-        if not raw:
-            return "local"
-        path = norm_path(raw, cwd)
-        roots = [norm_path(p) for p in cfg.external_paths] + [str(cfg.state_dir)] + list(session_paths)
-        return "external" if any(under(path, r) for r in roots) else "local"
+        base = canonical(cwd) if cwd else ""
+        path = canonical(str(tool_input.get("file_path") or tool_input.get("path") or cwd or "/"), cwd)
+        if any(under(path, r) for r in roots):
+            return "external"
+        if tool == "Grep" and mentions(output, roots, [path, base]):
+            return "external"
+        return "local"
     return None  # tools that carry no outside content, and tools this list does not know

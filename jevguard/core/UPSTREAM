@@ -4,5 +4,13 @@ License: MIT, see LICENSE
 Files:   extract.py jev_detector.py questions.py policy.py policy-jev.json trusted.py
 
 Copied unchanged. To update, copy the same files from a newer commit and rerun tests/.
+
+One function is replaced when the scanner loads (jevguard/scanner.py), not in the file:
+extract.strip_first_party, which removes Hermes' and BrowserOS' own messages from a result before
+scoring by matching their wording. Those messages do not occur under Claude Code, and the match
+can be forged: the approval-refusal pattern in trusted.py ends in `[^\n]*$`, so anything on the
+same line after a copied refusal sentence was removed unscored. jevguard/firstparty.py removes
+only this guard's own notice, and only when its seal verifies. tests/test_issues.py (issue 7)
+fails if an update brings the old behaviour back.
 policy-jev.json holds thresholds fitted on that repo's benchmark; they are only valid for the
 questions and chunking in these files.

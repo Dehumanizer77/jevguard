@@ -5,17 +5,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
-import unicodedata
 from pathlib import Path
 
+from . import firstparty
+from .core import extract as _extract
 from .core import jev_detector
 from .core.extract import extract
 from .core.jev_detector import JevDetector, JevError
 from .core.policy import Policy
+from .toolio import words
 
 jev_detector.RETRY_CODES.add(529)  # TypeSafe's "overloaded", not in the upstream (Venice) list
+# Upstream removes the instruction-like messages of its own harness (Hermes, BrowserOS) before
+# scoring, matching them by their wording. None of those are produced under Claude Code, and
+# wording is something an attacker can copy: one template ended in a wildcard that took the rest
+# of the line with it. Only this guard's own sealed notice is removed here.
+_extract.strip_first_party = firstparty.strip
 
 _POLICY_FILE = Path(__file__).parent / "core" / "policy-jev.json"
 _RANK = {"safe": 0, "suspicious": 1, "injection": 2}
@@ -24,9 +30,6 @@ INCOMPLETE = {"ocr_unavailable", "ocr_failed", "image_unreadable", "image_unscan
               "scan_incomplete"}
 MAX_IMAGES = 8
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
-_NL_WORD = re.compile(r"[^\W\d_]{2,}")
-_INVISIBLE = dict.fromkeys([0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x180E, *range(0x202A, 0x202F),
-                            *range(0x2066, 0x206A), 0x00AD])
 
 
 class ScanFailed(RuntimeError):
@@ -36,13 +39,6 @@ class ScanFailed(RuntimeError):
     def __init__(self, msg: str, *, outage: bool = True, partial: dict | None = None):
         super().__init__(msg)
         self.outage, self.partial = outage, partial
-
-
-def words(text: str) -> int:
-    """Words the model can read, counted after the same unhiding extraction does."""
-    if any(0xE0000 <= ord(c) <= 0xE007F for c in text):
-        text = "".join(chr(ord(c) - 0xE0000) if 0xE0000 <= ord(c) <= 0xE007F else c for c in text)
-    return len(_NL_WORD.findall(unicodedata.normalize("NFKC", text.translate(_INVISIBLE))))
 
 
 def load_policy() -> tuple[Policy, str]:
@@ -77,6 +73,7 @@ def unscanned(flag: str, reason: str) -> dict:
 class Scanner:
     def __init__(self, cfg, key: str):
         self.policy, self.policy_id = load_policy()
+        firstparty.use(cfg)
         self.jev = JevDetector(key, model=cfg.model, questions=self.policy.questions, timeout=cfg.timeout,
                                attempts=2, url=cfg.url, max_wait=cfg.deadline)
         self.deadline_s = cfg.deadline
@@ -105,6 +102,9 @@ class Scanner:
         try:
             if words(text) >= self.min_words:
                 verdict = self._decide(extract(text), deadline)
+            if images:
+                import site
+                site.main()  # the hook starts with -S for speed; Pillow is found only after this
             for img in images[:MAX_IMAGES]:
                 if not img or len(img) > MAX_IMAGE_BYTES:
                     verdict = merge(verdict, unscanned("image_unreadable", "image could not be decoded"))

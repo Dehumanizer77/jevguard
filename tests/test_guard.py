@@ -189,7 +189,7 @@ def test_gate_logs_then_asks(guard):
     ("Bash", {"command": "gh issue comment 12 --body hi"}, True),
     ("Bash", {"command": "pytest -q"}, False),
     ("WebFetch", {"url": "https://x.example/?q=" + "a" * 400}, True),
-    ("Write", {"file_path": "/home/u/.claude/settings.json"}, True),
+    ("Write", {"file_path": "/home/u/.bashrc"}, True),
     ("Write", {"file_path": "/home/u/project/main.py"}, False),
     ("mcp__claude_ai_Gmail__send_message", {}, True),
     ("mcp__claude_ai_Gmail__search_threads", {}, False),
@@ -238,16 +238,41 @@ def test_install_keeps_other_hooks_and_follows_the_mode(tmp_path, monkeypatch):
     assert cli.main(["--settings", str(settings), "install"]) == 0
     s = json.loads(settings.read_text())
     assert s["model"] == "x" and s["hooks"]["PreToolUse"][0] == rtk
-    ours = [h for ev in s["hooks"].values() for g in ev for h in g["hooks"] if h["command"] == cli.HOOK]
-    assert len(ours) == 4 and all(h.get("async") is True for h in ours)
+    def ours(event):
+        return [h for g in json.loads(settings.read_text())["hooks"].get(event, [])
+                for h in g["hooks"] if h["command"] == cli.HOOK]
+
+    # log mode: the scan answers nothing and runs in the background; the hook before a call is
+    # waited for, because it asks before changes to the guard
+    assert len(ours("PostToolUse")) == 2 and all(h.get("async") is True for h in ours("PostToolUse"))
+    assert len(ours("PreToolUse")) == 2 and all("async" not in h for h in ours("PreToolUse"))
     assert cli.main(["--settings", str(settings), "install"]) == 0
     assert json.loads(settings.read_text()) == s  # idempotent
     assert cli.main(["--settings", str(settings), "mode", "block"]) == 0
-    s = json.loads(settings.read_text())
-    post = [h for g in s["hooks"]["PostToolUse"] for h in g["hooks"]]
-    pre = [h for g in s["hooks"]["PreToolUse"] for h in g["hooks"] if h["command"] == cli.HOOK]
-    assert all("async" not in h for h in post) and all(h.get("async") for h in pre)
+    assert all("async" not in h for h in ours("PostToolUse") + ours("PreToolUse"))
     assert config.load().mode == "block"
+    (tmp_path / "jg" / "config" / "config.json").write_text(json.dumps({"protect_guard": False, "gate": "log"}))
+    assert cli.main(["--settings", str(settings), "install"]) == 0
+    assert all(h.get("async") is True for h in ours("PostToolUse") + ours("PreToolUse"))
+    (tmp_path / "jg" / "config" / "config.json").write_text(json.dumps({"protect_guard": False, "gate": "off"}))
+    assert cli.main(["--settings", str(settings), "install"]) == 0
+    assert ours("PreToolUse") == [] and len(ours("PostToolUse")) == 2
     assert cli.main(["--settings", str(settings), "uninstall"]) == 0
     assert json.loads(settings.read_text()) == {"model": "x", "hooks": {"PreToolUse": [rtk]}}
     assert len(list(tmp_path.glob("settings.json.jevguard-*.bak"))) >= 2
+
+
+def test_image_metadata_is_scored(guard, jev):
+    """The hook starts without site-packages; Pillow has to be found once an image arrives."""
+    Image = pytest.importorskip("PIL.Image")
+    PngInfo = pytest.importorskip("PIL.PngImagePlugin").PngInfo
+    import base64
+    import io
+    meta = PngInfo()
+    meta.add_text("Comment", ATTACK)
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 16), "white").save(buf, "PNG", pnginfo=meta)
+    block = [{"type": "image", "data": base64.b64encode(buf.getvalue()).decode(), "mimeType": "image/png"}]
+    guard.hook("PostToolUse", "mcp__shots__capture", {}, block)
+    assert ATTACK in jev.requests[-1]["state"]
+    assert guard.log()[-1]["action"] == "would-block" and "image_metadata_text" in guard.log()[-1]["flags"]
