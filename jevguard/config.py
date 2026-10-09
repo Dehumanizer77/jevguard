@@ -1,0 +1,88 @@
+"""Settings and file locations. Defaults live here; ~/.config/jevguard/config.json overrides them."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+DEFAULTS = {
+    # "log": scan and record, change nothing. "block": withhold results that score as an injection.
+    "mode": "log",
+    # Risky actions (send data out, push, write to startup files) in a session that saw outside
+    # content: "off", "log" (record what would have been asked), "ask-flagged" (ask once a result
+    # scored as an injection or passed unscanned), "ask-external" (ask after any outside content).
+    "gate": "log",
+    "url": "https://api.typesafe.ai/v1/systemone",
+    # Pinned: the thresholds in core/policy-jev.json were fitted on Jev 1.13. A moved alias would
+    # change the score scale under them without notice.
+    "model": "jev-1.13.0",
+    "key_file": "~/.config/jevguard/typesafe.key",
+    # Everything scanned is sent to the scoring API. Local files and local command output stay on
+    # this machine unless this is switched on (they then block at local_block, not at the policy level).
+    "scan_local": False,
+    "local_block": 0.6,
+    # Fetches from localhost and private addresses count as local content.
+    "scan_private_hosts": False,
+    # Files under these directories are outside content, whatever tool reads them.
+    "external_paths": ["~/Downloads"],
+    # Directories created by `git clone` count as outside content for the rest of the session.
+    "track_clones": False,
+    # Tool names (regular expressions, full match) never scanned / scanned but never blocked.
+    "skip_tools": ["mcp__claude_ai_Gmail__.*", "mcp__claude_ai_Google_Drive__.*",
+                   "mcp__claude_ai_Google_Calendar__.*", "mcp__claude_ai_Claude_Docs__.*"],
+    "warn_tools": [],
+    "trusted_commands": [],
+    # When scanning fails: "open" passes the result, "closed" withholds outside content.
+    "on_error": "open",
+    "timeout": 5.0,           # one request
+    "deadline": 20.0,         # one tool result, all chunks
+    "breaker_seconds": 60.0,  # pause after the API failed
+    "daily_token_budget": 5_000_000,  # about $0.21 a day at $0.042 per million tokens
+    "min_words": 3,
+}
+
+
+def root() -> tuple[Path, Path]:
+    """(config dir, state dir). JEVGUARD_HOME moves both under one directory (tests)."""
+    home = os.environ.get("JEVGUARD_HOME")
+    if home:
+        return Path(home) / "config", Path(home) / "state"
+    return Path.home() / ".config" / "jevguard", Path.home() / ".local" / "state" / "jevguard"
+
+
+def load() -> SimpleNamespace:
+    cfg_dir, state_dir = root()
+    values = dict(DEFAULTS)
+    path = cfg_dir / "config.json"
+    if path.exists():
+        user = json.loads(path.read_text())
+        unknown = sorted(set(user) - set(DEFAULTS))
+        if unknown:
+            raise ValueError(f"{path}: unknown setting(s) {', '.join(unknown)}")
+        values.update(user)
+    if values["mode"] not in ("log", "block"):
+        raise ValueError(f"{path}: mode must be log or block")
+    if values["gate"] not in ("off", "log", "ask-flagged", "ask-external"):
+        raise ValueError(f"{path}: gate must be off, log, ask-flagged or ask-external")
+    if values["on_error"] not in ("open", "closed"):
+        raise ValueError(f"{path}: on_error must be open or closed")
+    cfg = SimpleNamespace(**values)
+    cfg.config_dir, cfg.state_dir, cfg.config_file = cfg_dir, state_dir, path
+    if os.environ.get("JEVGUARD_HOME") and values["key_file"] == DEFAULTS["key_file"]:
+        cfg.key_file = str(cfg_dir / "typesafe.key")
+    cfg.key_file = os.path.expanduser(cfg.key_file)
+    cfg.quarantine_dir = state_dir / "quarantine"
+    cfg.sessions_dir = state_dir / "sessions"
+    cfg.scan_log = state_dir / "scans.jsonl"
+    cfg.released_file = state_dir / "released.txt"
+    cfg.usage_file = state_dir / "usage.json"
+    return cfg
+
+
+def read_key(cfg) -> str:
+    try:
+        return Path(cfg.key_file).read_text().strip()
+    except OSError:
+        return ""

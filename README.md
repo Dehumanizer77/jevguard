@@ -1,0 +1,132 @@
+# jevguard
+
+A prompt-injection guard for [Claude Code](https://code.claude.com). It scans what tools bring in
+from outside (web pages, search results, MCP responses, output of commands that fetch from the
+internet, files those commands saved) before the model reads it, and withholds results that
+score as an injection.
+
+Scoring is done by [Jev](https://docs.typesafe.ai/concepts/system-one), TypeSafe's decision
+model: it answers fixed questions about a text with probabilities and generates nothing. The
+extraction code, the two questions, the chunking and the thresholds come unchanged from
+[jooray/hermes-firewall](https://github.com/jooray/hermes-firewall) (MIT), which built and
+benchmarked this gate for Hermes Agent; see
+[the write-up](https://juraj.bednar.io/en/blog-en/2026/09/28/a-prompt-injection-gate-for-my-ai-agent-what-worked-what-didnt-and-the-benchmark/).
+This repository is the Claude Code side: hooks, origin tracking for Claude Code's tools, result
+replacement in each tool's own shape, and a gate in front of risky actions.
+
+It is one layer, not a security boundary. A detector misses some attacks and nobody has tested
+this one against an attacker who adapts to it. Keep permissions tight.
+
+## How it works
+
+Two Claude Code [hooks](https://code.claude.com/docs/en/hooks) run `bin/jevguard-hook`:
+
+**PostToolUse** (after a tool ran, before its result reaches the model)
+
+1. *Origin.* The result is classified by where its content came from, not by the tool:
+   `WebFetch`, `WebSearch` and MCP tools are outside content; so is `Bash` when the command
+   names a public URL or is a tool that only talks to a remote service (`gh`, ...); so are
+   files a fetching command saved (`curl -o`, `> file`) and anything under `external_paths`.
+   Everything else is local and, by default, is not scanned and never leaves the machine.
+2. *Extract.* Plain code reveals what a human would not see: invisible Unicode tag characters,
+   zero-width and bidi characters, hidden HTML, comments, attribute text, base64 blobs, image
+   metadata. Hiding text is recorded as a flag of its own.
+3. *Score.* The text goes to Jev in 12,000-character chunks with two questions: does it contain
+   a command unrelated to the rest of the content, and is the passage ordinary content, a normal
+   request, or an instruction aimed at an AI model. The highest probability over all chunks is
+   the score.
+4. *Decide.* Score ≥ 0.38: injection. Score ≥ 0.20, hidden text, or a part that could not be
+   read: logged as flagged, nothing else happens. The verdict is computed in code.
+5. *Act.* In `log` mode nothing changes for the model. In `block` mode the whole result is
+   replaced by a short notice (`updatedToolOutput`) and the original goes to a quarantine file.
+   Nothing is ever added to a result that passes.
+
+Every scan is one line in `~/.local/state/jevguard/scans.jsonl`: tool, origin, verdict, score,
+size, timing, a hash. Never the content.
+
+**PreToolUse** (before a tool runs)
+
+A pattern check, no model: is this call one that could carry out an injected instruction
+(HTTP request with a body, `git push`, `ssh`/`scp`, sending mail, publishing, an MCP tool that
+sends or changes something, a write to `~/.ssh`, shell startup files or Claude Code's own
+settings)? If so, and the session has read outside content, the call is logged, or, with
+`gate` set to `ask-flagged` / `ask-external`, held for the user's approval.
+
+## Install
+
+Needs Python 3.11+ on Linux or macOS and a TypeSafe API key. No packages to install.
+
+```bash
+git clone https://github.com/Dehumanizer77/claude-firewall ~/claude-firewall
+mkdir -p ~/.config/jevguard && chmod 700 ~/.config/jevguard
+umask 077; cat > ~/.config/jevguard/typesafe.key      # paste the key, Enter, Ctrl-D
+
+~/claude-firewall/bin/jevguard selftest               # one benign and one attack sample through the API
+~/claude-firewall/bin/jevguard install                # adds the hooks to ~/.claude/settings.json (backup kept)
+```
+
+It starts in `log` mode. Run it that way on your own traffic first and read what would have
+been blocked; upstream's first week of blocking produced only false positives, most of them the
+agent harness's own text.
+
+```bash
+jevguard status                 # settings, key, token use, counts from the log
+jevguard log                    # recent scans that were not a plain pass
+jevguard show fw-20261009-ab12cd      # read a quarantined result (your own terminal only)
+jevguard release fw-20261009-ab12cd   # let exactly that content pass from now on
+jevguard mode block             # start withholding; `jevguard mode log` to go back
+jevguard gate ask-flagged       # ask before risky actions once something was flagged
+jevguard uninstall
+```
+
+`show` and `release` refuse to run without a terminal, so the agent cannot use them.
+
+## Settings
+
+`~/.config/jevguard/config.json`; every key is optional. Defaults and their reasons are in
+[`jevguard/config.py`](jevguard/config.py).
+
+| Key | Default | |
+|---|---|---|
+| `mode` | `log` | `log` or `block` |
+| `gate` | `log` | `off`, `log`, `ask-flagged`, `ask-external` |
+| `scan_local` | `false` | also scan local files and local command output (they block at `local_block`, 0.6) |
+| `scan_private_hosts` | `false` | treat fetches from localhost and private addresses as outside content |
+| `external_paths` | `["~/Downloads"]` | directories whose files are outside content |
+| `track_clones` | `false` | treat directories created by `git clone` as outside content |
+| `skip_tools` | claude.ai Gmail, Drive, Calendar, Docs connectors | tool-name patterns never scanned |
+| `on_error` | `open` | `closed` withholds outside content when scanning fails (block mode) |
+| `daily_token_budget` | 5,000,000 | scanning stops for the day beyond this |
+| `model` | `jev-1.13.0` | pinned; the thresholds were fitted on this version |
+
+Everything that is scanned is sent to TypeSafe. The defaults keep local files, private-network
+fetches and the private connectors out of that; each switch above widens it.
+
+## What it does not cover
+
+- Files pulled in with `@file`, `CLAUDE.md`, memory and skill files, MCP tool descriptions and
+  server instructions, text you paste yourself: Claude Code runs no tool-result hook for these.
+- Text in the pixels of an image, unless `tesseract` is installed. Image metadata is read.
+- Results shorter than three words, and reports returned by subagents (their own tool calls are
+  scanned).
+- Claude Code on the web and cloud sessions: they do not read this machine's settings.
+- An attack the model does not recognise. Upstream measured 88.5% of attacks blocked and 3.5% of
+  benign items blocked on its 718-item test set, through Venice with `jev-latest`; those numbers
+  have not been re-measured through this code path.
+
+## Tests
+
+```bash
+python3 -m pytest tests -q      # the real hook script against a stand-in scoring API
+tests/e2e_claude.py             # a headless Claude Code session: does the model see only the notice?
+```
+
+Run `tests/e2e_claude.py` after a Claude Code update. A replacement whose shape no longer matches
+a built-in tool's output is ignored by Claude Code without an error, and the model then reads the
+original.
+
+## Credits
+
+`jevguard/core/` is copied unchanged from
+[jooray/hermes-firewall](https://github.com/jooray/hermes-firewall) by Juraj Bednár, MIT licensed
+(`jevguard/core/LICENSE`, source commit in `jevguard/core/UPSTREAM`).

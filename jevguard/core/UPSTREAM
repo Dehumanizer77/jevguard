@@ -1,0 +1,8 @@
+Source:  https://github.com/jooray/hermes-firewall  (firewall/src/hermes_firewall/)
+Commit:  ce09dafc9d557c6d496e577de03d2d0b6eef2d2a  (2026-10-08)
+License: MIT, see LICENSE
+Files:   extract.py jev_detector.py questions.py policy.py policy-jev.json trusted.py
+
+Copied unchanged. To update, copy the same files from a newer commit and rerun tests/.
+policy-jev.json holds thresholds fitted on that repo's benchmark; they are only valid for the
+questions and chunking in these files.
