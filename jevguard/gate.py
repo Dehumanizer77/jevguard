@@ -38,8 +38,16 @@ _STARTUP = re.compile(r"(?:^|/)(?:\.ssh(?:/|$)|\.claude/(?:hooks(?:/|$)|CLAUDE\.
 # Claude Code settings files: the hooks live there, and one line in any of them switches hooks off.
 _SETTINGS = re.compile(r"(?:^|/)\.claude/settings[^/]*\.json$")
 _ADMIN = {"mode", "gate", "install", "uninstall", "release", "show", "trust", "untrust"}
-# The same commands named inside code the reader cannot take apart: ['.../jevguard', 'release', id].
-_ADMIN_TEXT = re.compile(r"jevguard\b(?!-hook)[^|;&\n]{0,80}?\b(?:mode|gate|install|uninstall|release|show|trust|untrust)\b")
+# The same commands named inside code the reader cannot take apart: os.system("jevguard uninstall"),
+# ['.../jevguard', 'release', id], python3 -m jevguard.cli mode block. Only where the word stands
+# as the program and the subcommand is its next argument. The first version matched any of those
+# words within eighty characters, and so asked about `grep ... jevguard/gate.py` and about
+# `gh pr create --repo owner/jevguard --head release-notes`: a path and a repository name.
+_NEXT = r"['\"]?(?:\s*,\s*|\s+)['\"]?"
+_ADMIN_TEXT = re.compile(
+    r"(?<![\w.-])(?:[\w./~-]*/)?jevguard(?:\.cli)?" + _NEXT
+    + r"(?:--settings(?:=\S+?|" + _NEXT + r"\S+?)" + _NEXT + r")?"
+    + r"(?:" + "|".join(sorted(_ADMIN)) + r")\b(?![\w./-])")
 _LONG_URL = 300  # a fetch can carry data out in its address
 _UNREADABLE = "could not be read as a command, so what it does cannot be ruled out"
 

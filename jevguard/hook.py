@@ -133,6 +133,13 @@ def _ask(reason: str) -> dict:
                                    "permissionDecisionReason": f"jevguard: {reason}"}}
 
 
+def _purpose(tool_input: dict) -> str:
+    """What the agent said the call is for, to go into the question. A long command says little
+    to the person asked; this one sentence is the agent's own claim, and is labelled as that."""
+    said = " ".join(str(tool_input.get("description") or "").split())[:140]
+    return f' Claude describes the call as: "{said}" (its own words, not checked).' if said else ""
+
+
 def pre_tool_use(d: dict, cfg) -> dict | None:
     from . import gate
     tool, tool_input, sid, cwd = _fields(d)
@@ -143,8 +150,9 @@ def pre_tool_use(d: dict, cfg) -> dict | None:
         why = gate.guard_change(tool, tool_input, cfg, cwd)
         if why:
             store.audit(cfg, **ids, why=why, taint="guard", action="asked")
-            return _ask(f"{why}. Approve only if you expect this session to be changing the guard "
-                        "or Claude Code's settings right now; you do not need to review the rest of the command.")
+            return _ask(f"asking because {why}.{_purpose(tool_input)} Approve only if you expect this "
+                        "session to be changing the guard or Claude Code's settings right now; you do not "
+                        "need to review the rest of the command.")
     if cfg.gate == "off":
         return None
     why = gate.risky(tool, tool_input, cwd)
@@ -164,7 +172,7 @@ def pre_tool_use(d: dict, cfg) -> dict | None:
         return None
     seen = ("a tool result scored as a prompt injection or passed without a full scan" if taint == "flagged"
             else "content from outside was read")
-    return _ask(f"earlier in this session {seen}, and this call {why}.")
+    return _ask(f"asking because earlier in this session {seen}, and this call {why}.{_purpose(tool_input)}")
 
 
 def _on_alarm(*_):
