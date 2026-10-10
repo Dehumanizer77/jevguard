@@ -360,8 +360,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("value", choices=["log", "block"])
     p = sub.add_parser("gate", help="what to do with risky actions after outside content was read")
     p.add_argument("value", choices=["off", "log", "ask-flagged", "ask-external"])
-    sub.add_parser("install", help="add the hooks to the Claude Code settings file")
-    sub.add_parser("uninstall", help="remove the hooks")
+    from .agents import setup as agent_setup
+    for name, text in (("install", "add the guard's hooks to an agent's settings (Claude Code unless --agent says otherwise)"),
+                       ("uninstall", "remove them")):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("--agent", choices=agent_setup.AGENTS, default="claude")
     p = sub.add_parser("trust", help="never withhold content from this address (a URL prefix); it is still scanned and logged")
     p.add_argument("prefix")
     p = sub.add_parser("untrust", help="take an address off the trusted list")
@@ -381,7 +384,8 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd in ("own", "disown"):
         return cmd_own(cfg, a)
     if a.cmd in ("install", "uninstall"):
-        print(install(cfg, a.settings, remove=a.cmd == "uninstall"))
+        remove = a.cmd == "uninstall"
+        print(install(cfg, a.settings, remove=remove) if a.agent == "claude" else agent_setup.install(a.agent, remove))
         return 0
     run = {"status": cmd_status, "log": cmd_log, "show": cmd_show, "release": cmd_release,
            "scan": cmd_scan, "selftest": cmd_selftest}[a.cmd]

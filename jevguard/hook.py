@@ -35,7 +35,10 @@ def main() -> None:
         read = agent.read(d)
         if read:
             phase, call = read
-            decision = engine.after(call, cfg, ctx) if phase == "after" else engine.before(call, cfg)
+            # "after": a result to judge; "before": a call to gate; anything else: an event where the
+            # agent takes no decision, and its adapter may still rewrite the call
+            decision = (engine.after(call, cfg, ctx) if phase == "after" else
+                        engine.before(call, cfg) if phase == "before" else None)
             out = agent.answer(d, phase, call, decision) if decision else agent.untouched(d, phase, call)
     except BaseException as exc:  # a guard bug must not take the session down
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):

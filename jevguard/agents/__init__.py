@@ -49,13 +49,10 @@ class Agent:
 def all_agents() -> dict:
     from . import claude
     found = {a.name: a for a in (claude.ClaudeCode(),)}
-    for module in ("grok", "copilot", "codex", "cursor"):
-        try:
-            mod = __import__(f"{__name__}.{module}", fromlist=["AGENT"])
-        except ImportError:
-            continue
-        found[mod.AGENT.name] = mod.AGENT
-    return found
+    from . import codex, copilot, cursor, grok
+    for module in (grok, copilot, codex, cursor):
+        found[module.AGENT.name] = module.AGENT
+    return found  # Hermes is not here: its plugin calls agents/hermes.py in Hermes' own process
 
 
 def pick(d: dict, argv: list[str], env) -> Agent:

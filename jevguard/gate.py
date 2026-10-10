@@ -35,8 +35,10 @@ _STARTUP = re.compile(r"(?:^|/)(?:\.ssh(?:/|$)|\.claude/(?:hooks(?:/|$)|CLAUDE\.
                       r"\.bashrc$|\.bash_profile$|\.bash_login$|\.profile$|\.zshrc$|\.zprofile$|\.gitconfig$|"
                       r"\.config/systemd(?:/|$)|\.config/autostart(?:/|$)|CLAUDE\.md$|\.mcp\.json$|"
                       r"\.curlrc$|\.config/curlrc$|\.wgetrc$|\.netrc$|\.config/gh(?:/|$))")
-# Claude Code settings files: the hooks live there, and one line in any of them switches hooks off.
-_SETTINGS = re.compile(r"(?:^|/)\.claude/settings[^/]*\.json$")
+# The files an agent's hooks live in: Claude Code's settings and what the other adapters install
+# into (agents/setup.py). One line in any of them switches the guard off for that agent.
+_SETTINGS = re.compile(r"(?:^|/)(?:\.claude/settings[^/]*\.json|\.(?:grok|copilot)/hooks/[^/]+\.json|"
+                       r"\.cursor/hooks\.json|\.codex/hooks\.json|\.hermes/plugins/jevguard(?:/.*)?)$")
 _ADMIN = {"mode", "gate", "install", "uninstall", "release", "show", "trust", "untrust", "own", "disown"}
 # The same commands named inside code the reader cannot take apart: os.system("jevguard uninstall"),
 # ['.../jevguard', 'release', id], python3 -m jevguard.cli mode block. Only where the word stands

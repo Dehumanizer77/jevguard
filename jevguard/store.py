@@ -102,6 +102,24 @@ def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str
     return qid
 
 
+def judged(cfg, session: str, command: str, mark: bool = False) -> bool:
+    """Whether `jevguard-run` has judged what this command printed. The wrapper leaves a mark when
+    it has (mark=True); the agent's hook after the call asks, and the asking takes the mark away.
+    No mark means the wrapper could not do its work, as inside a sandbox that allows it neither
+    the network nor a file of its own, and the hook then judges the output itself."""
+    import hashlib
+    p = cfg.state_dir / "judged" / hashlib.sha256(f"{session}\0{command}".encode("utf-8", "replace")).hexdigest()[:32]
+    if mark:
+        _private_dir(p.parent)
+        p.touch(mode=0o600)
+        return True
+    try:
+        p.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def released(cfg) -> frozenset:
     """Content hashes the owner released after reading the quarantined original."""
     try:

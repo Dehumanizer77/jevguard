@@ -369,6 +369,53 @@ When its output goes to a program instead of a terminal, every line ends in a `#
 leave the lines whole (`grep`, `head` and `tail` are fine, `cut` is not), or the guard no
 longer recognises them as its own.
 
+## Other agents
+
+The guard is an engine and one adapter per agent (`jevguard/agents/`). The engine decides; an
+adapter knows how its agent calls a hook, what its tools are named, what shape their results
+have, and how it is told to replace a result or to ask. How much of the guard works in an agent
+depends on what that agent lets a hook do:
+
+| Agent | Withholds a result | Before a risky call | Checked |
+|---|---|---|---|
+| Claude Code | every tool | asks you | live (`tests/e2e_claude.py`) |
+| Grok Build | every tool | asks you | live against grok 1.0.30 (`tests/e2e_grok.py`) |
+| Codex CLI | shell output, when Codex runs without a sandbox; otherwise it is only logged | refuses the call | live against codex 0.160.0 (`tests/e2e_codex.py`) |
+| Copilot CLI | every tool | asks you | from its documentation only |
+| Cursor | MCP tools, file reads, shell output | asks you for shell and MCP | from its documentation only |
+| Hermes | every tool | refuses the call | from the notes of the plugin it is derived from |
+
+```bash
+jevguard install --agent grok       # ~/.grok/hooks/jevguard.json
+jevguard install --agent codex      # ~/.codex/hooks.json; Codex asks you to review new hooks when it starts
+jevguard install --agent copilot    # ~/.copilot/hooks/jevguard.json
+jevguard install --agent cursor     # adds its entries to ~/.cursor/hooks.json
+jevguard install --agent hermes     # ~/.hermes/plugins/jevguard; then `hermes plugins enable jevguard`
+jevguard uninstall --agent grok     # and so on
+```
+
+Settings, log, quarantine and release are the same for all of them: one `jevguard status`, one
+`jevguard log`.
+
+Things to know:
+
+- **Grok** also runs the hooks in `~/.claude/settings.json`, so with the guard installed for
+  Claude Code it is started by Grok too and recognises it. Installing for Grok as well gives it
+  hooks without Claude Code's tool-name filter, which Grok's MCP tools do not fit.
+- **Codex** lets a hook replace nothing after the fact and has no "ask". So a shell command
+  whose output the guard would look at is rewritten to run through `bin/jevguard-run`, which
+  scans what the command printed before Codex gets it. That works when Codex runs commands
+  without its sandbox (`--sandbox danger-full-access`). Inside the sandbox the wrapper can
+  reach neither the scoring service nor a file of its own (not even a local socket); it then
+  passes the output on, and the hook after the call, which runs outside the sandbox, scans and
+  logs it and tells Codex to stop. Codex 0.160.0 lets the model answer all the same, so there
+  the guard detects and does not withhold. Where the guard would ask, the call is refused.
+- **Cursor** and **Copilot CLI** adapters are written from the documentation and have not been
+  run against the programs. Cursor's own web tools cannot be covered: it lets a hook replace
+  only MCP results.
+- **Hermes** has no way to ask from a plugin; where the guard would ask, the call is refused.
+- The output of a wrapped command is held until the command has finished.
+
 ## Settings
 
 `~/.config/jevguard/config.json`; every key is optional. Defaults and their reasons are in

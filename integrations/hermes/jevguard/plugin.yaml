@@ -1,0 +1,6 @@
+name: jevguard
+version: "0.1"
+description: >
+  Prompt-injection guard. Scans what tools bring in from outside before the model reads it and
+  replaces a result that scores as an injection with a short notice. Settings, log and quarantine
+  are the guard's own (~/.config/jevguard, `jevguard status`, `jevguard log`).
