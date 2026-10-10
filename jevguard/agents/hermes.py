@@ -61,6 +61,28 @@ def text_of(result) -> tuple[str, list]:
     return toolio.text_of("", parsed)
 
 
+_PROCESS = {"process", "process_manage"}  # poll, log or wait for a command that runs in the background
+
+
+def _background(call: Call, tool_name: str, args: dict, result) -> None:
+    """A command started in the background returns a session_id and no output; the process tool
+    returns the output later, with the command that printed it. As the plugin this adapter is
+    derived from has it: the output of a background job is the output of what started it."""
+    parsed = result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except ValueError:
+            parsed = None
+    parsed = parsed if isinstance(parsed, dict) else {}
+    if tool_name in ("terminal", "execute_code") and parsed.get("session_id"):
+        call.later_ids = [str(parsed["session_id"])]
+    elif tool_name in _PROCESS:
+        command = parsed.get("command") if isinstance(parsed.get("command"), str) else ""
+        call.tool, call.tool_input = "Bash", {"command": engine.without_own_lines(command)}
+        call.task_ids = [str(args["session_id"])] if args.get("session_id") else []
+
+
 def around(tool_name: str, args, next_call, ids: dict):
     """The middleware: the gate, then the tool, then its result."""
     given = args if isinstance(args, dict) else {}
@@ -80,6 +102,7 @@ def around(tool_name: str, args, next_call, ids: dict):
     try:
         call.raw = result if isinstance(result, (str, dict, list)) else str(result)
         call.text, call.images = text_of(result)
+        _background(call, str(tool_name or ""), given, result)
         decision = engine.after(call, cfg, ctx)
     except Exception as exc:  # a guard bug must not take the agent down
         decision = engine.after_error("after", call, cfg, ctx, exc)

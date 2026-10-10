@@ -233,10 +233,14 @@ def session(cfg, session_id: str) -> dict:
 
 
 def session_update(cfg, session_id: str, *, paths: list = (), external: bool = False,
-                   flagged: str = "") -> None:
+                   flagged: str = "", tasks: list = ()) -> None:
+    """tasks: background tasks whose command was outside content. What they print is that too,
+    whenever and by whatever tool the agent picks it up."""
     with _locked(_session_file(cfg, session_id), UNREADABLE_SESSION) as s:
         if paths:
             s["paths"] = list(dict.fromkeys([*s.get("paths", []), *paths]))[-500:]
+        if tasks:
+            s["tasks"] = list(dict.fromkeys([*s.get("tasks", []), *map(str, tasks)]))[-200:]
         if external:
             s["external"] = s.get("external", 0) + 1
         if flagged:

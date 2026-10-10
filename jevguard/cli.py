@@ -19,7 +19,7 @@ from .agents import setup as agent_setup
 HOOK = str(Path(__file__).resolve().parent.parent / "bin" / "jevguard-hook")
 SETTINGS = Path.home() / ".claude" / "settings.json"
 _POST = ["WebFetch|WebSearch|Bash|Read|Grep", "mcp__.*"]
-_PRE = ["Bash|WebFetch|Write|Edit|NotebookEdit", "mcp__.*"]
+_PRE = ["Bash|Monitor|WebFetch|Write|Edit|NotebookEdit", "mcp__.*"]  # Monitor: its output is never a result
 
 BENIGN = ("The quarterly report is attached. Revenue grew four percent over the previous quarter, "
           "mostly from the two new regional offices. Let me know if Thursday works for the review call.")

@@ -4,6 +4,13 @@ A PostToolUse hook replaces what the model sees of any tool's result (updatedToo
 has to keep the tool's own shape: see toolio.py). A PreToolUse hook holds a call for approval
 (permissionDecision "ask") and may rewrite its input (updatedInput), which is how the reason for
 the question gets written into a shell command. The tool names are the engine's own.
+
+A command run with run_in_background returns {stdout: "", ..., backgroundTaskId}. Its output goes
+to a file that the model is told to Read when the command is done; the notice of completion
+names the file and holds none of the output. Monitor is different: its PostToolUse result is
+{taskId, timeoutMs, persistent}, and each line the command prints is put into the conversation
+as a notification, which no hook is called for. (Both seen in 2.1.295; that version has no tool
+that returns a background command's output directly.)
 """
 
 from __future__ import annotations
@@ -39,6 +46,11 @@ class ClaudeCode(Agent):
             if supplied is not None:
                 more = [t for t in toolio.server_texts(call.raw) if t not in supplied]  # a status phrase of the server's own
                 call.text, call.ids["scanned"] = "\n".join([supplied, *more]), "redirect notice: address and status"
+        task = call.raw.get("backgroundTaskId") if call.tool == "Bash" and isinstance(call.raw, dict) else None
+        if isinstance(task, str) and task:
+            # Sent to the background: the result is empty, and the model is told a file to read
+            # when the command is done. That file is where this command's output will be.
+            call.later_ids, call.later_paths = [task], _task_files(d, task)
         return "after", call
 
     def answer(self, d: dict, phase: str, call: Call, decision: Decision) -> dict | None:
@@ -48,8 +60,32 @@ class ClaudeCode(Agent):
                                            "classifierContext": _CLASSIFIER_NOTE}}
         out = {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                "permissionDecisionReason": f"jevguard: {decision.reason}"}
-        if call.tool == "Bash" and decision.topic and isinstance(call.tool_input.get("command"), str):
+        if call.tool in ("Bash", "Monitor") and decision.topic and isinstance(call.tool_input.get("command"), str):
             command = engine.with_question(call.tool_input["command"], decision,
                                            call.tool_input.get("description") or "", self.title)
             out["updatedInput"] = {**call.tool_input, "command": command}
         return {"hookSpecificOutput": out}
+
+
+def _task_files(d: dict, task: str) -> list[str]:
+    """Where Claude Code writes the output of a background command (seen in 2.1.295):
+
+        <tmp>/claude-<uid>/<project>/<session>/tasks/<task>.output
+
+    with <project> the name of the directory the session's transcript is in. The hook is not
+    given that path, only the task, so it is put together here and kept if the directory is
+    there. If it is somewhere else, the engine still knows the task and takes the file from the
+    first call that names it."""
+    import os
+    import re
+    from ..shell import canonical
+    project = os.path.basename(os.path.dirname(str(d.get("transcript_path") or "")))
+    session = str(d.get("session_id") or "")
+    if not project or not session or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", task):
+        return []
+    found = []
+    for base in dict.fromkeys(b for b in (os.environ.get("CLAUDE_CODE_TMPDIR"), os.environ.get("TMPDIR"), "/tmp", "/private/tmp") if b):
+        folder = os.path.join(base, f"claude-{os.getuid()}", project, session, "tasks")
+        if os.path.isdir(folder):
+            found.append(canonical(os.path.join(folder, task + ".output")))
+    return list(dict.fromkeys(found))

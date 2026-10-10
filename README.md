@@ -57,6 +57,13 @@ another agent its adapter translates them.
    going to a terminal (each line ends in a `#jg:` tag): it talks about injections, and
    without the seal the guard blocked its own log on the first day it ran.
 
+   A command sent to the background returns nothing at once; what it prints reaches the model
+   later and is still that command's output. In Claude Code it goes to a file the model is told
+   to read: if the command is outside content, that file is tracked like a download, however
+   it is read. In Grok and Hermes another tool hands the output over
+   (`get_command_or_subagent_output`, `process`): its result is judged as the output of the
+   command that printed it.
+
    One message of a tool is taken apart instead: `WebFetch`'s notice that an address redirects
    to another host. It tells the model to fetch the new address and quotes the agent's own
    prompt, so scored whole it was withheld every time. The guard writes that notice out again
@@ -522,10 +529,15 @@ fetches and the private connectors out of that; each switch above widens it.
 - Text in the pixels of an image, unless `tesseract` is installed. Image metadata is read.
 - Results shorter than three words, and reports returned by subagents (their own tool calls are
   scanned).
-- The output of a command run in the background, which the agent picks up later through
-  another tool: the hook is installed for the tools that fetch, run and read, and that tool is
-  none of them. More generally, the result of a built-in tool whose name the adapter does not
-  know is not scanned (MCP tools always are; in Copilot CLI an unknown tool is too).
+- What a `Monitor` prints (Claude Code, Grok). Each line goes into the conversation as a
+  notification, and no hook is called for those, so it can be neither scanned nor withheld.
+  When the command reads from outside, the guard asks before the monitor starts (in `block`
+  mode; in `log` mode it records it) and counts the session as flagged. If you approve, that
+  output reaches the model unscanned.
+- The result of a built-in tool whose name the adapter does not know (MCP tools always are
+  scanned; in Copilot CLI an unknown tool is too). A background command's output is followed
+  in Claude Code, Grok and Hermes as described above; whether Codex has a tool of that kind
+  that its hooks do not report is not known.
 - A file tool the guard has no model of, when the path it changes is inside a longer text it
   is given rather than an argument of its own. The patches of Codex and Hermes are read;
   another tool's own patch format would not be.
@@ -556,6 +568,12 @@ API key or the network. The others start the real agent (`claude -p`, `grok -p`,
 with temporary hooks and a stand-in scoring API, so each needs that agent logged in and costs a
 few cents of usage, but no API key and no installation of the guard. The Codex one puts a
 `~/.codex/hooks.json` in place while it runs and refuses to start if you have one.
+
+They test the code in this checkout, not a guard you have installed: the Claude Code one
+leaves your own settings out of its sessions, the Grok one switches off the hooks Grok would
+take from `~/.claude` and `~/.cursor` and does not run beside a guard installed for Grok
+itself. (Before that, with the guard installed for Claude Code, the installed copy's hooks
+ran in the Claude Code check as well and could have carried a failing result.)
 
 Run the one for your agent after that agent is updated. A replacement whose shape no longer
 matches a built-in tool's output is ignored by Claude Code without an error, and the model then

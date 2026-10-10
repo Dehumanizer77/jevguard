@@ -7,16 +7,29 @@ The engine speaks one vocabulary for tools, the one this guard started with:
     WebFetch    tool_input: url
     WebSearch
     Write, Edit, NotebookEdit   tool_input: file_path
+    Monitor     tool_input: command; what it prints goes to the model line by line, as
+                notifications, and never comes back as a result a hook could look at
     mcp__<server>__<tool>       anything that brings content in from outside
 
 An adapter (jevguard/agents) turns its agent's tool calls into a Call in that vocabulary and a
 Decision back into what its agent understands. The engine knows nothing about any agent: not
 the names of its tools, not the shape of their results, not how it is told to ask or to replace.
+
+A command sent to the background returns nothing at once. Its output reaches the model later,
+by one of three routes, and is still that command's output:
+
+    a file the agent reads   the adapter names the file (Call.later_paths) and the task
+                             (Call.later_ids) when the command starts; if the command is outside
+                             content, the file is tracked like a download
+    another tool             the adapter hands that tool's result over as a Bash result of the
+                             command that printed it, with the tasks it is about (Call.task_ids)
+    notifications            nothing to scan; see Monitor
 """
 
 from __future__ import annotations
 
 import os
+import re
 import time
 
 from . import config, store
@@ -38,6 +51,9 @@ class Call:  # plain classes: the hook starts for every tool call, and dataclass
         self.images: list = []        # ... the images in it, as bytes
         self.raw = None               # ... and the result as the agent gave it, for the quarantine
         self.gate_first = False       # an event that is both: gate the call, then judge the content it carries
+        self.later_ids: list = []     # the call sent a command to the background: the tasks it started
+        self.later_paths: list = []   # ... and the files their output is written to
+        self.task_ids: list = []      # the result is the output of these background tasks
 
 
 class Decision:
@@ -99,6 +115,38 @@ def _purpose(call: Call) -> str:
     return f' {call.who} describes the call as: "{said}" (its own words, not checked).' if said else ""
 
 
+# ---- output that comes later -------------------------------------------------------------------------
+_TASK_OUTPUT = re.compile(r"(?:~|/)[^\s\"'<>|;&()$`\\]*/tasks/([A-Za-z0-9_-]{1,80})\.output")
+
+
+def _task_outputs(tool_input: dict, cwd: str, tasks: list) -> list[str]:
+    """The output files of this session's outside background tasks that the call names. Where the
+    adapter could work out the file when the command started, it is tracked already; this is for
+    where it could not (the directory an agent keeps such files in is its own business, the name
+    `tasks/<id>.output` is what the model is told)."""
+    if not tasks:
+        return []
+    from .shell import canonical
+    found = []
+    for key in ("command", "file_path", "path"):
+        value = tool_input.get(key)
+        for m in _TASK_OUTPUT.finditer(value) if isinstance(value, str) else ():
+            if m.group(1) in tasks:
+                found.append(canonical(m.group(0), cwd))
+    return found
+
+
+def _streams_outside(call: Call, cfg) -> bool:
+    """A Monitor whose command brings in content from outside. Read like a shell command."""
+    from . import provenance
+    try:
+        session = store.session(cfg, call.session)
+    except (ValueError, OSError):
+        return True  # which files this session downloaded is not known: it may print one of them
+    paths = [*session.get("paths", []), *_task_outputs(call.tool_input, call.cwd, list(session.get("tasks", [])))]
+    return provenance.classify("Bash", call.tool_input, cfg, call.cwd, _existing(cfg, paths), "") in ("external", "own")
+
+
 # ---- after a call: the result ------------------------------------------------------------------------
 def after(call: Call, cfg, ctx: dict) -> Decision | None:
     from . import firstparty, provenance, toolio
@@ -107,7 +155,11 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
         session = store.session(cfg, sid)
     except (ValueError, OSError):
         session = None  # which files this session downloaded is not known
-    mode = provenance.classify(tool, tool_input, cfg, cwd, _existing(cfg, (session or {}).get("paths", [])), text)
+    tasks = list((session or {}).get("tasks", []))
+    seen = _task_outputs(tool_input, cwd, tasks)
+    mode = provenance.classify(tool, tool_input, cfg, cwd, _existing(cfg, [*(session or {}).get("paths", []), *seen]), text)
+    if mode in ("local", "warn") and any(str(t) in tasks for t in call.task_ids):
+        mode = "external"  # the output of a command that was outside content when it was started
     if session is None and mode in ("local", "warn"):
         mode = "external"  # it may be one of them
     ctx["mode"] = mode  # what the error path needs to know if anything below fails
@@ -117,7 +169,8 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
         if not session:
             store.prune_sessions(cfg)  # first outside content of a session: drop old session files
         paths = _existing(cfg, provenance.saved_paths(str(tool_input.get("command") or ""), cwd, cfg.track_clones)) if tool == "Bash" else []
-        store.session_update(cfg, sid, paths=paths, external=True)
+        # What a background command prints is this command's output, wherever it turns up later.
+        store.session_update(cfg, sid, paths=[*paths, *seen, *call.later_paths], external=True, tasks=call.later_ids)
     elif not cfg.scan_local:
         return None
     if toolio.words(text) < cfg.min_words and not images:
@@ -210,16 +263,29 @@ def before(call: Call, cfg) -> Decision | None:
     detail = str(tool_input.get("command") or tool_input.get("url") or tool_input.get("file_path")
                  or tool_input.get("path") or "")[:160]
     ids = {"event": "gate", "tool": tool, "session": sid, **call.ids, "cwd": cwd, "detail": detail}
+    read_as = "Bash" if tool == "Monitor" else tool  # a monitor runs a shell command, whatever becomes of its output
     if cfg.protect_guard:
-        why = gate.guard_change(tool, tool_input, cfg, cwd)
+        why = gate.guard_change(read_as, tool_input, cfg, cwd)
         if why:
             store.audit(cfg, **ids, why=why, taint="guard", action="asked")
             return Decision("ask", reason=f"asking because {why}.{_purpose(call)} Approve only if you expect this "
                             "session to be changing the guard or Claude Code's settings right now; you do not "
                             "need to review the rest of the command.", topic="CHANGES THE GUARD", why=why)
+    if tool == "Monitor" and _streams_outside(call, cfg):
+        # What it prints goes to the model as notifications. No hook sees those, so nothing of it
+        # can be scanned or withheld afterwards; the one place to stop it is here. This is not
+        # the gate (a risky action) and not on_error (a scan that failed): it is outside content
+        # on a road with no check on it, and in block mode the owner is asked before it starts.
+        why = "its output would go to the model as notifications, which cannot be scanned, and the command reads from outside"
+        store.audit(cfg, **ids, why=why, taint="unscanned", action="asked" if cfg.mode == "block" else "would-ask")
+        store.session_update(cfg, sid, external=True, flagged="unscanned")
+        if cfg.mode == "block":
+            return Decision("ask", reason=f"asking because {why}.{_purpose(call)} Run it as an ordinary command, or in "
+                            "the background and read its output file, and the guard scans what it prints.",
+                            topic="OUTPUT CANNOT BE SCANNED", why=why)
     if cfg.gate == "off":
         return None
-    why = gate.risky(tool, tool_input, cwd)
+    why = gate.risky(read_as, tool_input, cwd)
     if not why:
         return None
     try:

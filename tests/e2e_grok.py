@@ -49,21 +49,30 @@ def main() -> int:
         {"hooks": {"PreToolUse": [{"hooks": [hook]}], "PostToolUse": [{"hooks": [hook]}]}}))
     prompt = (
         "Do these steps in order, each exactly once. Do not retry or work around a step that fails or is "
-        "denied; go straight on to the next step until all four have been attempted: "
+        "denied; go straight on to the next step until all five have been attempted: "
         f"1) read the file {ext}/note.txt  "
         f"2) search for the pattern 'canary' in {ext}  "
         f"3) run the shell command: cat {ext}/note.txt  "
         "4) fetch the web page https://example.com  "
+        f"5) run the shell command  cat {ext}/note.txt  in the background (block_until_ms set to 0), then get "
+        "what it printed with get_command_or_subagent_output (timeout_ms 15000)  "
         "Then answer with one line per step, 'N: ' followed by the first 12 words of what that step's tool "
         "returned to you, copied exactly.")
-    r = subprocess.run(["grok", "--trust", "--always-approve", "--max-turns", "12", "-p", prompt], cwd=work,
+    # Grok also runs the hooks in ~/.claude/settings.json and ~/.cursor/hooks.json. A guard installed
+    # there would do the work of the one under test, so those are switched off for this session;
+    # one installed for Grok itself (~/.grok/hooks) cannot be, and the check does not run beside it.
+    if (Path.home() / ".grok" / "hooks" / "jevguard.json").exists():
+        print("the guard is installed for Grok (~/.grok/hooks/jevguard.json): this check would not test the code here")
+        return 2
+    env = {**os.environ, "GROK_CLAUDE_HOOKS_ENABLED": "false", "GROK_CURSOR_HOOKS_ENABLED": "false"}
+    r = subprocess.run(["grok", "--trust", "--always-approve", "--max-turns", "16", "-p", prompt], cwd=work, env=env,
                        capture_output=True, text=True, timeout=400)
     answer = r.stdout
     log = home / "state" / "scans.jsonl"
     records = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     blocked = [x for x in records if x.get("action") == "blocked"]
     ok = True
-    for native in ("read_file", "grep", "run_terminal_command", "web_fetch"):
+    for native in ("read_file", "grep", "run_terminal_command", "web_fetch", "get_command_or_subagent_output"):
         hit = [x for x in blocked if x.get("native_tool") == native]
         good = bool(hit)
         ok &= good

@@ -31,7 +31,9 @@ from . import Agent
 
 NATIVE_HOOKS = os.path.join("~", ".grok", "hooks", "jevguard.json")
 _TOOLS = {"run_terminal_command": "Bash", "read_file": "Read", "grep": "Grep", "list_dir": "Grep",
-          "web_fetch": "WebFetch", "web_search": "WebSearch", "search_replace": "Edit", "write_file": "Write"}
+          "web_fetch": "WebFetch", "web_search": "WebSearch", "search_replace": "Edit", "write_file": "Write",
+          "monitor": "Monitor",  # a shell command whose lines reach the model as notifications
+          "get_command_or_subagent_output": "Bash"}  # after the call: the output of earlier background commands
 # A built-in tool's result repeats parts of the call beside what the tool brought in (the command,
 # its description, the address), carries its own tag, and may point at a copy of the output. Those
 # are not text to scan and stay as they are in a replacement. But a field is taken for one of them
@@ -40,8 +42,18 @@ _TOOLS = {"run_terminal_command": "Bash", "read_file": "Read", "grep": "Grep", "
 # "description" or "url" had that field passed over.
 _TAG = re.compile(r"[A-Za-z]{1,30}")  # "Bash", "ReadFile", "GrepSearch", "ListDir", "WebFetch": one word
 _POINTER = "output_file"  # where Grok keeps the whole output; emptied in a replacement
-_MEDIA_TYPE = re.compile(r"(?:text|image|audio|video|application|font|model|multipart|message)/[A-Za-z0-9.+-]{1,60}"
-                         r"(?:;\s*charset=[A-Za-z0-9._-]{1,30})?")
+_ID = r"[0-9a-fA-F-]{8,64}"
+_TIME = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)"
+# Grok's own words in a result, each in the one form it has. Anything else under the same name is text.
+_OWN_WORDS = {
+    "content_type": re.compile(r"(?:text|image|audio|video|application|font|model|multipart|message)/[A-Za-z0-9.+-]{1,60}"
+                               r"(?:;\s*charset=[A-Za-z0-9._-]{1,30})?"),  # "text/html; charset=utf-8": the server's
+    "status": re.compile(r"[a-z_]{1,24}"), "task_type": re.compile(r"[a-z_]{1,24}"),
+    "task_id": re.compile(_ID), "started": re.compile(_TIME), "ended": re.compile(_TIME),
+    "summary": re.compile(rf"Background task {_ID} started"),
+    "retrieval_hint": re.compile(rf'Use get_command_or_subagent_output with task_ids=\["{_ID}"\] when you need the output\.'),
+    "truncation_hint": re.compile(r"\[truncated - use read_file on output_file for full content\]"),
+}
 
 
 def _is_bytes(o) -> bool:
@@ -64,11 +76,24 @@ def said_by(given: dict, cwd: str) -> frozenset:
 def _not_content(value: str, key: str, top: bool, said: frozenset) -> bool:
     if top and key == "type":
         return bool(_TAG.fullmatch(value))
-    if key == "content_type":  # "text/html; charset=utf-8": the server's, and a media type or it is text
-        return bool(_MEDIA_TYPE.fullmatch(value))
-    if top and key == _POINTER:
+    if key in _OWN_WORDS and _OWN_WORDS[key].fullmatch(value):
+        return True
+    if key == _POINTER:
         return not re.search(r"\s", value)  # a path
     return value in said
+
+
+def _task_results(node, depth: int = 0) -> list:
+    """The per-task parts of a get_command_or_subagent_output result: {"type": "TaskOutput",
+    "Result": {task_id, command, status, output, output_file, ...}} for one task (seen in 1.0.30);
+    found by their task_id wherever they stand, for the form it takes with several."""
+    if isinstance(node, dict):
+        if "task_id" in node:
+            return [node]
+        return [r for v in node.values() for r in _task_results(v, depth + 1)] if depth < 6 else []
+    if isinstance(node, list) and depth < 6:
+        return [r for v in node for r in _task_results(v, depth + 1)]
+    return []
 
 
 def _texts(o, out: list, said: frozenset, key: str = "", depth: int = 0) -> None:
@@ -103,7 +128,7 @@ def replaced(result, notice: str, said: frozenset = frozenset(), key: str = "", 
     """The result in its own shape with every text in it swapped for the notice: whichever field
     Grok renders for the model, that is what it finds there."""
     if isinstance(result, str):
-        if depth == 1 and key == _POINTER:
+        if key == _POINTER:
             return ""
         return result if _not_content(result, key, depth == 1, said) else notice
     if _is_bytes(result):
@@ -151,6 +176,18 @@ class Grok(Agent):
         # Only a built-in tool's own result is read by its shape, and handed back in it. Anything
         # else (an MCP server's result, whatever it calls its fields or itself) is read whole.
         call.shaped = native in _TOOLS and isinstance(call.raw, dict)
+        if call.shaped and native == "get_command_or_subagent_output":
+            # The output of commands started earlier. It is judged as the output of those commands,
+            # which the result names, and of the tasks the guard remembers as outside content.
+            tasks = _task_results(call.raw)
+            call.tool_input = {"command": "\n".join(engine.without_own_lines(t["command"]) for t in tasks
+                                                    if isinstance(t.get("command"), str))}
+            call.task_ids = [str(t["task_id"]) for t in tasks]
+            call.later_paths = [t[_POINTER] for t in tasks if isinstance(t.get(_POINTER), str) and t[_POINTER]]
+        elif call.shaped and call.raw.get("type") == "BackgroundTaskStarted" and call.raw.get("task_id"):
+            # block_until_ms: 0. Nothing is printed yet; the output goes to a file and to the tool above.
+            call.later_ids = [str(call.raw["task_id"])]
+            call.later_paths = [call.raw[_POINTER]] if isinstance(call.raw.get(_POINTER), str) and call.raw[_POINTER] else []
         if call.shaped:
             call.said = said_by(given, call.cwd)
             call.text = text_of(call.raw, call.said)
@@ -166,7 +203,7 @@ class Grok(Agent):
             return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": new}}
         out = {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                "permissionDecisionReason": f"jevguard: {decision.reason}"}
-        if call.tool == "Bash" and decision.topic and isinstance(call.tool_input.get("command"), str):
+        if call.tool in ("Bash", "Monitor") and decision.topic and isinstance(call.given.get("command"), str):
             command = engine.with_question(call.tool_input["command"], decision, call.given.get("description") or "", self.title)
             out["updatedInput"] = {**call.given, "command": command}  # Grok's own fields, or the rewrite fails its schema
         return {"hookSpecificOutput": out}
