@@ -134,17 +134,63 @@ def test_nothing_is_held_in_log_mode(guard, ext, tmp_path, jev):
     assert r.stdout == ATTACK + "\n" and r.returncode == 3 and not jev.requests
 
 
-def test_a_monitors_lines_are_not_held(guard, ext, tmp_path):
-    """A Monitor's command comes through the prefix in the same line as any other. Its output has
-    to go out as it comes; the owner was asked about it before it started."""
-    command = f"tail -f {ext}/note.txt"
-    assert hook(guard, "PreToolUse", "Monitor", {"command": command, "description": "watch"})["hookSpecificOutput"]["permissionDecision"] == "ask"
-    r = shell(guard, f"cat {ext}/note.txt", tmp_path)                 # another command: held
-    assert ATTACK not in r.stdout
-    asked_about = "# jevguard: OUTPUT CANNOT BE SCANNED\n# jevguard: why: x\n" + f"cat {ext}/note.txt; true"
-    hook(guard, "PreToolUse", "Monitor", {"command": f"cat {ext}/note.txt; true"})
-    assert shell(guard, asked_about, tmp_path).stdout == ATTACK + "\n"   # the monitor itself, with the question lines on it
-    assert ATTACK not in shell(guard, f"cat {ext}/note.txt; true", tmp_path).stdout   # the mark was for one run
+def to_a_socket(guard, command, cwd):
+    """Run the line with its output connected to a socket, as Claude Code connects a Monitor's."""
+    import socket
+    ours, theirs = socket.socketpair()
+    p = subprocess.Popen([SHELL, line(command, str(cwd / "cwd-file"))], cwd=cwd, stdout=theirs, stderr=theirs,
+                         env={**os.environ, "JEVGUARD_HOME": str(guard.home), "CLAUDE_CODE_SESSION_ID": SESSION, "SHELL": "/bin/bash"})
+    theirs.close()
+    data = b""
+    while chunk := ours.recv(65536):
+        data += chunk
+    return data.decode(), p.wait(timeout=20)
+
+
+def test_a_monitor_is_known_by_what_its_output_is_connected_to(guard, ext, tmp_path, jev):
+    """A Monitor's command comes through the prefix in the same line as a Bash command's. Claude
+    Code connects a Monitor's output to a socket and reads its lines as they come; a Bash
+    command's, in the foreground or the background, goes to a file. (The owner is asked about a
+    Monitor on outside content before it starts.)"""
+    command = f"cat {ext}/note.txt; exit 3"
+    assert to_a_socket(guard, command, tmp_path) == (ATTACK + "\n", 3) and not jev.requests   # streamed, as a Monitor has to be
+    with open(tmp_path / "task.output", "w+") as task:                                    # a file, as for Bash
+        p = subprocess.run([SHELL, line(command, str(tmp_path / "cwd-file"))], cwd=tmp_path, stdout=task, stderr=task,
+                           env={**os.environ, "JEVGUARD_HOME": str(guard.home), "CLAUDE_CODE_SESSION_ID": SESSION, "SHELL": "/bin/bash"})
+        task.seek(0)
+        written = task.read()
+    assert p.returncode == 3 and ATTACK not in written and json.loads(written)["firewall"] == "blocked"
+
+
+def test_41_a_monitor_that_was_asked_about_leaves_nothing_a_bash_call_can_use(guard, ext, tmp_path, jev):
+    """As reported: a Monitor is asked about and turned down, and then Bash runs the same command.
+    The first version had the hook before the Monitor leave a mark for that command, which the
+    Bash call's wrapper took for its own and let the output through unjudged."""
+    guard.configure(mode="block", on_error="closed", external_paths=[str(ext)])
+    command = f"cat {ext}/note.txt; exit 3"
+    assert hook(guard, "PreToolUse", "Monitor", {"command": command})["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert hook(guard, "PreToolUse", "Bash", {"command": command}) is None
+    for _ in range(2):   # the first time and every time after
+        r = shell(guard, command, tmp_path)
+        assert ATTACK not in r.stdout + r.stderr and json.loads(r.stdout)["firewall"] == "blocked" and r.returncode == 3
+    assert jev.requests
+    assert not (guard.home / "state" / "streamed").exists()
+    # the Monitor's own question lines on a Bash command change nothing either
+    r = shell(guard, "# jevguard: OUTPUT CANNOT BE SCANNED\n# jevguard: why: x\n" + command, tmp_path)
+    assert ATTACK not in r.stdout and r.returncode == 3
+
+
+def test_41_a_mark_for_one_output_is_not_a_mark_for_another(guard, ext, tmp_path):
+    """The same kind of thing in the mark the wrapper leaves for the hook after the call: it is for
+    the output that was judged. A call whose hook never came for it (a background command) must
+    not let another result of the same command past the hook."""
+    command = f"cat {ext}/ok.txt"
+    assert shell(guard, command, tmp_path).stdout == BENIGN + "\n"          # judged, mark left, nobody came for it
+    out = hook(guard, "PostToolUse", "Bash", {"command": command}, tool_response={"stdout": ATTACK, "stderr": ""})
+    assert out is not None                                                 # another output of that command: judged
+    out = hook(guard, "PostToolUseFailure", "Bash", {"command": command}, error="Exit code 1\n" + ATTACK)
+    assert out is not None and "additionalContext" in out["hookSpecificOutput"]
+    assert hook(guard, "PostToolUse", "Bash", {"command": command}, tool_response={"stdout": BENIGN, "stderr": ""}) is None   # that one
 
 
 # ---- it must never be what stops a command from running --------------------------------------------
@@ -179,6 +225,43 @@ def test_a_scan_that_fails_leaves_the_output_to_the_hook(guard, ext, tmp_path, j
     guard.configure(mode="block", external_paths=[str(ext)], on_error="closed")
     jev.status = 503
     assert json.loads(shell(guard, command, tmp_path).stdout)["verdict"] == "unavailable"
+
+
+@pytest.mark.parametrize("on_error", ["closed", "open"])
+def test_42_where_the_origin_cannot_be_worked_out_the_policy_decides(guard, ext, tmp_path, jev, on_error):
+    """As reported: the settings are read and say block, and working out where the output comes
+    from fails (a setting that is no pattern). That is not "local". The first version ran the
+    line as it was, whatever on_error said."""
+    guard.configure(mode="block", on_error=on_error, external_paths=[str(ext)], skip_tools=["("])
+    r = shell(guard, f"cat {ext}/note.txt; echo more >&2; exit 3", tmp_path)
+    assert r.returncode == 3 and not jev.requests
+    rec = guard.log()[-1]
+    assert rec["event"] == "error" and rec["via"] == "shell"
+    if on_error == "closed":
+        assert ATTACK not in r.stdout + r.stderr and json.loads(r.stdout)["verdict"] == "unavailable" and rec["action"] == "blocked-error"
+    else:
+        assert r.stdout == ATTACK + "\n" and r.stderr == "more\n" and rec["action"] == "passed-error"
+    assert not list((guard.home / "state" / "judged").glob("*")) if (guard.home / "state" / "judged").exists() else True
+
+
+@pytest.mark.parametrize("on_error", ["closed", "open"])
+def test_42_a_tools_line_that_cannot_be_read_is_not_a_hooks(guard, ext, tmp_path, on_error):
+    """A line with the shape of a tool's and no command to be got out of it (a later version's
+    line): what it prints cannot be judged, and that too costs what on_error says."""
+    guard.configure(mode="block", on_error=on_error, external_paths=[str(ext)])
+    odd = f"source /nonexistent 2>/dev/null || true && eval 'cat {ext}/note.txt' && eval 'exit 3'"
+    r = through(guard, odd, tmp_path)
+    assert r.returncode == 3
+    assert (json.loads(r.stdout)["verdict"] == "unavailable" and ATTACK not in r.stdout) if on_error == "closed" else r.stdout == ATTACK + "\n"
+
+
+def test_42_status_says_when_a_setting_is_no_pattern(guard, monkeypatch, capsys):
+    from jevguard import cli
+    monkeypatch.setenv("JEVGUARD_HOME", str(guard.home))
+    guard.configure(mode="block", skip_tools=["mcp__ok__.*", "("])
+    assert cli.main(["status"]) == 0
+    said = capsys.readouterr().out
+    assert "skip_tools" in said and "'('" in said and "mcp__ok__" not in said.split("skip_tools")[1].split("\n")[0]
 
 
 # ---- a failed call that did not come through the wrapper -------------------------------------------

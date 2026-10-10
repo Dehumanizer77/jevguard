@@ -105,12 +105,29 @@ def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str
 _MARK_SECONDS = 900  # longer than the longest a command may run before the agent gives up on it
 
 
-def _mark(cfg, kind: str, session: str, command: str, mark: bool) -> bool:
-    """A note from one of the guard's processes to another about one command of one session:
-    left with mark=True, and taken away by the one that asks. One left behind (the process that
-    would have asked never ran) is not believed after a quarter of an hour."""
+def printed(text) -> str:
+    """What a command printed, as a wrapper and the hook after it can both name it. The agent
+    trims the output and frames it in its own way between the two, so all space is left out."""
     import hashlib
-    p = cfg.state_dir / kind / hashlib.sha256(f"{session}\0{command}".encode("utf-8", "replace")).hexdigest()[:32]
+    return hashlib.sha256("".join(str(text or "").split()).encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def judged(cfg, session: str, command: str, mark: bool = False, output: str = "") -> bool:
+    """Whether a wrapper (`jevguard-run`, `jevguard-shell`) has judged what this command printed.
+    The wrapper leaves a mark when it has (mark=True); the agent's hook after the call asks, and
+    the asking takes the mark away. No mark means the wrapper could not do its work, as inside a
+    sandbox that allows it neither the network nor a file of its own, and the hook then judges
+    the output itself.
+
+    output: printed() of what the wrapper handed over. With it the mark is for that very output
+    and no other result of the same command can use it: a mark by command alone, left by a call
+    whose hook never came to ask, would let the next call's output past the hook unjudged (a
+    Monitor's mark was taken by a Bash call in just this way, #41). Cursor's hook is not given
+    the output in a form that can be compared and passes none; nothing can be withheld there by
+    then anyway. A mark nobody came for is not believed after a quarter of an hour."""
+    import hashlib
+    key = hashlib.sha256(f"{session}\0{command}\0{output}".encode("utf-8", "replace")).hexdigest()[:32]
+    p = cfg.state_dir / "judged" / key
     if mark:
         _private_dir(p.parent)
         p.touch(mode=0o600)
@@ -122,21 +139,6 @@ def _mark(cfg, kind: str, session: str, command: str, mark: bool) -> bool:
         return fresh
     except OSError:
         return False
-
-
-def judged(cfg, session: str, command: str, mark: bool = False) -> bool:
-    """Whether a wrapper (`jevguard-run`, `jevguard-shell`) has judged what this command printed.
-    The wrapper leaves a mark when it has (mark=True); the agent's hook after the call asks, and
-    the asking takes the mark away. No mark means the wrapper could not do its work, as inside a
-    sandbox that allows it neither the network nor a file of its own, and the hook then judges
-    the output itself."""
-    return _mark(cfg, "judged", session, command, mark)
-
-
-def streamed(cfg, session: str, command: str, mark: bool = False) -> bool:
-    """Whether this command is a Monitor's: its lines have to go out as they come, so the shell
-    wrapper must not hold them. The hook before the call leaves the mark; the wrapper asks."""
-    return _mark(cfg, "streamed", session, command, mark)
 
 
 def released(cfg) -> frozenset:

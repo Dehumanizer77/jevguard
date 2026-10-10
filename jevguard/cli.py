@@ -229,6 +229,13 @@ def cmd_status(cfg, a) -> int:
           f"protect_guard: {cfg.protect_guard}   model: {cfg.model}")
     print(f"hooks installed: {'yes' if installed(a.settings) else 'no'} ({a.settings})")
     print(f"shell commands run through the guard: {_prefix_state(a.settings, cfg)}")
+    for key in ("skip_tools", "warn_tools"):
+        for pattern in getattr(cfg, key, None) or []:
+            try:
+                re.compile(str(pattern))
+            except re.error as exc:
+                print(f"WARNING: {key} holds {pattern!r}, which is not a pattern ({exc}). The guard fails on it at every "
+                      "call, and each of those is then handled as on_error says")
     others = [name for name in agent_setup.AGENTS if name != "claude" and agent_setup.installed(name)]
     print("installed for other agents: " + (", ".join(others) or "none"))
     print(f"API key: {'present' if key else 'MISSING'} ({cfg.key_file})")

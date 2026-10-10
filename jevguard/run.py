@@ -120,13 +120,16 @@ def _judge(agent: str, session: str, command: str, out: bytes, err: bytes, close
             raise
         signal.alarm(0)
         return _failed(call, cfg, ctx, exc, closed, via)
+    notice = decision.notice if decision and decision.action == "replace" else None
     try:
         # Tells the agent's own hook that this output is dealt with. Not where the scan did not get
         # to a verdict (the API down, a deadline on a very long output): then that hook is still
         # to do what it can. Bookkeeping: if the mark cannot be left, the hook looks at the output
-        # a second time and the verdict above stands.
+        # a second time and the verdict above stands. For Claude Code the mark names the very
+        # text that is handed over (store.judged says why).
         if ctx.get("scan") != "failed":
-            store.judged(cfg, session, call.tool_input["command"], mark=True)
+            handed = notice if notice is not None else out.decode("utf-8", "replace") + err.decode("utf-8", "replace")
+            store.judged(cfg, session, call.tool_input["command"], mark=True, output=store.printed(handed) if via == "shell" else "")
     except Exception as exc:
         ctx.setdefault("unrecorded", []).append(f"judged: {type(exc).__name__}: {exc}"[:200])
     if ctx.get("unrecorded"):  # what could not be written down (engine._record); nothing is printed here
@@ -135,7 +138,7 @@ def _judge(agent: str, session: str, command: str, out: bytes, err: bytes, close
                         error="; ".join(ctx["unrecorded"])[:300])
         except Exception:
             pass
-    return decision.notice if decision and decision.action == "replace" else None
+    return notice
 
 
 def _failed(call, cfg, ctx: dict, exc: BaseException, closed: bool, via: str = "run") -> str | None:

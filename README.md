@@ -64,7 +64,11 @@ another agent its adapter translates them.
    For a command whose output would be scanned, that program holds the output until the
    command has finished, has it scored whole, and prints it or the notice, with the
    command's own exit status. It covers what the hook cannot: a command that fails, one that
-   is killed for running too long, and everything after the first 30,000 characters. The
+   is killed for running too long, and everything after the first 30,000 characters. A
+   `Monitor`'s command comes through the same program and is let through as it comes: it is
+   known by where Claude Code sends its output (a socket; a `Bash` command's goes to a file),
+   not by anything a call can say about itself. Where it cannot be worked out whether a
+   command's output comes from outside, the output is held and `on_error` decides. The
    hook on `PostToolUseFailure` is there for the errors of other tools (an MCP tool's error
    text): it scans and logs them and, when one scores as an injection, says so beside it
    (`not-withheld` in the log), since nothing can be put in its place.
@@ -281,9 +285,10 @@ what it does, is under [How it works](#how-it-works). Three things to know about
 - The output of a command that reads from outside is held until the command has finished,
   so you do not see it come line by line. Local commands are run directly, as before.
 - With Claude Code's own sandbox switched on, the prefix runs inside it, without the network
-  and without a file of its own, and cannot scan. Allow `api.typesafe.ai` and writing to
-  `~/.local/state/jevguard` in the sandbox settings, or it does nothing there and the hooks
-  work as they did before it.
+  and without a file of its own, and cannot scan. What that costs is `on_error`, as for any
+  other failure of the guard: `open` passes the output on unscanned, `closed` withholds it.
+  Allow `api.typesafe.ai` and writing to `~/.local/state/jevguard` in the sandbox settings
+  to have it work there.
 
 If you already use `CLAUDE_CODE_SHELL_PREFIX` yourself, `install` leaves yours and says so.
 
@@ -576,8 +581,9 @@ fetches and the private connectors out of that; each switch above widens it.
 - Text in the pixels of an image, unless `tesseract` is installed. Image metadata is read.
 - Results shorter than three words, and reports returned by subagents (their own tool calls are
   scanned).
-- What a `Monitor` prints (Claude Code, Grok). Each line goes into the conversation as a
-  notification, and no hook is called for those, so it can be neither scanned nor withheld.
+- What a `Monitor` prints (Claude Code, Grok), or is sent over a WebSocket it opens. Each
+  line goes into the conversation as a notification, and no hook is called for those, so it
+  can be neither scanned nor withheld.
   When the command reads from outside, the guard asks before the monitor starts (in `block`
   mode; in `log` mode it records it) and counts the session as flagged. If you approve, that
   output reaches the model unscanned. A monitor on one of your `own_repos` is recorded

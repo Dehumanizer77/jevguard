@@ -116,6 +116,19 @@ def test_a_monitor_on_outside_content_is_asked_about_before_it_starts(guard, tas
         assert guard.raw(claude("PreToolUse", "Monitor", {"command": command}))["hookSpecificOutput"]["permissionDecision"] == "ask", command
 
 
+def test_a_monitor_on_a_websocket_is_asked_about_too(guard):
+    """Monitor can also open a WebSocket: every frame the server sends becomes a notification.
+    There is no command in that call; the first version looked only at a command and saw nothing."""
+    guard.configure(mode="block")
+    out = guard.raw(claude("PreToolUse", "Monitor", {"ws": {"url": "wss://events.example.com/stream"}, "description": "deploy events"}))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "ask" and "cannot be scanned" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert guard.log()[-1]["taint"] == "unscanned"
+    for ws in ({"url": "ws://localhost:8080/events"}, {"url": "ws://192.168.1.5/x"}):          # this machine, this network
+        assert guard.raw(claude("PreToolUse", "Monitor", {"ws": ws, "description": "local"})) is None, ws
+    for ws in ({"url": "not an address"}, {}, "wss://events.example.com/stream", 7):          # anything that cannot be read as one
+        assert guard.raw(claude("PreToolUse", "Monitor", {"ws": ws, "description": "x"})) is not None, ws
+
+
 def test_a_monitor_on_local_output_is_left_alone(guard):
     guard.configure(mode="block")
     for command in ("tail -f /var/log/app.log | grep --line-buffered ERROR", "inotifywait -m --format '%e %f' src",

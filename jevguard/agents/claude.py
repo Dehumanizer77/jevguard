@@ -51,11 +51,9 @@ class ClaudeCode(Agent):
                     who=self.title)
         command = tool_input.get("command") if isinstance(tool_input.get("command"), str) else None
         if event == "PreToolUse":
-            if call.tool == "Monitor" and command is not None:
-                _mark("streamed", call.session, command, True)  # jevguard-shell must let its lines out as they come
             return "before", call
-        if call.tool == "Bash" and command is not None and _mark("judged", call.session, command, False):
-            return None  # jevguard-shell held this output and judged it before Claude Code was given it
+        if call.tool == "Bash" and command is not None and _judged(call.session, command, _handed(d)):
+            return None  # jevguard-shell held this very output and judged it before Claude Code was given it
         if event == "PostToolUseFailure":
             # A call that failed: {error: "Exit code 3\n<what it printed>"}. A hook here can add a
             # remark and no more. A shell command does not get this far unjudged where jevguard-shell
@@ -106,12 +104,23 @@ class ClaudeCode(Agent):
         return {"hookSpecificOutput": out}
 
 
-def _mark(kind: str, session: str, command: str, leave: bool) -> bool:
-    """A note between this hook and jevguard-shell about one command (store.judged, store.streamed).
-    Bookkeeping: if it cannot be read or written, the hook goes on as if there were none."""
+def _handed(d: dict) -> str:
+    """The text of a shell command's result as jevguard-shell handed it over: both streams (Claude
+    Code writes them to one file and reports it all as stdout), without the "Exit code N" line
+    that Claude Code puts in front of a failed command's output."""
+    import re
+    resp = d.get("tool_response")
+    if isinstance(resp, dict):
+        return str(resp.get("stdout") or "") + str(resp.get("stderr") or "")
+    return re.sub(r"\AExit code \d+\n?", "", str(d.get("error") or ""))
+
+
+def _judged(session: str, command: str, text: str) -> bool:
+    """jevguard-shell left its mark for this command and this very output (store.judged). If the
+    mark cannot be read, there is none: the hook then judges the output itself."""
     try:
         from .. import config, store
-        return getattr(store, kind)(config.load(), session, command, mark=leave)
+        return store.judged(config.load(), session, command, output=store.printed(text))
     except Exception:
         return False
 

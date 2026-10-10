@@ -143,6 +143,16 @@ def _stream_origin(call: Call, cfg) -> str:
     "external", "own" (one gh command that names one of the owner's repositories), or "" for a
     command that brings nothing in from outside."""
     from . import provenance
+    ws = call.tool_input.get("ws")
+    if ws is not None:
+        # A Monitor on a WebSocket: every frame the server sends becomes a notification. There is
+        # no command to read; the address says where it comes from, as for a fetch.
+        try:
+            url = str(ws.get("url") if isinstance(ws, dict) else ws)
+            host = provenance._URL.match(url)
+            return "" if host and provenance.private_host(host.group(1)) and not cfg.scan_private_hosts else "external"
+        except Exception:
+            return "external"
     try:
         session = store.session(cfg, call.session)
     except (ValueError, OSError):
