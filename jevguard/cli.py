@@ -327,7 +327,10 @@ def cmd_scan(cfg, a) -> int:
     if sys.stdout.isatty():
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:  # read by a program, likely the agent: one sealed line, so a later scan knows it is ours
-        firstparty.use(cfg)
+        try:
+            firstparty.use(cfg)
+        except Exception:
+            pass  # no seal key to be had: the line goes out unsealed
         print(json.dumps(firstparty.seal_object(result), ensure_ascii=False))
     return 0
 

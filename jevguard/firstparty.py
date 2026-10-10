@@ -24,12 +24,23 @@ _LINE_TAG = re.compile(r"^(.*)\t#jg:([0-9a-f]{16})$", re.M)
 _secret: bytes | None = None
 
 
+_KEY_BYTES = 16  # the least a seal key may be; one is made with 32
+
+
 def use(cfg) -> None:
-    """Load this installation's seal key, creating it on first use."""
+    """Load this installation's seal key, creating it on first use. Raises if there is none to be
+    had; the callers go on without one, and then nothing is sealed and nothing is taken for sealed.
+
+    The key in use is either one that was just read and found good, or none. It is dropped before
+    anything else is done, so a load that fails, at whatever point, leaves no key behind: not the
+    bytes of a file that turned out too short, and not a key from an earlier, successful load in a
+    process that lives long. (The first version put the file's bytes in place and checked them
+    afterwards. An empty seal.key then stayed in use as the key, and anyone can seal with that.)"""
     global _secret
+    _secret = None
     path = cfg.state_dir / "seal.key"
     try:
-        _secret = path.read_bytes()
+        key = path.read_bytes()
     except FileNotFoundError:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -42,24 +53,31 @@ def use(cfg) -> None:
             pass
         finally:
             os.unlink(tmp)
-        _secret = path.read_bytes()
-    if len(_secret) < 16:
+        key = path.read_bytes()
+    if len(key) < _KEY_BYTES:
         raise ValueError(f"{path} is too short to be a seal key")
+    _secret = key
 
 
 def _mac(text: str) -> str:
-    return hmac.new(_secret or b"", text.encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
+    if _secret is None or len(_secret) < _KEY_BYTES:
+        raise RuntimeError("no seal key")  # never a seal made with nothing: callers ask first
+    return hmac.new(_secret, text.encode("utf-8", "surrogatepass"), hashlib.sha256).hexdigest()
 
 
 def seal_object(obj: dict) -> dict:
-    """The object with a "seal" over everything else in it, as its last key."""
+    """The object with a "seal" over everything else in it, as its last key. Without a key it is
+    the object and no more: it says nothing about a seal rather than carry one that proves nothing."""
     body = {k: v for k, v in obj.items() if k != "seal"}
+    if _secret is None:
+        return body
     return {**body, "seal": _mac(json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")))[:32]}
 
 
 def seal_line(line: str) -> str:
-    """One line of the guard's own output (log, status), tagged so a later scan can tell it is ours."""
-    return f"{line}\t#jg:{_mac(line)[:16]}"
+    """One line of the guard's own output (log, status), tagged so a later scan can tell it is ours.
+    Without a key the line goes out untagged, and a later scan scores it like any other text."""
+    return f"{line}\t#jg:{_mac(line)[:16]}" if _secret is not None else line
 
 
 def notice(tool: str, verdict: dict, qid: str = "", released_copy: str = "") -> str:
@@ -76,8 +94,9 @@ def notice(tool: str, verdict: dict, qid: str = "", released_copy: str = "") -> 
 
 
 def _genuine(obj) -> bool:
-    return (_secret is not None and isinstance(obj, dict) and isinstance(obj.get("seal"), str)
-            and hmac.compare_digest(obj["seal"], seal_object(obj)["seal"]))
+    if _secret is None or not isinstance(obj, dict) or not isinstance(obj.get("seal"), str):
+        return False  # with no key nothing is genuine, whatever seal it carries
+    return hmac.compare_digest(obj["seal"], seal_object(obj)["seal"])
 
 
 def _strip_objects(text: str) -> str:
