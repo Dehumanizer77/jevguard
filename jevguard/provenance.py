@@ -229,41 +229,102 @@ def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: lis
     return mentions(output, roots, c.dirs)
 
 
-_OTHER_REMOTE = {"himalaya", "yt-dlp", "lynx", "w3m", "notmuch"}
+# ---- commands written out in full -------------------------------------------------------------------
+# The exemptions below (the owner's own repositories, a trusted address) hold for a command only
+# when everything that can add to its output is accounted for. That is decided on the command as
+# written, so it has to be written out in full, and every program in it has to be known.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_FD = re.compile(r"(?<= )\d(?=>)")         # the 2 of 2>/dev/null
+_SED_PRINT = re.compile(r"\d+(?:,\d+)?p")  # sed -n '1,80p', and nothing else of sed
+_DIGITS = "0123456789"
+# Filters as they stand at the end of a pipe: (flag letters, letters of options that take a
+# value, how many other arguments). Only forms that read nothing but their input: a file operand
+# (`head notes.txt`, `cat - notes.txt`, `grep -r x`, `jq -f prog`) would put that file into
+# output that is then not withheld. awk and a sed script can run other programs.
+_GREP = ("inovEFPcqsxwhH" + _DIGITS, "mABC", 1)
+_STDIN_FILTERS = {"head": ("qv" + _DIGITS, "nc", 0), "tail": ("qv" + _DIGITS, "nc", 0), "grep": _GREP, "egrep": _GREP,
+                  "fgrep": _GREP, "jq": ("rcesSMCanj", "", 1), "wc": ("lwcmL", "", 0), "cat": ("AbEnsTv", "", 0),
+                  "sort": ("bdfghinMRrVsu", "kt", 0), "uniq": ("cdiu", "fsw", 0), "cut": ("s", "dfcb", 0),
+                  "tr": ("cdst", "", 2)}
+# Programs that print their own arguments, pass their input on, or print nothing.
+_NO_CONTENT = {"cd", "echo", "printf", "true", "tee"}
+
+
+def _plain_commands(cmd: str) -> list[list[str]] | None:
+    """The simple commands of a command line, each as its words without redirections and without
+    a leading `rtk`. None when the line is not written out in full: a here-document, anything
+    the shell still expands, or a control character. A line break inside a quoted argument
+    reaches the program as part of that argument, and in a header it starts a second header; a
+    line break outside quotes starts another command. Neither is taken apart here."""
+    cmd = cmd.strip()
+    if "<<" in cmd or _CONTROL.search(cmd) or shell.expands(cmd):
+        return None
+    commands = []
+    for words in shell.simple_commands(_FD.sub("", cmd)):
+        words = shell.without_redirections(words[1:] if words[0] == "rtk" else words)
+        if words:
+            commands.append(words)
+    return commands
+
+
+def _adds_nothing(name: str, args: list[str]) -> bool:
+    """The program brings no content of its own into the output: it filters what it is piped, or
+    prints only its arguments. By bare name: ./grep and /tmp/grep are other programs."""
+    if name in _NO_CONTENT:
+        return True
+    if name == "sed":
+        return len(args) == 2 and args[0] == "-n" and bool(_SED_PRINT.fullmatch(args[1]))
+    if name not in _STDIN_FILTERS:
+        return False
+    flags, values, operands = _STDIN_FILTERS[name]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if not a.startswith("-"):
+            operands -= 1
+        elif len(a) < 2 or a.startswith("--"):
+            return False  # `-`, and long options: --files0-from and the like read files
+        else:
+            for j, c in enumerate(a[1:], 1):
+                if c in values:
+                    if not a[j + 1:]:
+                        i += 1  # its value is the next word
+                    break
+                if c not in flags:
+                    return False
+    return operands >= 0 and i <= len(args)
 
 
 def _own_repo_mode(cmd: str, cwd: str, cfg) -> str | None:
-    """"own" when the only thing the command fetches is `gh` output about the owner's own
+    """"own" when everything the command prints is `gh` output about the owner's own
     repositories; "echo" when all of it is the reply to something the command itself just created
-    there (gh pr create, a comment posted through gh api); None when anything about the command
-    is not plain: another remote tool, a repository that cannot be told, a value computed at run
-    time."""
-    if "GH_REPO" in cmd or "GH_HOST" in cmd:
+    there (gh pr create, a comment posted through gh api). None when anything else could add to
+    the output or anything about the command is not plain: a program beside `gh` that is not a
+    filter on its input (curl with a config file, a script, cat of a file), a repository that
+    cannot be told, a value computed at run time, another host."""
+    from . import github
+    commands = _plain_commands(cmd)
+    if commands is None or os.environ.get("GH_HOST") or os.environ.get("GH_REPO") or github.rerouted():
+        return None
+    if not all(words[0] == "gh" or _adds_nothing(words[0], words[1:]) for words in commands):
         return None
     try:
         c = shell.read(cmd, cwd)
     except Exception:
         return None
-    programs = [(os.path.basename(argv[0]), argv, dirs) for argv, dirs in zip(c.programs, c.program_dirs)]
-    calls = [(argv, dirs) for name, argv, dirs in programs if name == "gh"]
-    if not calls or c.dynamic or any(name in _OTHER_REMOTE for name, _, _ in programs):
+    calls = [words for words in commands if words[0] == "gh"]
+    places = [dirs for argv, dirs in zip(c.programs, c.program_dirs) if argv[0] == "gh"]  # after any `cd`
+    if not calls or len(places) != len(calls):
         return None
-    from . import github
-    for argv, dirs in calls:
+    for argv, dirs in zip(calls, places):
         repos = github.gh_repos(argv, dirs)
         if not repos or not all(github.is_own(r, cfg.own_repos) for r in repos):
             return None
-    return "echo" if all(github.gh_echo(argv) for argv, _ in calls) else "own"
+    return "echo" if all(github.gh_echo(argv) for argv in calls) else "own"
 
 
 # ---- a fetch that is plainly from a trusted address -------------------------------------------------
-# Programs that add nothing from elsewhere to a pipeline: what they print comes from their input,
-# a local file or their own arguments. awk, a sed script and sort --compress-program can run
-# other programs, so they are not here.
-_FILTERS = {"head", "tail", "grep", "egrep", "fgrep", "jq", "wc", "cut", "tr", "cat", "tee", "nl", "uniq", "sort",
-            "echo", "printf", "true", "cd"}
-_SED_PRINT = re.compile(r"\d+(?:,\d+)?p")  # sed -n '1,80p', and nothing else of sed
-_FD = re.compile(r"(?<=\s)\d(?=>)")        # the 2 of 2>/dev/null
 # The options a plain download uses: (short flags, short options with a value, long flags, long
 # options with a value). Anything else (a proxy, --resolve, --connect-to, a config file, -k) can
 # make a trusted address return someone else's content, so a command using it is handled as
@@ -283,14 +344,18 @@ _HEADERS = {"accept", "accept-language", "accept-encoding", "user-agent", "cache
 
 
 def _plain_header(value: str) -> bool:
+    """One header with an allowed name. `@file` and `Host;` have no such name, and a value with
+    a line break in it is two headers: `Accept: x\\r\\nX-Forwarded-Host: elsewhere`."""
     name, colon, _ = value.partition(":")
-    return bool(colon) and name.strip().lower() in _HEADERS  # `@file` and `Host;` have no such name
+    return bool(colon) and not _CONTROL.search(value) and name.strip().lower() in _HEADERS
 
 
 def _plain_download(args: list[str], spec: tuple) -> list[str] | None:
     """The addresses one curl or wget invocation fetches, or None when it uses anything outside
     the plain set."""
     flags, values, long_flags, long_values = spec
+    if any(_CONTROL.search(a) for a in args):
+        return None  # a user agent or a referer with a line break in it carries a header of its own
     urls, i = [], 0
     while i < len(args):
         a = args[i]
@@ -350,24 +415,18 @@ def _trusted_fetch(cmd: str, cfg) -> bool:
     and filters. Trust is read off what is fetched: an address printed by echo, left in a comment
     or kept in a config file proves nothing, and neither does a command the shell still has to
     put together or one that runs anything else beside the download."""
-    cmd = cmd.replace("\\\n", " ")
-    if not cfg.trusted_sources or "<<" in cmd or shell.expands(cmd):
+    commands = _plain_commands(cmd) if cfg.trusted_sources else None
+    if not commands:
         return False
     programs = set()
-    for words in shell.simple_commands(_FD.sub("", cmd)):
-        words = shell.without_redirections(words[1:] if words[0] == "rtk" else words)
-        if not words:
-            continue
+    for words in commands:
         name, args = words[0], words[1:]  # the bare name only: ./curl and /tmp/curl are other programs
         if name in ("curl", "wget"):
             urls = _plain_download(args, _CURL if name == "curl" else _WGET)
             if not urls or not all(trusted_source(u, cfg.trusted_sources) for u in urls):
                 return False
             programs.add(name)
-        elif name == "sed":
-            if not (len(args) == 2 and args[0] == "-n" and _SED_PRINT.fullmatch(args[1])):
-                return False
-        elif name not in _FILTERS or any(a.startswith("--compress-program") for a in args):
+        elif not _adds_nothing(name, args):
             return False
     return bool(programs) and not any(_own_settings(p) for p in programs)
 

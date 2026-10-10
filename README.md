@@ -268,13 +268,17 @@ like one:
 - The address has to be plain: no percent escapes in the path (`%2e%2e` is `..` to the server),
   no `..`, `;` or doubled slash, no braces or brackets.
 - In the shell the whole command has to be `curl` or `wget` fetching trusted addresses with
-  everyday options (`-s -S -L -f -o -H 'Accept: ...'` and the like), optionally piped through
-  `head`, `tail`, `grep`, `jq`, `wc`, `sort` and similar. A proxy, `--resolve`, `--connect-to`,
-  a `Host` header, `-k`, a config file (`-K`, `wget -i`), a variable, `$(...)`, a second
-  program in the same command: any of these and the result is handled as ordinary outside
-  content. So is every `curl` download while a `~/.curlrc` exists, and every `wget` download
-  while a `~/.wgetrc` does: such a file can name a proxy, and the guard cannot tell who wrote
-  it.
+  everyday options (`-s -S -L -f -o -H 'Accept: ...'` and the like), written on one line,
+  optionally piped through filters. A proxy, `--resolve`, `--connect-to`, a `Host` or
+  forwarding header, a line break inside an argument (in a header that is a second header),
+  `-k`, a config file (`-K`, `wget -i`), a variable, `$(...)`, any other program in the same
+  command: any of these and the result is handled as ordinary outside content. So is every
+  `curl` download while a `~/.curlrc` exists, and every `wget` download while a `~/.wgetrc`
+  does: such a file can name a proxy, and the guard cannot tell who wrote it.
+- A filter here is `head`, `tail`, `grep`, `jq`, `wc`, `sort`, `uniq`, `cut`, `tr`,
+  `sed -n '1,80p'` or `tee`, with short options and reading only what it is piped. Given a
+  file to read (`head notes.txt`, `grep -r`, `jq -f`) it is a program that adds content of its
+  own, and the exemption ends.
 
 `gh` is a special case. Everything it prints counts as outside content, and short status lines
 and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false` scored 0.38. List
@@ -287,9 +291,13 @@ itself: `gh api -X PATCH .../issues/7 -f state=closed` returns the whole issue a
 `gh issue close 7` prints its title, and either may be a stranger's text. This is deliberately
 not an exemption: anyone can open an issue or write a comment in a public repository, and a
 clear injection scores near 1 either way. A command counts only when its repository is plain
-to see (`--repo`, an `api repos/owner/name/...` path, or the checkout it runs in) and it
-fetches nothing else; a `gh api` call with an option the guard does not know, `--hostname`, two
-methods or `..` in its path gets no leniency at all.
+to see (`--repo`, an `api repos/owner/name/...` path, or the checkout it runs in) and nothing
+else in it can add to the output: beside `gh` there may be `cd`, `echo` and the same filters
+as above, and no other program (`gh issue comment ...; curl -K x` is ordinary outside
+content). A `gh api` call with an option the guard does not know, `--hostname`, two methods or
+`..` in its path gets no leniency at all, and neither does any `gh` call while `GH_HOST` or
+`GH_REPO` is set or gh's own settings send its requests through a socket
+(`http_unix_socket`).
 
 `show` and `release` are for you, reading what was blocked. They refuse to run without a
 terminal or when started from inside Claude Code, and the hook asks you before any call that

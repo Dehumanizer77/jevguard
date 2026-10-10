@@ -141,6 +141,25 @@ def gh_echo(argv: list[str]) -> bool:
     return [a for a in args if not a.startswith("-")][1] in _ECHO_VERBS
 
 
+_SOCKET = re.compile(r"(?m)^\s*http_unix_socket\s*:[ \t]*(?!(?:\"\"|'')?[ \t]*(?:#.*)?$)\S")
+
+
+def rerouted() -> bool:
+    """gh is set to send its requests through a socket. What answers there is not known to be
+    GitHub, so nothing gh returns is then treated as coming from the owner's own repositories."""
+    env = os.environ
+    folder = env.get("GH_CONFIG_DIR") or os.path.join(
+        env.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"), "gh")
+    for name in ("config.yml", "hosts.yml"):
+        try:
+            with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+                if _SOCKET.search(f.read(200_000)):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 def gh_repos(argv: list[str], dirs: list[str]) -> list[str] | None:
     """The repositories one `gh` invocation is about, or None when that cannot be told."""
     args = argv[1:]

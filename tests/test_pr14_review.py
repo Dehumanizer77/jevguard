@@ -1,8 +1,11 @@
-"""Regression tests for the review of pull request 14 (issues 15 to 18)."""
+"""Regression tests for the review of pull request 14 (issues 15 to 20)."""
 
 import base64
-import json
 import os
+import shutil
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -184,7 +187,7 @@ def test_issue17_a_fetch_whose_origin_is_not_plain_is_ordinary_outside_content(g
     f"wget -q -O - {PREFIX}/a | jq .",
     f"cd /tmp && curl -s {PREFIX}/a > a.html",
     f"curl -s {PREFIX}/a 2>/dev/null | sed -n '1,80p'",
-    f"curl -s --proto '=https' --tlsv1.2 -w '%{{http_code}}' -H 'Accept: */*' \\\n  '{PREFIX}/a?x=1&y=2'",
+    f"curl -s --proto '=https' --tlsv1.2 -w '%{{http_code}}' -H 'Accept: */*' '{PREFIX}/a?x=1&y=2'; echo $?",
     f"rtk curl -s {PREFIX}/a 2>&1 | tail -n 20",
     f"wget -nv -qO- {PREFIX}/a",
 ])
@@ -280,6 +283,133 @@ def test_issue18_what_counts_as_a_write(command, writes):
 ])
 def test_issue18_a_path_or_host_that_leads_elsewhere_is_not_an_own_repository(command):
     assert github.gh_repos(command.split(), ["/work"]) is None
+
+
+# ---- #19 the leniency for `gh` covers `gh` output and nothing that rides along --------------------
+COMMENT = "gh issue comment 7 --repo acme/widget --body done"
+REPLY = "https://github.com/acme/widget/issues/7#issuecomment-1 "
+
+
+@pytest.mark.parametrize("command", [
+    f"{COMMENT}; curl --config attacker.cfg",
+    f"{COMMENT}; curl -K attacker.cfg",
+    f"{COMMENT}; wget -i urls.txt",
+    f"{COMMENT} && wget -q --input-file=urls.txt -O -",
+    f"curl -sK attacker.cfg | tail -5; {COMMENT}",
+    f"{COMMENT}; curl -s http://localhost:8080/x",
+    f"{COMMENT}; python3 fetch.py",
+    f"{COMMENT}; ./fetch.sh",
+    f"{COMMENT}; env -S 'curl -K attacker.cfg'",
+    f"{COMMENT}\ncurl -K attacker.cfg",
+    f"{COMMENT}; cat notes.txt",                       # a local file is not gh output either
+    f"{COMMENT}; head -5 notes.txt",
+    f"{COMMENT} | cat - notes.txt",
+    f"{COMMENT} | grep -r instructions",
+    f"{COMMENT} | jq -n -f prog.jq",
+    f"{COMMENT} | sort --files0-from=list",
+    f"GH_REPO=stranger/widget {COMMENT}",
+])
+def test_issue19_anything_else_in_the_command_ends_the_leniency(guard, command):
+    guard.configure(mode="block", on_error="closed", scan_local=True, own_repos=OWN)
+    assert run(guard, command, REPLY + ATTACK) is not None, command
+    assert guard.log()[-1]["mode"] == "external" and guard.log()[-1]["action"] == "blocked"
+
+
+def test_issue19_some_other_program_called_gh_is_not_gh(guard):
+    guard.configure(mode="block", on_error="closed", scan_local=True, own_repos=OWN)
+    assert run(guard, "/tmp/gh issue comment 7 --repo acme/widget --body done", REPLY + ATTACK) is not None
+    assert guard.log()[-1]["mode"] == "local"  # like any program the guard does not know
+
+
+def test_issue19_a_failed_scan_withholds_the_mixed_command(guard, jev):
+    guard.configure(mode="block", on_error="closed", own_repos=OWN)
+    jev.status = 503
+    assert run(guard, f"{COMMENT}; curl --config attacker.cfg", REPLY + BENIGN) is not None
+    assert run(guard, f"{COMMENT}; wget -i urls.txt", REPLY + BENIGN + " again") is not None
+
+
+@pytest.mark.parametrize("command, mode", [
+    (f"{COMMENT} 2>&1 | tail -n 3", "echo"),
+    (f"cd /work && {COMMENT}; echo $?", "echo"),
+    ("gh pr create --repo acme/widget --title x --body y | tee created.txt | grep -o pull", "echo"),
+    ("gh api repos/acme/widget/pulls/14 --jq .state 2>/dev/null | grep -c open", "own"),
+    ("gh issue list --repo acme/widget --json number,title | jq -r '.[].title' | sort -u | head -20", "own"),
+    ("rtk gh pr view 14 --repo acme/widget --comments | sed -n '1,40p'", "own"),
+])
+def test_issue19_filters_on_the_output_of_gh_change_nothing(guard, command, mode):
+    guard.configure(mode="block", own_repos=OWN)
+    out = run(guard, command, REPLY + ATTACK)
+    assert guard.log()[-1]["mode"] == mode, command
+    assert (out is None) == (mode == "echo")
+
+
+def test_issue19_gh_pointed_somewhere_else_gets_no_leniency(guard, tmp_path):
+    guard.configure(mode="block", own_repos=OWN)
+    guard.env = {"GH_CONFIG_DIR": str(tmp_path)}
+    (tmp_path / "config.yml").write_text("git_protocol: https\nhttp_unix_socket:\nprompt: enabled\n")
+    assert run(guard, COMMENT, REPLY + ATTACK) is None and guard.log()[-1]["mode"] == "echo"
+    (tmp_path / "config.yml").write_text("git_protocol: https\nhttp_unix_socket: /tmp/elsewhere.sock\n")
+    assert run(guard, COMMENT, REPLY + ATTACK + " again") is not None and guard.log()[-1]["mode"] == "external"
+    guard.env = {"GH_CONFIG_DIR": str(tmp_path / "none"), "GH_HOST": "ghe.evil.example"}
+    assert run(guard, COMMENT, REPLY + ATTACK + " a third time") is not None
+
+
+# ---- #20 a line break in an argument is part of what the program sends ----------------------------
+@pytest.mark.parametrize("command", [
+    f"curl -s -H 'Accept: text/plain\r\nX-Forwarded-Host: evil.example' {PREFIX}/a",
+    f"curl -s -H 'Accept: text/plain\nHost: evil.example' {PREFIX}/a",
+    f"curl -s --header 'Accept: text/plain\r\nX-Forwarded-Host: evil.example' {PREFIX}/a",
+    f"curl -s '--header=Accept: text/plain\nX-Forwarded-Host: evil.example' {PREFIX}/a",
+    f"curl -s -A 'probe\r\nX-Forwarded-Host: evil.example' {PREFIX}/a",
+    f"curl -s -e 'x\r\nHost: evil.example' {PREFIX}/a",
+    f"curl -s -H 'Accept: text/plain\rX-Forwarded-Host: evil.example' {PREFIX}/a",
+    f"curl -s -H 'Accept: text/plain\x00' {PREFIX}/a",
+    f"wget -q -O - --header 'Accept: text/plain\r\nX-Forwarded-Host: evil.example' {PREFIX}/a",
+    f"wget -q -O - -U 'probe\r\nHost: evil.example' {PREFIX}/a",
+])
+def test_issue20_a_line_break_inside_an_argument_ends_the_exemption(guard, command):
+    guard.configure(mode="block", on_error="closed", trusted_sources=[PREFIX])
+    assert run(guard, command, ATTACK) is not None, repr(command)
+    assert guard.log()[-1]["mode"] == "external" and guard.log()[-1]["action"] == "blocked"
+
+
+@pytest.mark.skipif(not shutil.which("curl"), reason="needs curl")
+def test_issue20_what_the_reader_calls_plain_is_what_curl_sends(guard, tmp_path):
+    """Every command taken for a plain download is run for real against a local server: it has
+    to ask that server, under the trusted path, with no header beyond the allowed ones."""
+    seen = []
+
+    class Server(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append((self.path, self.headers.get("Host"), {name.lower() for name in self.headers.keys()}))
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    host = f"127.0.0.1:{server.server_address[1]}"
+    base = f"http://{host}/guide"
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path)}  # no proxy variables, no ~/.curlrc
+    guard.configure(mode="block", scan_private_hosts=True, trusted_sources=[base])
+    guard.env = {"HOME": str(tmp_path)}
+    try:
+        for command in (f"curl -s {base}/a",
+                        f"curl -sS -H 'Accept: text/plain' -H 'Cache-Control: no-cache' -A probe {base}/b",
+                        f"curl -fsSL --compressed --max-time 5 '{base}/c?x=1&y=2' 2>/dev/null | head -5",
+                        f"cd . && curl -s --url {base}/d -o out.txt -w '%{{http_code}}' | tail -n 1; echo $?"):
+            seen.clear()
+            subprocess.run(["bash", "-c", command], cwd=tmp_path, env=env, capture_output=True, timeout=30)
+            assert seen, command
+            for path, asked, names in seen:
+                assert path.startswith("/guide/") and asked == host and names <= provenance._HEADERS | {"host"}, command
+            assert run(guard, command, ATTACK) is None and guard.log()[-1]["mode"] == "trusted", command
+    finally:
+        server.shutdown()
 
 
 def test_curl_and_wget_startup_files_count_as_startup_files(guard):

@@ -29,12 +29,12 @@ _CONNECT = {"ssh", "scp", "sftp", "ftp", "nc", "ncat", "netcat", "socat", "telne
 _MAIL = {"mail", "mailx", "sendmail", "msmtp", "mutt", "swaks"}
 _MCP_WRITE = re.compile(r"(?:^|_)(?:send|create|update|delete|post|write|reply|upload|share|publish|batch|"
                         r"move|remove|add|insert|modify|forward|draft|edit|set|invite|comment)(?:_|$)", re.I)
-# Files that run or grant access later, and the settings curl and wget read on their own: a
-# proxy written there decides whose content every later download returns.
+# Files that run or grant access later, and the settings curl, wget and gh read on their own: a
+# proxy or a socket written there decides whose content every later request returns.
 _STARTUP = re.compile(r"(?:^|/)(?:\.ssh(?:/|$)|\.claude/(?:hooks(?:/|$)|CLAUDE\.md$)|\.git/hooks(?:/|$)|"
                       r"\.bashrc$|\.bash_profile$|\.bash_login$|\.profile$|\.zshrc$|\.zprofile$|\.gitconfig$|"
                       r"\.config/systemd(?:/|$)|\.config/autostart(?:/|$)|CLAUDE\.md$|\.mcp\.json$|"
-                      r"\.curlrc$|\.config/curlrc$|\.wgetrc$|\.netrc$)")
+                      r"\.curlrc$|\.config/curlrc$|\.wgetrc$|\.netrc$|\.config/gh(?:/|$))")
 # Claude Code settings files: the hooks live there, and one line in any of them switches hooks off.
 _SETTINGS = re.compile(r"(?:^|/)\.claude/settings[^/]*\.json$")
 _ADMIN = {"mode", "gate", "install", "uninstall", "release", "show", "trust", "untrust"}

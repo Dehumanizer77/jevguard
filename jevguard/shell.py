@@ -86,13 +86,16 @@ def without_redirections(words: list[str]) -> list[str]:
 def expands(cmd: str) -> bool:
     """The shell would rewrite part of this command before running it: a variable or a command
     substitution anywhere but in single quotes, a brace list or a glob outside quotes. What then
-    runs is not what is written. A lone `?` is let through: addresses are full of them."""
+    runs is not what is written. A lone `?` is let through: addresses are full of them. So is
+    `$?`, which is a number."""
     quote, i = "", 0
     while i < len(cmd):
         ch = cmd[i]
         if quote == "'":
             quote = "" if ch == "'" else quote
         elif ch == "\\":
+            i += 1
+        elif cmd[i:i + 2] == "$?":
             i += 1
         elif ch in "$`":
             return True
