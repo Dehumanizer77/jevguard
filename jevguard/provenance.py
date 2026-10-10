@@ -188,7 +188,7 @@ def trusted_command(cmd: str, extra: set, cwd: str = "") -> bool:
     that prints nothing else. The command has to run as written (see _plain_commands):
     `echo $(cat notes.txt)`, `echo *` and `wc -l < notes.txt` print other things. Programs count
     by their bare name: ./date and /tmp/tools/cp are other programs, and `PATH=... date` may be."""
-    commands = _plain_commands(cmd)
+    commands = _plain_commands(cmd, cwd)
     if not commands:
         return False
     dirs = [canonical(cwd)] if cwd else []
@@ -201,6 +201,8 @@ def trusted_command(cmd: str, extra: set, cwd: str = "") -> bool:
             return False
         elif name in _LIST_OPTIONS and _uses(args, *_LIST_OPTIONS[name]):
             return False
+        elif name == "printf" and (args[:1] and args[0].startswith("-") or any(_PRINTF_ASSIGNS.search(a) for a in args)):
+            return False  # printf -v NAME and %n assign a shell variable: PATH, for one
         if any(_names_a_device(a, dirs) for a in args):
             return False
         if name == "cd":
@@ -317,13 +319,41 @@ _STDIN_FILTERS = {"head": ("qv" + _DIGITS, "nc", 0), "tail": ("qv" + _DIGITS, "n
                   "fgrep": _GREP, "jq": ("rcesSMCanj", "", 1), "wc": ("lwcmL", "", 0), "cat": ("AbEnsTv", "", 0),
                   "sort": ("bdfghinMRrVsu", "kt", 0), "uniq": ("cdiu", "fsw", 0), "cut": ("s", "dfcb", 0),
                   "tr": ("cdst", "", 2)}
-# Programs that print their own arguments, pass their input on, or print nothing.
-_NO_CONTENT = {"cd", "echo", "printf", "true", "tee"}
+# Programs that print their own arguments, pass their input on, or print nothing. printf is not
+# one of them: `printf -v PATH ...` and `printf '%n' PATH` assign a shell variable, and after
+# that a bare `curl` is whatever the new search path holds.
+_NO_CONTENT = {"cd", "echo", "true", "tee"}
+_PRINTF_ASSIGNS = re.compile(r"%[^A-Za-z%]*n")
 
 
-def _plain_commands(cmd: str) -> list[list[str]] | None:
+def _program_dirs() -> set[str] | None:
+    """The directories programs are looked up in. None when one entry is empty or relative: a
+    bare name then means whatever lies in the directory the command happens to be in."""
+    entries = os.environ.get("PATH", "").split(":")
+    return {os.path.realpath(e) for e in entries} if all(os.path.isabs(e) for e in entries) else None
+
+
+def _is_program(arg: str, dirs: list[str], programs: set, files: bool = True) -> bool:
+    """The argument names a place where programs are looked up, something in one, or (files) a
+    file that can be run. A command that writes there decides what a later bare name runs:
+    `echo ... > ~/.cargo/bin/rtk; rtk curl ...`, `cp x ~/.local/bin/date; date`. Which arguments
+    a program writes to is not sorted out here; any that could be one of these counts."""
+    forms = {arg, arg.partition("=")[2], arg[2:] if arg.startswith("-") and not arg.startswith("--") else ""}
+    for form in filter(None, forms):
+        for base in dirs or [""]:
+            path = canonical(form, base)
+            # in such a directory, or above one: `mv ~/tools ~/old; mv /tmp/x ~/tools` swaps ~/tools/bin
+            if os.path.dirname(path) in programs or any(under(p, path) for p in programs):
+                return True
+            if files and os.path.isfile(path) and os.access(path, os.X_OK):
+                return True
+    return False
+
+
+def _plain_commands(cmd: str, cwd: str = "") -> list[list[str]] | None:
     """The simple commands of a command line, each as its words, without a leading `rtk`. None
-    when the line is not written out in full, or takes something in by a side door:
+    when the line is not written out in full, takes something in by a side door, or can change
+    what its own bare program names stand for:
 
     - anything the shell still expands, a comment, an open quote;
     - a control character. A line break inside a quoted argument reaches the program as part of
@@ -331,16 +361,19 @@ def _plain_commands(cmd: str) -> list[list[str]] | None:
     - a redirection that supplies input. `cat < /dev/tcp/host/port` reads from the network and
       `head < notes.txt` from a file, whatever the program is taken for; a here-document, `<&3`
       and `<>` likewise;
-    - a redirection to a /dev/tcp or /dev/udp address, in either direction.
+    - a redirection to a /dev/tcp or /dev/udp address, in either direction;
+    - an argument or a redirection that names a program or a place programs are looked up in,
+      or a search path with an entry that depends on the current directory.
 
-    Output redirections bring nothing in and are left out. What is an operator and what is an
-    argument is decided by quoting (shell.plain_commands): `'>'` is an argument, and so is the
-    word after it."""
+    Other output redirections bring nothing in and are left out. What is an operator and what
+    is an argument is decided by quoting (shell.plain_commands): `'>'` is an argument, and so is
+    the word after it."""
     cmd = cmd.strip()
     commands = None if _CONTROL.search(cmd) else shell.plain_commands(cmd)
-    if commands is None:
+    programs = _program_dirs()
+    if commands is None or programs is None:
         return None
-    plain = []
+    plain, dirs = [], [canonical(cwd)] if cwd else []
     for words, redirections in commands:
         if any("<" in operator or _SOCKET.search(target) for operator, target in redirections):
             return None
@@ -348,6 +381,15 @@ def _plain_commands(cmd: str) -> list[list[str]] | None:
         # that fetch: what rtk makes of `grep` or `head` is not known here.
         if words[:1] == ["rtk"] and words[1:2] and words[1] in ("curl", "wget", "gh", "git"):
             words = words[1:]
+        # git writes inside its checkout and nowhere it is not told to; its arguments are branch
+        # names and paths there, and a branch may well be called like a program in the directory
+        git = words[:1] == ["git"]
+        if any(_is_program(target, dirs, programs) for _, target in redirections):
+            return None
+        if words[:1] == ["cd"]:  # going somewhere writes nothing
+            dirs = dirs + [canonical(a, d) for a in words[1:2] if not a.startswith("-") for d in dirs[:8]]
+        elif any(_is_program(a, dirs, programs, not git) for a in words[1:]):
+            return None
         if words:
             plain.append(words)
     return plain
@@ -393,7 +435,7 @@ def _own_repo_mode(cmd: str, cwd: str, cfg) -> str | None:
     repository that cannot be told, a value computed at run time, another host. A `git push`
     to an own repository beside `gh` keeps the result "own"."""
     from . import github
-    commands = _plain_commands(cmd)
+    commands = _plain_commands(cmd, cwd)
     if commands is None or os.environ.get("GH_HOST") or os.environ.get("GH_REPO") or github.rerouted():
         return None
     remote = []  # the commands that bring something back from a server (gh, git push), and where they run
@@ -523,12 +565,12 @@ def _own_settings(program: str) -> bool:
     return any(p and os.path.exists(p) for p in places)
 
 
-def _trusted_fetch(cmd: str, cfg) -> bool:
+def _trusted_fetch(cmd: str, cwd: str, cfg) -> bool:
     """The command is nothing but plain curl or wget downloads from addresses on the trusted list,
     and filters. Trust is read off what is fetched: an address printed by echo, left in a comment
     or kept in a config file proves nothing, and neither does a command the shell still has to
     put together or one that runs anything else beside the download."""
-    commands = _plain_commands(cmd) if cfg.trusted_sources else None
+    commands = _plain_commands(cmd, cwd) if cfg.trusted_sources else None
     if not commands:
         return False
     programs = set()
@@ -607,7 +649,7 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
             # Trusted only if every public address the text of the command holds is on the list,
             # and the command is nothing but a plain download of those addresses.
             public = _public_urls(cmd, cfg)
-            if public and all(trusted_source(u, cfg.trusted_sources) for u in public) and _trusted_fetch(cmd, cfg):
+            if public and all(trusted_source(u, cfg.trusted_sources) for u in public) and _trusted_fetch(cmd, cwd, cfg):
                 return "trusted"
             if not public and cfg.own_repos:
                 return _own_repo_mode(cmd, cwd, cfg) or "external"

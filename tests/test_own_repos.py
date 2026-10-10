@@ -100,8 +100,7 @@ def test_a_clear_injection_in_an_own_repository_is_still_withheld(guard):
 def test_the_reply_to_what_the_command_created_is_only_logged(guard):
     guard.configure(mode="block", own_repos=OWN)
     for command in ("gh pr create --repo acme/widget --title x --body y",
-                    "gh api repos/acme/widget/issues/7/comments -f body=done",
-                    "gh api -X POST repos/acme/widget/pulls -f title=x -f head=fix -f base=main",
+                    "gh pr edit 14 --repo acme/widget --title x",
                     "gh issue comment 7 --repo acme/widget --body done"):
         assert run(guard, command, "https://github.com/acme/widget/pull/14 " + ATTACK) is None, command
         assert guard.log()[-1]["mode"] == "echo" and guard.log()[-1]["action"] == "would-block"
@@ -200,6 +199,8 @@ def test_git_in_any_other_form_ends_it(guard, checkout, command):
     CONFIG.replace("remote = origin", "remote = origin\n\tpushRemote = git@evil.example:x.git"),
     CONFIG.replace("remote = origin", "remote = git@evil.example:x.git"),
     CONFIG + "[include]\n\tpath = /tmp/more.config\n",                              # settings the reader cannot see
+    CONFIG.replace("bare = false", "bare = false\n\tsshCommand = ./x"),             # a program in place of ssh
+    CONFIG + "[http]\n\tproxy = http://proxy.evil.example:3128\n\tsslVerify = false\n",
     CONFIG + '[remote "origin"]\n\turl = git@evil.example:x.git\n',                 # the section given twice
 ])
 def test_a_checkout_that_may_talk_to_anyone_else_gets_no_leniency(guard, checkout, config):

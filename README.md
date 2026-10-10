@@ -283,18 +283,22 @@ like one:
   and `head < notes.txt` a file read, so any `<`, a here-document or a `/dev/tcp` address ends
   the exemption. Redirecting output (`> out.html`, `2>&1`, `2>/dev/null`) is fine. The command
   is read the way the shell reads it: a quoted `'>'` or `';'` is an argument, not an operator.
+- A bare `curl` has to be the program it seems. `printf` is no companion, because
+  `printf -v PATH ...` changes where programs are found; a command that writes to a program
+  or into a directory on your `PATH` (`echo ... > ~/.cargo/bin/rtk; rtk curl ...`) is not
+  exempt; and nothing is while `PATH` has an empty or relative entry.
 
 `gh` is a special case. Everything it prints counts as outside content, and short status lines
 and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false` scored 0.38. List
 your own repositories in `own_repos` (`"acme/*"`, `"solo/tool"`) and what `gh` returns about
-them is withheld only from 0.6 up; between 0.38 and 0.6 it is logged as flagged. The reply to
-something the command itself just created there (`gh pr create`, `gh issue comment`, a comment
-or an issue posted through `gh api` with its text written in the command) is only logged: it
-holds what the command says. With `--input file` or `-F body=@file` the reply carries that
-file back, and is handled like any other output about your repository. A change
-to something that already exists is not treated that way, because the reply carries the thing
-itself: `gh api -X PATCH .../issues/7 -f state=closed` returns the whole issue and
-`gh issue close 7` prints its title, and either may be a stranger's text. This is deliberately
+them is withheld only from 0.6 up; between 0.38 and 0.6 it is logged as flagged. Where the
+whole reply is the address of what the command just made or changed, it is only logged:
+`gh pr create`, `gh pr comment`, `gh pr edit`, the same three for `gh issue`, `gh release
+create` and `edit`, `gh label create` and `edit` (not with `--dry-run`, which prints the text
+it would use). Nothing else is treated that way. `gh issue close 7` prints the issue's title,
+and `gh api` returns the whole object for every write, with more in it than the command sent:
+a pull request made from an issue carries that issue's text, release notes can be generated
+from the titles of merged pull requests. Either may be a stranger's text. This is deliberately
 not an exemption: anyone can open an issue or write a comment in a public repository, and a
 clear injection scores near 1 either way. A command counts only when its repository is plain
 to see (`--repo`, an `api repos/owner/name/...` path, or the checkout it runs in) and nothing
@@ -314,7 +318,8 @@ never "only logged", and it counts as about your own repository only when the pu
 goes to one: `git push`, `git push origin <branch>` with everyday options (`-u`, `--tags`,
 `--force-with-lease`, ...), in a checkout that talks to one repository only. That is a
 checkout whose only remote is `origin` with a single github.com address, with no `pushurl`,
-`insteadOf`, `pushDefault`, `pushRemote` or `include` in its settings or in your `~/.gitconfig`.
+`insteadOf`, `pushDefault`, `pushRemote`, `sshCommand`, `proxy` or `include` in its settings or
+in your `~/.gitconfig`.
 The same holds for a `gh` command that names no repository and takes it from the checkout:
 with a second remote `gh` may pick that one. Anything else (`git -c ...`, `git -C dir`,
 another remote, an address in place of a remote, `git log`, `git fetch`, `git pull`) and the

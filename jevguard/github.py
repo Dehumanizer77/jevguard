@@ -40,10 +40,11 @@ _ORIGIN_HEADER = re.compile(r'\[\s*(?i:remote)\s+"origin"\s*\]')
 _URL_KEY = re.compile(_KEY + r"url\s*=[ \t]*(\S*)", re.I | re.M)
 _BRANCH_REMOTE = re.compile(_KEY + r"remote\s*=[ \t]*(\S*)", re.I | re.M)
 _GH_RESOLVED = re.compile(_KEY + r"gh-resolved\s*=[ \t]*(\S*)", re.I | re.M)
-# Settings that send git somewhere other than the address written for origin, or that pull in
-# settings this reader does not see.
-_ELSEWHERE = re.compile(_KEY + r"(?:pushurl|pushdefault|pushremote|(?:push)?insteadof|worktreeconfig)\s*=|"
-                        r"^\s*\[\s*include", re.I | re.M)
+# Settings that send git somewhere other than the address written for origin, put a program or
+# a proxy of someone's choosing between git and that address, or pull in settings this reader
+# does not see.
+_ELSEWHERE = re.compile(_KEY + r"(?:pushurl|pushdefault|pushremote|(?:push)?insteadof|worktreeconfig|sshcommand|"
+                        r"(?:git)?proxy|sslverify|hookspath|fsmonitor)\s*=|^\s*\[\s*include", re.I | re.M)
 _GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT",
             "GIT_CONFIG_PARAMETERS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND")
 
@@ -179,13 +180,14 @@ WRITE_VERBS = {"create", "comment", "edit", "merge", "close", "reopen", "delete"
                "review", "ready", "lock", "unlock", "transfer", "rename", "archive", "unarchive", "sync", "enable",
                "disable", "rerun", "cancel", "add", "remove", "import", "pin", "unpin", "develop", "revert"}
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-# Replies that hold nothing but what the command itself sent: the address of the new pull
-# request, the comment just posted. A change to something that already exists is not one: it
-# returns or names the whole thing, and in a public repository that text may be a stranger's
-# (`gh api -X PATCH .../issues/7 -f state=closed` returns the issue, `gh issue close` its title).
-_ECHO_VERBS = {"create", "comment", "edit"}
-_ECHO_API = re.compile(r"/?repos/[^/]+/[^/]+/(?:issues|pulls|releases|labels|(?:issues|pulls)/\d+/comments|"
-                       r"pulls/\d+/reviews)/?")
+# The commands whose whole reply is the address of what they made or changed, or one line saying
+# that it was done. Nothing else is an echo:
+# - `gh issue close` prints the title of the issue, which may be a stranger's;
+# - `gh api` returns the whole object for every write, and what GitHub puts into a new object is
+#   not only what the command sent: a pull request made from an issue (`-F issue=7`) carries
+#   that issue's text, release notes can be generated from the titles of merged pull requests.
+_ECHO = {("pr", "create"), ("pr", "comment"), ("pr", "edit"), ("issue", "create"), ("issue", "comment"),
+         ("issue", "edit"), ("release", "create"), ("release", "edit"), ("label", "create"), ("label", "edit")}
 
 
 def gh_writes(argv: list[str]) -> bool:
@@ -207,16 +209,14 @@ def gh_sends_file(argv: list[str]) -> bool:
 
 
 def gh_echo(argv: list[str]) -> bool:
-    """The reply to this invocation is what it just created and nothing else: what the command
-    itself says. A new issue whose body came from a file comes back with that file in it, and
-    that is no more the command's own text than `cat file` would be."""
-    if not gh_writes(argv):
-        return False
+    """The reply to this invocation is the address of what it just made or changed, and nothing
+    else. Never for `gh api`, and not for --dry-run, which prints the title and the body the
+    command would have used (with --fill, the text of the commits)."""
     args = argv[1:]
-    if args[0] == "api":
-        endpoint, method, from_file = _api(args[1:])
-        return method == "POST" and not from_file and bool(_ECHO_API.fullmatch(endpoint.split("?", 1)[0]))
-    return [a for a in args if not a.startswith("-")][1] in _ECHO_VERBS
+    if not gh_writes(argv) or args[0] == "api":
+        return False
+    words = [a for a in args if not a.startswith("-")]
+    return (words[0], words[1]) in _ECHO and not any(a.split("=", 1)[0] == "--dry-run" for a in args)
 
 
 _SOCKET = re.compile(r"(?m)^\s*http_unix_socket\s*:[ \t]*(?!(?:\"\"|'')?[ \t]*(?:#.*)?$)\S")
