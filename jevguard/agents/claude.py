@@ -11,6 +11,11 @@ names the file and holds none of the output. Monitor is different: its PostToolU
 {taskId, timeoutMs, persistent}, and each line the command prints is put into the conversation
 as a notification, which no hook is called for. (Both seen in 2.1.295; that version has no tool
 that returns a background command's output directly.)
+
+A result too large to hand over is saved to a file under <transcript>/tool-results and the model
+is told to read it: for Bash the hook gets the first 30,000 characters and the path, for an MCP
+tool from about 100 KB only a message with the path (toolio.py has both). The file is tracked as
+this call's output, and a replacement does not carry the path.
 """
 
 from __future__ import annotations
@@ -51,6 +56,14 @@ class ClaudeCode(Agent):
             # Sent to the background: the result is empty, and the model is told a file to read
             # when the command is done. That file is where this command's output will be.
             call.later_ids, call.later_paths = [task], _task_files(d, task)
+        # A result too large to hand over: the hook is given the beginning of it, or none of it,
+        # and the rest is in a file the model is told to read. That file is this call's output.
+        store = toolio.result_store(d.get("transcript_path"))
+        call.later_paths = [*call.later_paths, *toolio.saved_paths(call.raw, store)]
+        if isinstance(call.raw, str):
+            form = toolio.saved_notice_format(call.raw, store)
+            if form is not None:  # the tool's own message about it: only the line made from the content is scanned
+                call.text, call.ids["scanned"] = form, "saved-result notice: format line"
         return "after", call
 
     def answer(self, d: dict, phase: str, call: Call, decision: Decision) -> dict | None:

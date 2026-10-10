@@ -19,6 +19,7 @@ and the owner can run it himself.
 from __future__ import annotations
 
 import json
+import os
 
 from .. import config, engine, toolio
 from ..engine import Call
@@ -89,6 +90,10 @@ def around(tool_name: str, args, next_call, ids: dict):
     call, cfg = to_call(str(tool_name or ""), given, ids), None
     try:
         cfg = config.load()
+        # Hermes puts results too large to hand over into files under its cache, and the model
+        # reads them back from there. What is in them is tool output, whichever tool it was; as
+        # in the plugin this is derived from, all of it counts as content from outside.
+        cfg.external_paths = [*cfg.external_paths, os.path.join(os.environ.get("HERMES_HOME") or "~/.hermes", "cache", "spillover")]
         decision = engine.before(call, cfg)
     except Exception as exc:
         decision = engine.after_error("before", call, cfg, {}, exc)

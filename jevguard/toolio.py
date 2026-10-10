@@ -162,10 +162,74 @@ def redirect_supplied(tool_input: dict, text: str) -> str | None:
     return "\n".join([redirect, status] + ([decoded] if decoded != redirect else []))
 
 
+# A result too large to hand over is put in a file of the session,
+#   <the transcript's path without .jsonl>/tool-results/<name>,
+# and the model is told to read that instead (seen in 2.1.295):
+#   Bash         stdout is cut to its first 30,000 characters; persistedOutputPath and
+#                persistedOutputSize are added. The model gets a 2 KB preview and the path.
+#   an MCP tool  from about 100 KB: the hook gets none of the content. The result is the message
+#                below, a string, and that is all the model gets too.
+# Either way the content the hook did not see is in that file, and the file is this call's output
+# (saved_paths). The MCP message is the tool's own words around three things: sizes, the path, and
+# a line that says what form the content has, which is made from the content.
+_SAVED = re.compile(r"Error: result \(([\d,]{1,20}) characters across (\d{1,12}) lines\) exceeds maximum allowed tokens\. "
+                    r"Output has been saved to (\S+)\.\nFormat: ([^\n]*)\n")
+_SAVED_CHUNK = re.compile(r"in chunks of ~(\d{1,9}) lines")
+_STORED = re.compile(r"/[^\s\"'<>|]*/tool-results/[^\s\"'<>|/]+")
+
+
+def _saved_notice(chars: str, lines: str, path: str, form: str, chunk: str) -> str:
+    return (f"Error: result ({chars} characters across {lines} lines) exceeds maximum allowed tokens. "
+            f"Output has been saved to {path}.\n"
+            f"Format: {form}\n"
+            "- For targeted searches (find a line, locate a string): use grep on the file directly.\n"
+            f"- For analysis or summarization that requires reading the full content: read {path} in chunks of "
+            f"~{chunk} lines using offset/limit until you have read 100% of it.\n"
+            "- If the Agent tool is available, do this inside a subagent so the full output stays out of your main "
+            "context. Give it the instruction above verbatim, and be explicit about what it must return — e.g. "
+            f'"Read {path} in chunks of ~{chunk} lines using offset/limit until you have read all {lines} lines, then '
+            'summarize and quote any key findings verbatim." A vague "summarize this" may lose detail.\n')
+
+
+def result_store(transcript_path) -> str:
+    """The directory this session's oversized results are saved in, or "" when it cannot be told."""
+    path = str(transcript_path or "")
+    return path[:-len(".jsonl")] + "/tool-results" if path.endswith(".jsonl") and len(path) > len(".jsonl") else ""
+
+
+def saved_notice_format(text: str, store: str) -> str | None:
+    """If a result is that message and nothing else, about a file in this session's own store:
+    its format line, the one part of it made from the content, which is then all there is to
+    scan here (the content itself is scanned when the file is read). Else None, and the result
+    is scanned whole. As with the redirect notice, the message is not known by its wording: it is
+    written out again from the parts found in it and has to come out equal."""
+    found, chunk = _SAVED.match(text), _SAVED_CHUNK.search(text)
+    if not store or not found or not chunk:
+        return None
+    chars, lines, path, form = found.groups()
+    name = path[len(store) + 1:] if path.startswith(store + "/") else ""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", name) or name.startswith("."):
+        return None
+    return form if text.strip() == _saved_notice(chars, lines, path, form, chunk.group(1)).strip() else None
+
+
+def saved_paths(resp, store: str) -> list[str]:
+    """The files a result says its content was saved to. With the store known, only files in it;
+    without, anything that reads like one. Tracking a file too many costs a scan."""
+    texts: list = []
+    _leaves(resp, texts, [])
+    named = [m for t in texts for m in _STORED.findall(t)]
+    if isinstance(resp, dict) and isinstance(resp.get("persistedOutputPath"), str):
+        named.insert(0, resp["persistedOutputPath"])
+    return list(dict.fromkeys(p.rstrip(".,;:)") for p in named if not store or p.startswith(store + "/")))
+
+
 def replaced(tool: str, resp, note: str):
     """The tool result with its content replaced by note, in the shape the tool returns."""
     if isinstance(resp, dict) and tool == "Bash":
-        return {**resp, "stdout": note, "stderr": "", "isImage": False}
+        # not the fields that say where the whole output was saved: that file is the original
+        kept = {k: v for k, v in resp.items() if k not in ("persistedOutputPath", "persistedOutputSize")}
+        return {**kept, "stdout": note, "stderr": "", "isImage": False}
     if isinstance(resp, dict) and tool == "Read":
         f = resp.get("file") if isinstance(resp.get("file"), dict) else {}  # whatever came: this must not fail
         return {"type": "text", "file": {"filePath": f.get("filePath", ""), "content": note,

@@ -83,6 +83,16 @@ def _not_content(value: str, key: str, top: bool, said: frozenset) -> bool:
     return value in said
 
 
+def _pointers(node, depth: int = 0) -> list:
+    """Every output_file in a result that is a path."""
+    if isinstance(node, dict) and depth < 6:
+        here = [node[_POINTER]] if isinstance(node.get(_POINTER), str) and node[_POINTER] and not re.search(r"\s", node[_POINTER]) else []
+        return here + [p for v in node.values() for p in _pointers(v, depth + 1)]
+    if isinstance(node, list) and depth < 6:
+        return [p for v in node for p in _pointers(v, depth + 1)]
+    return []
+
+
 def _task_results(node, depth: int = 0) -> list:
     """The per-task parts of a get_command_or_subagent_output result: {"type": "TaskOutput",
     "Result": {task_id, command, status, output, output_file, ...}} for one task (seen in 1.0.30);
@@ -189,6 +199,10 @@ class Grok(Agent):
             call.later_ids = [str(call.raw["task_id"])]
             call.later_paths = [call.raw[_POINTER]] if isinstance(call.raw.get(_POINTER), str) and call.raw[_POINTER] else []
         if call.shaped:
+            # Any built-in result may name the file Grok keeps the whole output in (output_file),
+            # which the model is sent to when what it was handed is cut short. That file is this
+            # call's output like the rest.
+            call.later_paths = list(dict.fromkeys([*call.later_paths, *_pointers(call.raw)]))
             call.said = said_by(given, call.cwd)
             call.text = text_of(call.raw, call.said)
         else:

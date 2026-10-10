@@ -64,6 +64,15 @@ another agent its adapter translates them.
    (`get_command_or_subagent_output`, `process`): its result is judged as the output of the
    command that printed it.
 
+   A result too large to hand over is saved to a file by the agent, and the model is told to
+   read that. In Claude Code the hook is then given only the first 30,000 characters of a
+   shell command's output, and of an MCP result over about 100 KB nothing at all, just a
+   message naming the file. The file is this call's output: it is tracked like a download
+   when the call is outside content, and a withheld result no longer says where it is. That
+   message is taken apart like the redirect notice below (scored whole, it is withheld every
+   time). Grok's `output_file` is followed the same way; in Hermes everything under its
+   spill-over cache counts as outside content.
+
    One message of a tool is taken apart instead: `WebFetch`'s notice that an address redirects
    to another host. It tells the model to fetch the new address and quotes the agent's own
    prompt, so scored whole it was withheld every time. The guard writes that notice out again
@@ -540,7 +549,9 @@ fetches and the private connectors out of that; each switch above widens it.
 - The result of a built-in tool whose name the adapter does not know (MCP tools always are
   scanned; in Copilot CLI an unknown tool is too). A background command's output is followed
   in Claude Code, Grok and Hermes as described above; whether Codex has a tool of that kind
-  that its hooks do not report is not known.
+  that its hooks do not report is not known. Nor is it known what Codex, Copilot CLI and
+  Cursor do with a result too large to hand over; if they save it to a file as Claude Code
+  does, that file is not followed there.
 - A file tool the guard has no model of, when the path it changes is inside a longer text it
   is given rather than an argument of its own. The patches of Codex and Hermes are read;
   another tool's own patch format would not be.
