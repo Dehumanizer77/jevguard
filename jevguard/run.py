@@ -1,7 +1,7 @@
 """`jevguard-run`: run a shell command and let the guard see what it printed before the agent does.
 
-For agents whose hooks cannot replace the output of a shell command after it ran (Cursor,
-Codex). Their adapter rewrites the command, before it runs, into
+For agents whose hooks cannot replace the output of a shell command after it ran (Cursor).
+Their adapter rewrites the command, before it runs, into
 
     /path/to/bin/jevguard-run --agent cursor --session <id> -- '<the command as it was>'
 
@@ -105,9 +105,9 @@ def _judge(agent: str, session: str, command: str, out: bytes, err: bytes) -> st
         store.judged(cfg, session, call.tool_input["command"], mark=True)
     except BaseException as exc:
         # The wrapper could not do its work: a guard bug, or a sandbox around the command that
-        # allows neither the network nor a file of the guard's own (Codex's does not). The output
-        # goes through as it is and nothing is marked, so the agent's hook after the call, which
-        # runs outside that sandbox, judges it. Nothing is printed: it would land in the output.
+        # allows neither the network nor a file of the guard's own. The output goes through as
+        # it is and nothing is marked, so the agent's hook after the call, which runs outside
+        # that sandbox, judges it. Nothing is printed: it would land in the output.
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         signal.alarm(0)

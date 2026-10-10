@@ -341,7 +341,7 @@ def cmd_selftest(cfg, a) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="jevguard", description="Prompt-injection guard for Claude Code.")
+    ap = argparse.ArgumentParser(prog="jevguard", description="Prompt-injection guard for coding agents.")
     ap.add_argument("--settings", type=Path, default=SETTINGS, help="Claude Code settings file")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("status", help="settings, key, usage and counts from the scan log")

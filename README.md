@@ -1,25 +1,31 @@
 # jevguard
 
-A prompt-injection guard for [Claude Code](https://code.claude.com). It scans what tools bring in
-from outside (web pages, search results, MCP responses, output of commands that fetch from the
-internet, files those commands saved) before the model reads it, and withholds results that
-score as an injection.
+A prompt-injection guard for coding agents. It runs from the agent's own hooks: in
+[Claude Code](https://code.claude.com), Grok Build and Codex CLI, where it has been run against
+the live program, and in Copilot CLI, Cursor and Hermes, where the adapter is written from the
+documentation ([Other agents](#other-agents)). It scans what tools bring in from outside (web
+pages, search results, MCP responses, output of commands that fetch from the internet, files
+those commands saved) before the model reads it, and withholds results that score as an
+injection.
 
 Scoring is done by [Jev](https://docs.typesafe.ai/concepts/system-one), TypeSafe's decision
 model: it answers fixed questions about a text with probabilities and generates nothing. The
 extraction code, the two questions, the chunking and the thresholds come unchanged from
-[jooray/hermes-firewall](https://github.com/jooray/hermes-firewall) (MIT), which built and
-benchmarked this gate for Hermes Agent; see
+[jooray/hermes-firewall](https://github.com/jooray/hermes-firewall) (MIT), where this gate was
+built and benchmarked for Hermes Agent; see
 [the write-up](https://juraj.bednar.io/en/blog-en/2026/09/28/a-prompt-injection-gate-for-my-ai-agent-what-worked-what-didnt-and-the-benchmark/).
-This repository is the Claude Code side: hooks, origin tracking for Claude Code's tools, result
-replacement in each tool's own shape, and a gate in front of risky actions.
+This repository is what goes around it: an engine that tracks where each result came from, one
+adapter per agent (how its hook is called, what its tools are named, how a result is replaced
+in each tool's own shape), and a gate in front of risky actions.
 
 It is one layer, not a security boundary. A detector misses some attacks and nobody has tested
 this one against an attacker who adapts to it. Keep permissions tight.
 
 ## How it works
 
-Two Claude Code [hooks](https://code.claude.com/docs/en/hooks) run `bin/jevguard-hook`:
+The agent's hooks run `bin/jevguard-hook` at two points. The names below (hooks, tools,
+`updatedToolOutput`) are Claude Code's [own](https://code.claude.com/docs/en/hooks); for
+another agent its adapter translates them.
 
 **PostToolUse** (after a tool ran, before its result reaches the model)
 
@@ -59,8 +65,9 @@ size, timing, a hash. Never the content.
 Two checks that read the call itself, no model:
 
 - *Changes to the guard.* A call that would change the guard's settings, state, release list
-  or code, run `jevguard mode|gate|install|uninstall|release|show|trust|untrust|own|disown`, or touch a Claude Code
-  `settings*.json` (the hooks live there) is held for your approval. That holds whether the
+  or code, run `jevguard mode|gate|install|uninstall|release|show|trust|untrust|own|disown`, or touch a file
+  the hooks are set up in (a Claude Code `settings*.json`, and the hook files of the other
+  agents the guard installs into) is held for your approval. That holds whether the
   file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`),
   through a directory above it (`rm -rf ~/.claude`), or as the place a command writes to in
   any spelling (`curl -o/path`, `--output-dir` with `-O`, `cd` there and download,
@@ -104,7 +111,8 @@ The check before a call takes about 35 ms on the machine this was developed on.
 ## Install
 
 The steps below are the ones used for the first installation (Debian 12, Claude Code 2.1.295,
-Python 3.11). macOS should work and has not been tried; Windows needs WSL.
+Python 3.11). macOS should work and has not been tried; Windows needs WSL. They set the guard
+up for Claude Code; for another agent do the same and then see [Other agents](#other-agents).
 
 Know before you install: once the hooks are in, the text of every tool result that counts as
 outside content is sent to TypeSafe's API (`https://api.typesafe.ai/v1/systemone`) for scoring.
@@ -380,7 +388,7 @@ depends on what that agent lets a hook do:
 |---|---|---|---|
 | Claude Code | every tool | asks you | live (`tests/e2e_claude.py`) |
 | Grok Build | every tool | asks you | live against grok 1.0.30 (`tests/e2e_grok.py`) |
-| Codex CLI | shell output, when Codex runs without a sandbox; otherwise it is only logged | refuses the call | live against codex 0.160.0 (`tests/e2e_codex.py`) |
+| Codex CLI | every tool | refuses the call | live against codex 0.160.0 (`tests/e2e_codex.py`) |
 | Copilot CLI | every tool | asks you | from its documentation only |
 | Cursor | MCP tools, file reads, shell output | asks you for shell and MCP | from its documentation only |
 | Hermes | every tool | refuses the call | from the notes of the plugin it is derived from |
@@ -402,19 +410,18 @@ Things to know:
 - **Grok** also runs the hooks in `~/.claude/settings.json`, so with the guard installed for
   Claude Code it is started by Grok too and recognises it. Installing for Grok as well gives it
   hooks without Claude Code's tool-name filter, which Grok's MCP tools do not fit.
-- **Codex** lets a hook replace nothing after the fact and has no "ask". So a shell command
-  whose output the guard would look at is rewritten to run through `bin/jevguard-run`, which
-  scans what the command printed before Codex gets it. That works when Codex runs commands
-  without its sandbox (`--sandbox danger-full-access`). Inside the sandbox the wrapper can
-  reach neither the scoring service nor a file of its own (not even a local socket); it then
-  passes the output on, and the hook after the call, which runs outside the sandbox, scans and
-  logs it and tells Codex to stop. Codex 0.160.0 lets the model answer all the same, so there
-  the guard detects and does not withhold. Where the guard would ask, the call is refused.
+- **Codex** has no field for a replacement and no "ask". But when a hook after a call answers
+  `decision: "block"`, Codex puts the hook's words in place of the tool's result, so the guard
+  hands it the notice that way. The hook runs outside Codex's sandbox, so this holds whatever
+  the sandbox allows the command. Where the guard would ask, the call is refused with the
+  reason. Codex runs a hook only after you have reviewed it (`/hooks`).
 - **Cursor** and **Copilot CLI** adapters are written from the documentation and have not been
-  run against the programs. Cursor's own web tools cannot be covered: it lets a hook replace
-  only MCP results.
+  run against the programs. Cursor lets a hook replace only MCP results, so there a shell
+  command whose output the guard would look at is rewritten to run through `bin/jevguard-run`,
+  which scans what the command printed before Cursor gets it; that needs the command to be
+  allowed the network. Cursor's own web tools cannot be covered.
 - **Hermes** has no way to ask from a plugin; where the guard would ask, the call is refused.
-- The output of a wrapped command is held until the command has finished.
+- The output of a command run through `jevguard-run` is held until the command has finished.
 
 ## Settings
 
@@ -436,7 +443,7 @@ Things to know:
 | `own_repos` | `[]` | your own GitHub repositories, as `owner/name` or `owner/*`; what one `gh` command naming such a repository returns is withheld only from `own_repos_block` up |
 | `own_repos_block` | `0.6` | that level |
 | `on_error` | `open` | `closed` withholds outside content that could not be fully scanned: the API failed, the guard hit an error, or part of the result was unreadable (block mode). Without `tesseract` that includes every image from outside |
-| `protect_guard` | `true` | ask before any call that would change the guard or the Claude Code settings that run it |
+| `protect_guard` | `true` | ask before any call that would change the guard or the agent settings that run it |
 | `daily_token_budget` | 5,000,000 | scanning stops for the day beyond this |
 | `model` | `jev-1.13.0` | pinned; the thresholds were fitted on this version |
 | `url` | `https://api.typesafe.ai/v1/systemone` | where the text is sent for scoring |
@@ -478,16 +485,19 @@ fetches and the private connectors out of that; each switch above widens it.
 ```bash
 python3 -m pytest tests -q      # the real hook script against a stand-in scoring API
 tests/e2e_claude.py             # a headless Claude Code session: does the model see only the notice?
+tests/e2e_grok.py               # the same against Grok Build
+tests/e2e_codex.py              # the same against Codex CLI (optionally: a sandbox mode)
 ```
 
 The first needs pytest (`python3-pytest`) and, for one image test, Pillow; neither needs the
-API key or the network. The second starts `claude -p` with a temporary settings file and a
-stand-in scoring API, so it needs a logged-in Claude Code and costs a few cents of usage, but
-no API key and no installation of the guard.
+API key or the network. The others start the real agent (`claude -p`, `grok -p`, `codex exec`)
+with temporary hooks and a stand-in scoring API, so each needs that agent logged in and costs a
+few cents of usage, but no API key and no installation of the guard. The Codex one puts a
+`~/.codex/hooks.json` in place while it runs and refuses to start if you have one.
 
-Run `tests/e2e_claude.py` after a Claude Code update. A replacement whose shape no longer matches
-a built-in tool's output is ignored by Claude Code without an error, and the model then reads the
-original.
+Run the one for your agent after that agent is updated. A replacement whose shape no longer
+matches a built-in tool's output is ignored by Claude Code without an error, and the model then
+reads the original.
 
 ## License and credits
 

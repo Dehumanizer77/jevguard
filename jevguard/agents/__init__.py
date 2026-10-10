@@ -9,12 +9,13 @@ What an agent lets a hook do decides how much of the guard works there:
     grok      every tool                   yes                      replaced
     copilot   every tool                   yes                      replaced
     hermes    every tool (in process)      no: refuse with a note   replaced
-    cursor    MCP tools; file reads are    shell and MCP            run through `jevguard run`
+    codex     every tool, by way of the    no: refuse with a note   replaced
+              hook's feedback
+    cursor    MCP tools; file reads are    shell and MCP            run through `jevguard-run`
               refused before they happen
-    codex     MCP tools                    yes                      run through `jevguard run`
 
-Where an agent cannot replace what a shell command printed, the adapter rewrites the command
-so that it runs through `jevguard run`, which scans the output before the agent gets it.
+Where an agent cannot replace what a shell command printed (Cursor), the adapter rewrites the
+command so that it runs through `jevguard-run`, which scans the output before the agent gets it.
 """
 
 from __future__ import annotations

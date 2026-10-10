@@ -2,9 +2,9 @@
 """End-to-end check against the real Codex CLI: does what a shell command printed reach the
 model as the notice only when it scores as an injection?
 
-Codex lets a hook replace only an MCP tool's result, so the adapter rewrites the command to run
-through `jevguard-run`. Not part of the pytest run: it starts `codex exec` (a few cents) with a
-stand-in scoring API that calls everything an injection.
+Codex has no field for a replacement; the adapter answers `decision: "block"` and Codex puts the
+hook's words, the notice, in place of the result. Not part of the pytest run: it starts
+`codex exec` (a few cents) with a stand-in scoring API that calls everything an injection.
 
 Codex reads hooks from ~/.codex/hooks.json and runs only hooks the owner has reviewed. This
 check puts a hooks.json there for its own duration (and refuses to start if one exists), and
@@ -54,32 +54,27 @@ def main() -> int:
     try:
         hooks_file.write_text(json.dumps({"hooks": {"PreToolUse": entry, "PostToolUse": entry}}))
         r = subprocess.run(["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-hook-trust", "--sandbox", sandbox,
-                            "-c", f'shell_environment_policy.set={{JEVGUARD_HOME="{home}"}}', prompt],
+                            "-o", str(tmp / "last-message.txt"), prompt],
                            cwd=work, capture_output=True, text=True, timeout=400)
     finally:
         hooks_file.unlink(missing_ok=True)
-    answer = r.stdout
     log = home / "state" / "scans.jsonl"
     records = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
     actions = {a: sum(1 for x in records if x.get("action") == a) for a in sorted({str(x.get("action")) for x in records})}
-    # Two good outcomes. Where the wrapper can work (no sandbox around the command), the model gets
-    # the notice in place of the output. Inside Codex's sandbox it cannot, and the hook after the
-    # call stops the turn: the model never answers.
-    final = answer.rsplit("GOT:", 1)[-1] if "GOT:" in answer else ""
-    stopped = "The turn was stopped" in (r.stdout + r.stderr) and not final
-    withheld = "firewall" in final.lower() and CANARY not in final
-    ok = stopped or withheld
-    print("sandbox:", sandbox)
-    print("ok   the model got the notice in place of the output" if withheld else
-          "ok   the turn was stopped before the model could act on the output" if stopped else
-          "FAIL the model answered with the output")
+    # The model's own last message, from Codex itself: the printed transcript repeats the prompt.
+    last = tmp / "last-message.txt"
+    final = last.read_text() if last.exists() else ""
+    leaked = CANARY in final
+    withheld = any(x.get("action") == "blocked" for x in records)
+    print("sandbox:", sandbox, "; codex exit:", r.returncode)
+    print("FAIL the model's answer holds the canary" if leaked else "ok   the model's answer does not hold the canary")
+    print("ok   the guard withheld the result" if withheld else "FAIL the guard withheld nothing")
     runs = (tmp / "hook-runs.log").read_text().count("ran") if (tmp / "hook-runs.log").exists() else 0
     errors = (tmp / "hook-stderr.log").read_text().strip() if (tmp / "hook-stderr.log").exists() else ""
     print(f"hook runs: {runs}; guard log: {actions}" + (f"; hook stderr: {errors[-300:]}" if errors else ""))
-    print("ran through jevguard-run:", "jevguard-run" in answer)
     print("answer:", " ".join(final.split())[:400])
     print("temporary files:", tmp)
-    return 0 if ok else 1
+    return 3 if leaked else 0 if withheld else 4  # 3: the model saw the canary; 4: the guard did not act at all
 
 
 if __name__ == "__main__":

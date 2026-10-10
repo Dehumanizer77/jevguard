@@ -54,7 +54,7 @@ def test_local_output_is_not_sent_anywhere(guard, downloads, tmp_path, jev):
 
 
 def test_binary_output_and_no_output(guard, downloads, tmp_path):
-    r = subprocess.run(["bash", "-c", run.wrap("printf '\\377\\000\\376'; true", "codex", "s1")], cwd=tmp_path,
+    r = subprocess.run(["bash", "-c", run.wrap("printf '\\377\\000\\376'; true", "cursor", "s1")], cwd=tmp_path,
                        capture_output=True, timeout=60, env={**os.environ, "JEVGUARD_HOME": str(guard.home)})
     assert r.stdout == b"\xff\x00\xfe" and r.returncode == 0
     assert wrapped(guard, "true", tmp_path).stdout == ""
@@ -84,18 +84,18 @@ def test_the_guard_failing_does_not_lose_the_output(guard, downloads, tmp_path):
     "",
 ])
 def test_wrapping_keeps_the_command_as_it_was(command):
-    line = run.wrap(command, "codex", "abc")
+    line = run.wrap(command, "cursor", "abc")
     assert run.unwrap(line) == command
-    assert run.unwrap(run.wrap(command, "codex", "")) == command
+    assert run.unwrap(run.wrap(command, "cursor", "")) == command
 
 
 @pytest.mark.parametrize("line", [
     "echo hello",
-    f"{RUN} --agent codex --session s -- 'a' 'b'",
-    f"{RUN} --agent codex --session s -- 'a'; rm -rf x",
-    f"/tmp/jevguard-run --agent codex --session s -- 'a'",
-    f"{RUN} --session s --agent codex -- 'a'",
-    f"{RUN} --agent codex --session s -- 'unbalanced",
+    f"{RUN} --agent cursor --session s -- 'a' 'b'",
+    f"{RUN} --agent cursor --session s -- 'a'; rm -rf x",
+    f"/tmp/jevguard-run --agent cursor --session s -- 'a'",
+    f"{RUN} --session s --agent cursor -- 'a'",
+    f"{RUN} --agent cursor --session s -- 'unbalanced",
 ])
 def test_only_the_exact_form_is_taken_for_a_wrapped_command(line):
     assert run.unwrap(line) is None

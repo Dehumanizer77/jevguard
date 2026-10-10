@@ -142,6 +142,8 @@ def test_copilot_result_is_replaced_and_a_call_is_asked_about(guard, ext):
 
 # ---- Codex CLI ------------------------------------------------------------------------------------
 def codex(event, tool, tool_input, response=None):
+    """Input as codex 0.160.0 really sends it (recorded 2026-10-10): the shell is "Bash" and its
+    result the plain text it printed."""
     d = {"hook_event_name": event, "session_id": "x1", "cwd": "/work", "tool_name": tool, "tool_input": tool_input,
          "tool_use_id": "t1", "turn_id": "u1", "model": "gpt", "permission_mode": "default", "transcript_path": "/t"}
     if response is not None:
@@ -149,53 +151,32 @@ def codex(event, tool, tool_input, response=None):
     return d
 
 
-def test_codex_shell_commands_that_bring_content_in_are_run_through_the_wrapper(guard, ext):
+def test_codex_result_is_replaced_by_way_of_the_hooks_feedback(guard, ext):
+    """Codex has no field for a replacement, but puts a blocking hook's feedback in place of the
+    tool result. The notice goes out as that feedback."""
     command = f"cat {ext}/note.txt"
-    out = guard.raw(codex("PreToolUse", "Bash", {"command": command}), "--agent", "codex")["hookSpecificOutput"]
-    # Codex takes a rewrite only together with "allow"
-    assert out["permissionDecision"] == "allow" and run.unwrap(out["updatedInput"]["command"]) == command
-    argv = guard.raw(codex("PreToolUse", "shell", {"command": ["bash", "-lc", command]}), "--agent", "codex")
-    wrapped = argv["hookSpecificOutput"]["updatedInput"]["command"]
-    assert wrapped[:2] == ["bash", "-lc"] and run.unwrap(wrapped[2]) == command      # the argv form is kept
-    # a local command is left alone, and so is everything in log mode, where nothing is replaced
-    assert guard.raw(codex("PreToolUse", "Bash", {"command": "git status"}), "--agent", "codex") is None
-    guard.configure(mode="log", external_paths=[str(ext)])
-    assert guard.raw(codex("PreToolUse", "Bash", {"command": command}), "--agent", "codex") is None
-
-
-def test_codex_output_the_wrapper_judged_is_not_judged_twice(guard, ext, tmp_path):
-    import os
-    import subprocess
-    (ext / "ok.txt").write_text(BENIGN + "\n")
-    command = f"cat {ext}/ok.txt"
-    wrapped = run.wrap(command, "codex", "x1")
-    env = {**os.environ, "JEVGUARD_HOME": str(guard.home)}
-    assert subprocess.run(["bash", "-c", wrapped], capture_output=True, text=True, env=env, cwd=tmp_path).stdout == BENIGN + "\n"
-    n = len(guard.log())
-    assert guard.raw(codex("PostToolUse", "Bash", {"command": wrapped}, BENIGN + "\n"), "--agent", "codex") is None
-    assert len(guard.log()) == n                      # the wrapper left its mark; the hook stood back
-    # the mark is for one run: the next result of the same command is the hook's to judge again
-    assert guard.raw(codex("PostToolUse", "Bash", {"command": wrapped}, ATTACK), "--agent", "codex")["continue"] is False
-
-
-def test_codex_where_the_wrapper_could_not_work_the_hook_judges_and_stops_the_turn(guard, ext):
-    """Inside Codex's sandbox the wrapper can reach neither the scoring service nor a file of
-    its own: it passes the output on, leaves no mark, and the hook after the call takes over."""
-    wrapped = run.wrap(f"cat {ext}/note.txt", "codex", "x1")
-    out = guard.raw(codex("PostToolUse", "Bash", {"command": wrapped}, ATTACK), "--agent", "codex")
-    assert out["continue"] is False and "prompt injection" in out["stopReason"] and guard.log()[-1]["action"] == "blocked"
-    assert guard.raw(codex("PostToolUse", "Bash", {"command": wrapped}, BENIGN), "--agent", "codex") is None
-    # the same for a result Codex gives a hook no way to replace, an MCP tool's included
+    out = guard.raw(codex("PostToolUse", "Bash", {"command": command}, ATTACK + "\n"), "--agent", "codex")
+    assert out["decision"] == "block" and notice_in(out["reason"]) and set(out) == {"decision", "reason"}
+    rec = guard.log()[-1]
+    assert rec["action"] == "blocked" and rec["client"] == "codex" and rec["native_tool"] == "Bash"
+    assert guard.raw(codex("PostToolUse", "Bash", {"command": command}, BENIGN + "\n"), "--agent", "codex") is None
     mail = guard.raw(codex("PostToolUse", "mcp__mail__read", {}, [{"type": "text", "text": ATTACK + " mail"}]), "--agent", "codex")
-    assert mail["continue"] is False and "updatedMCPToolOutput" not in json.dumps(mail)
+    assert mail["decision"] == "block" and notice_in(mail["reason"])
+    assert guard.raw(codex("PostToolUse", "Bash", {"command": "git status"}, ATTACK), "--agent", "codex") is None   # local
+
+
+def test_codex_commands_are_left_as_they_are(guard, ext):
+    """No wrapper here: the hook after the call does the work, outside Codex's sandbox."""
+    for command in (f"cat {ext}/note.txt", "curl -s https://news.example.com/a", "git status"):
+        assert guard.raw(codex("PreToolUse", "Bash", {"command": command}), "--agent", "codex") is None
 
 
 def test_codex_cannot_ask_so_the_call_is_refused_with_the_reason(guard, ext):
-    for command in ("jevguard gate off", run.wrap("jevguard gate off", "codex", "x1")):   # the gate reads what is inside
-        out = guard.raw(codex("PreToolUse", "Bash", {"command": command}), "--agent", "codex")["hookSpecificOutput"]
-        assert out["permissionDecision"] == "deny" and "jevguard gate" in out["permissionDecisionReason"]
-        assert "updatedInput" not in out
-    assert guard.raw(codex("PreToolUse", "Bash", {"command": run.wrap("git status", "codex", "x1")}), "--agent", "codex") is None
+    out = guard.raw(codex("PreToolUse", "Bash", {"command": "jevguard gate off"}), "--agent", "codex")["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "jevguard gate" in out["permissionDecisionReason"]
+    assert "updatedInput" not in out
+    patch = codex("PreToolUse", "apply_patch", {"command": "*** Begin Patch", "file_path": str(guard.home / "config" / "config.json")})
+    assert guard.raw(patch, "--agent", "codex")["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 # ---- Cursor ---------------------------------------------------------------------------------------
