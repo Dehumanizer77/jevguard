@@ -292,12 +292,25 @@ itself: `gh api -X PATCH .../issues/7 -f state=closed` returns the whole issue a
 not an exemption: anyone can open an issue or write a comment in a public repository, and a
 clear injection scores near 1 either way. A command counts only when its repository is plain
 to see (`--repo`, an `api repos/owner/name/...` path, or the checkout it runs in) and nothing
-else in it can add to the output: beside `gh` there may be `cd`, `echo` and the same filters
-as above, and no other program (`gh issue comment ...; curl -K x` is ordinary outside
-content). A `gh api` call with an option the guard does not know, `--hostname`, two methods or
-`..` in its path gets no leniency at all, and neither does any `gh` call while `GH_HOST` or
-`GH_REPO` is set or gh's own settings send its requests through a socket
+else in it can add to the output: beside `gh` there may be `cd`, `echo`, the same filters as
+above and plain `git`, and no other program (`gh issue comment ...; curl -K x` is ordinary
+outside content). A `gh api` call with an option the guard does not know, `--hostname`, two
+methods or `..` in its path gets no leniency at all, and neither does any `gh` call while
+`GH_HOST` or `GH_REPO` is set or gh's own settings send its requests through a socket
 (`http_unix_socket`).
+
+Plain `git` beside `gh` means two things. `git status`, `add`, `commit`, `checkout`, `switch`,
+`branch`, `stash`, `restore`, `tag` and `rev-parse` fetch nothing and change nothing about how
+the result is handled. `git push` brings back what the server says, so with it the result is
+never "only logged", and it counts as about your own repository only when the push plainly
+goes to one: `git push`, `git push origin <branch>` with everyday options (`-u`, `--tags`,
+`--force-with-lease`, ...), in a checkout that talks to one repository only. That is a
+checkout whose only remote is `origin` with a single github.com address, with no `pushurl`,
+`insteadOf`, `pushDefault`, `pushRemote` or `include` in its settings or in your `~/.gitconfig`.
+The same holds for a `gh` command that names no repository and takes it from the checkout:
+with a second remote `gh` may pick that one. Anything else (`git -c ...`, `git -C dir`,
+another remote, an address in place of a remote, `git log`, `git fetch`, `git pull`) and the
+command is ordinary outside content; name the repository with `--repo` and run git separately.
 
 `show` and `release` are for you, reading what was blocked. They refuse to run without a
 terminal or when started from inside Claude Code, and the hook asks you before any call that

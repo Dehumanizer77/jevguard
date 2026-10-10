@@ -30,26 +30,92 @@ def slug(value: str) -> str | None:
     return value if re.fullmatch(_NAME, value) else None
 
 
-def origin_repo(directory: str) -> str | None:
-    """The github.com repository that the git checkout around a directory calls origin."""
+# ---- the checkout a command runs in ----------------------------------------------------------------
+# Git's settings files are searched as text, not parsed: a key counts wherever it stands (at the
+# start of a line or after a section header on the same line, in a comment too), and anything
+# that is not exactly the plain form ends in "cannot tell". Wider than the truth, never narrower.
+_KEY = r"(?:^|[\]\s])"
+_REMOTE_HEADER = re.compile(r"\[\s*remote\b[^\]\n]*\]?", re.I)
+_ORIGIN_HEADER = re.compile(r'\[\s*(?i:remote)\s+"origin"\s*\]')
+_URL_KEY = re.compile(_KEY + r"url\s*=[ \t]*(\S*)", re.I | re.M)
+_BRANCH_REMOTE = re.compile(_KEY + r"remote\s*=[ \t]*(\S*)", re.I | re.M)
+_GH_RESOLVED = re.compile(_KEY + r"gh-resolved\s*=[ \t]*(\S*)", re.I | re.M)
+# Settings that send git somewhere other than the address written for origin, or that pull in
+# settings this reader does not see.
+_ELSEWHERE = re.compile(_KEY + r"(?:pushurl|pushdefault|pushremote|(?:push)?insteadof|worktreeconfig)\s*=|"
+                        r"^\s*\[\s*include", re.I | re.M)
+_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND")
+
+
+def _read(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(200_000)
+    except OSError:
+        return None
+
+
+def _checkout_settings(directory: str) -> str | None:
+    """The text of .git/config of the checkout around a directory."""
     d = directory
     for _ in range(40):
         config = os.path.join(d, ".git", "config")
         if os.path.isfile(config):
-            break
+            return _read(config)
         parent = os.path.dirname(d)
         if parent == d:
             return None
         d = parent
-    else:
+    return None
+
+
+def _user_git_settings() -> str:
+    home = os.path.expanduser("~")
+    folder = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return "\n".join(_read(p) or "" for p in (os.path.join(home, ".gitconfig"), os.path.join(folder, "git", "config")))
+
+
+def origin_repo(directory: str) -> str | None:
+    """The one github.com repository the git checkout around a directory talks to, or None when
+    that is not plain. It is plain when origin is the only remote and has one address, every
+    branch follows origin, and neither the checkout's settings nor the user's own hold anything
+    that sends git elsewhere (pushurl, insteadOf, pushDefault, an include). With a second remote
+    `gh` may pick that one, and a bare `git push` may go to it."""
+    text = _checkout_settings(directory)
+    if text is None or any(name in os.environ for name in _GIT_ENV):
         return None
-    try:
-        with open(config, encoding="utf-8", errors="replace") as f:
-            text = f.read(200_000)
-    except OSError:
+    if _ELSEWHERE.search(text) or _ELSEWHERE.search(_user_git_settings()):
         return None
-    m = re.search(r'^\[remote "origin"\][^\[]*?^\s*url\s*=\s*(\S+)', text, re.M | re.S)
-    return slug(m.group(1)) if m else None
+    remotes, urls = _REMOTE_HEADER.findall(text), _URL_KEY.findall(text)
+    if len(remotes) != 1 or not _ORIGIN_HEADER.fullmatch(remotes[0]) or len(urls) != 1:
+        return None
+    if any(remote not in ("origin", ".") for remote in _BRANCH_REMOTE.findall(text)):
+        return None
+    if any(chosen != "base" for chosen in _GH_RESOLVED.findall(text)):
+        return None  # `gh repo set-default` pointed gh at another repository of the same network
+    return slug(urls[0])
+
+
+# ---- git push beside gh -----------------------------------------------------------------------------
+_PUSH_FLAGS = {"-u", "--set-upstream", "-q", "--quiet", "-v", "--verbose", "-f", "--force", "--force-with-lease",
+               "--tags", "--follow-tags", "--no-verify", "-n", "--dry-run", "-d", "--delete"}
+_REFSPEC = re.compile(r"\+?[A-Za-z0-9._/-]*(?::[A-Za-z0-9._/-]*)?")
+
+
+def push_repos(args: list[str], dirs: list[str]) -> list[str] | None:
+    """The github.com repositories a `git push` with these arguments sends to, one for each
+    directory the command may be running in; None when that cannot be told. It can be told when
+    the push names origin or no remote at all, uses everyday options, and the checkout talks to
+    one repository only (see origin_repo). A remote given as an address, another remote's name,
+    --receive-pack, --recurse-submodules: not told."""
+    words = [a for a in args if a not in _PUSH_FLAGS]
+    if any(a.startswith("-") for a in words):
+        return None
+    if words and (words[0] != "origin" or not all(_REFSPEC.fullmatch(w) for w in words[1:])):
+        return None
+    repos = [origin_repo(d) for d in dirs] or [None]
+    return None if any(r is None for r in repos) else repos
 
 
 # ---- gh api, taken apart ---------------------------------------------------------------------------

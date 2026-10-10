@@ -300,28 +300,49 @@ def _own_repo_mode(cmd: str, cwd: str, cfg) -> str | None:
     """"own" when everything the command prints is `gh` output about the owner's own
     repositories; "echo" when all of it is the reply to something the command itself just created
     there (gh pr create, a comment posted through gh api). None when anything else could add to
-    the output or anything about the command is not plain: a program beside `gh` that is not a
-    filter on its input (curl with a config file, a script, cat of a file), a repository that
-    cannot be told, a value computed at run time, another host."""
+    the output or anything about the command is not plain: a program beside `gh` that is neither
+    a filter on its input nor plain git (curl with a config file, a script, cat of a file), a
+    repository that cannot be told, a value computed at run time, another host. A `git push`
+    to an own repository beside `gh` keeps the result "own"."""
     from . import github
     commands = _plain_commands(cmd)
     if commands is None or os.environ.get("GH_HOST") or os.environ.get("GH_REPO") or github.rerouted():
         return None
-    if not all(words[0] == "gh" or _adds_nothing(words[0], words[1:]) for words in commands):
-        return None
+    remote = []  # the commands that bring something back from a server: gh, and git push
+    for words in commands:
+        if words[0] == "gh" or (words[0] == "git" and words[1:2] == ["push"]):
+            remote.append(words)
+        elif not _adds_nothing(words[0], words[1:]) and not _git_reports(words):
+            return None
     try:
         c = shell.read(cmd, cwd)
     except Exception:
         return None
-    calls = [words for words in commands if words[0] == "gh"]
-    places = [dirs for argv, dirs in zip(c.programs, c.program_dirs) if argv[0] == "gh"]  # after any `cd`
-    if not calls or len(places) != len(calls):
+    # the directories each of them may be running in, after any `cd`
+    places = [dirs for argv, dirs in zip(c.programs, c.program_dirs)
+              if argv[0] == "gh" or argv[:2] == ["git", "push"]]
+    if not any(words[0] == "gh" for words in remote) or len(places) != len(remote):
         return None
-    for argv, dirs in zip(calls, places):
-        repos = github.gh_repos(argv, dirs)
+    echo = True
+    for words, dirs in zip(remote, places):
+        if words[0] == "gh":
+            repos = github.gh_repos(words, dirs)
+            echo = echo and github.gh_echo(words)
+        else:
+            # What the server says to a push is not something the command sent: no echo. It counts
+            # as about an own repository only when the push plainly goes to one.
+            repos, echo = github.push_repos(words[2:], dirs), False
         if not repos or not all(github.is_own(r, cfg.own_repos) for r in repos):
             return None
-    return "echo" if all(github.gh_echo(argv) for argv in calls) else "own"
+    return "echo" if echo else "own"
+
+
+def _git_reports(words: list[str]) -> bool:
+    """`git status`, `git add`, `git commit` and the like beside `gh`: the same subcommands whose
+    output on their own counts as a report on the agent's own work, and that fetch nothing. Only
+    with the subcommand as the first argument: `git -c alias.x='!program' x` runs that program,
+    and `git -C elsewhere` works in another checkout."""
+    return words[0] == "git" and len(words) > 1 and words[1] in _TRUSTED_GIT
 
 
 # ---- a fetch that is plainly from a trusted address -------------------------------------------------
