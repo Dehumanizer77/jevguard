@@ -146,11 +146,11 @@ def _stream_origin(call: Call, cfg) -> str:
     ws = call.tool_input.get("ws")
     if ws is not None:
         # A Monitor on a WebSocket: every frame the server sends becomes a notification. There is
-        # no command to read; the address says where it comes from, as for a fetch.
+        # no command to read; the address says where it comes from, as for a fetch, and whether
+        # it is this machine or network is decided where that is decided for a fetch.
         try:
-            url = str(ws.get("url") if isinstance(ws, dict) else ws)
-            host = provenance._URL.match(url)
-            return "" if host and provenance.private_host(host.group(1)) and not cfg.scan_private_hosts else "external"
+            url = ws.get("url") if isinstance(ws, dict) else ws
+            return "" if provenance.private_address(url) and not cfg.scan_private_hosts else "external"
         except Exception:
             return "external"
     try:

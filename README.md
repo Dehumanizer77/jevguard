@@ -548,7 +548,7 @@ Things to know:
 | `gate` | `log` | `off`, `log`, `ask-flagged`, `ask-external` |
 | `scan_local` | `false` | also scan local files and local command output (they block at `local_block`, 0.6); output of `gh` about your own repositories is then withheld from the lower of the two levels |
 | `trusted_commands` | `[]` | program names whose output is scanned and logged, never withheld, e.g. `make`: your word for that program. Only when the whole command is that one program with its arguments written out |
-| `scan_private_hosts` | `false` | treat fetches from localhost and private addresses as outside content |
+| `scan_private_hosts` | `false` | treat fetches from localhost and private addresses as outside content. An address counts as private only when it plainly names such a host (`localhost`, `192.168.1.5`, `[::1]`, `nas.local`, a name without a dot; a port and a user part are fine). Anything a program might read another way is outside content: `localhost;other.example`, `134744072`, a backslash, a `#` straight after the host |
 | `external_paths` | `["~/Downloads"]` | directories whose files are outside content |
 | `track_clones` | `false` | treat directories created by `git clone` as outside content |
 | `skip_tools` | claude.ai Gmail, Drive, Calendar, Docs connectors | tool-name patterns never scanned |

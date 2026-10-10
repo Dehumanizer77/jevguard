@@ -449,6 +449,73 @@ def test_40_a_good_key_is_dropped_when_the_next_load_fails(guard, monkeypatch):
     assert "firewall" not in firstparty.strip(sealed) and "firewall" in firstparty.strip(forged(b""))
 
 
+# ---- #43: an address taken for this machine's by the first part of its host -------------------------
+# The check before a WebSocket Monitor read the host with an expression made for the text of a
+# shell command, which stops at `;` and `&`. `ws://localhost;events.example.com/` was "localhost".
+# The same expression decided "private, so not scanned" for WebFetch and for the addresses in a
+# shell command, and what it was handed to took a number without a dot for a name on the local
+# network: 134744072 is 8.8.8.8 to curl and to a browser. One place decides now, and only an
+# address that names a private host beyond doubt is taken for one.
+NOT_PRIVATE = [
+    "localhost;events.example.com", "localhost&events.example.com", "127.0.0.1;events.example.com", "localhost(x).example.com",
+    "localhost,events.example.com", "localhost%2eexample.com", "localhost\\@events.example.com", "events.example.com\\@localhost",
+    "localhost@events.example.com", "user:pw@events.example.com", "localhost:80@events.example.com", "localhost.events.example.com",
+    "192.168.1.5.events.example.com", "134744072", "0x08080808", "0x8.0x8.0x8.0x8", "010.8.8.8", "8.8.2056", "8.524296", "1.1",
+    "[::ffff:8.8.8.8]", "[2001:4860:4860::8888]", "[::1", "::1]", "localhost:port", "localhost:999999", "", "local host",
+    "localhost#@events.example.com", "localhost?@events.example.com", "-localhost", "localhost-", "localhost..lan", "ｌocalhost",
+]
+PRIVATE = ["localhost", "LOCALHOST", "localhost.", "localhost:8080", "127.0.0.1", "127.0.0.1:9", "[::1]", "[::1]:8080", "192.168.1.5",
+           "10.0.0.5:8123", "172.16.3.4", "169.254.1.1", "[fe80::1]", "[::ffff:192.168.1.5]", "intranet", "nas.local", "printer.lan",
+           "git.home.arpa:3000", "user:pw@localhost", "user@192.168.1.5:8080", "a;b@localhost"]
+
+
+@pytest.mark.parametrize("host", NOT_PRIVATE)
+def test_43_an_address_is_private_only_when_it_names_a_private_host_beyond_doubt(guard, host):
+    from jevguard import provenance
+    for scheme in ("ws", "wss", "http", "https"):
+        assert not provenance.private_address(f"{scheme}://{host}/stream"), f"{scheme}://{host}"
+    guard.configure(mode="block")
+    monitor = guard.hook("PreToolUse", "Monitor", {"ws": {"url": f"ws://{host}/stream"}, "description": "events"})
+    assert monitor and "cannot be scanned" in monitor["hookSpecificOutput"]["permissionDecisionReason"], host
+    fetched = guard.hook("PostToolUse", "WebFetch", {"url": f"http://{host}/page"}, web(ATTACK))
+    assert fetched and ATTACK not in json.dumps(fetched), host
+    if "'" not in host and host:
+        ran = guard.hook("PostToolUse", "Bash", {"command": f"curl -s 'http://{host}/page'"}, {"stdout": ATTACK, "stderr": ""})
+        assert ran and ATTACK not in json.dumps(ran), host
+
+
+@pytest.mark.parametrize("host", PRIVATE)
+def test_43_what_is_this_machine_or_this_network_stays_out_of_it(guard, host, jev):
+    from jevguard import provenance
+    assert provenance.private_address(f"ws://{host}/stream") and provenance.private_address(f"http://{host}")
+    guard.configure(mode="block")
+    assert guard.hook("PreToolUse", "Monitor", {"ws": {"url": f"ws://{host}/stream"}, "description": "events"}) is None
+    assert guard.hook("PostToolUse", "WebFetch", {"url": f"http://{host}/page"}, web(ATTACK)) is None
+    assert guard.hook("PostToolUse", "Bash", {"command": f"curl -s 'http://{host}/page'"}, {"stdout": ATTACK, "stderr": ""}) is None
+    assert not jev.requests   # nothing from there is sent for scoring
+    guard.configure(mode="block", scan_private_hosts=True)
+    assert guard.hook("PreToolUse", "Monitor", {"ws": {"url": f"ws://{host}/stream"}, "description": "events"}) is not None
+    assert guard.hook("PostToolUse", "WebFetch", {"url": f"http://{host}/page"}, web(ATTACK)) is not None
+
+
+def test_43_in_a_shell_command_a_doubtful_address_is_an_outside_one(guard):
+    """Unquoted, `;` ends the command and the address really is localhost. Quoted, it is part of
+    the address. The text does not say which was meant; one of the two is outside."""
+    guard.configure(mode="block")
+    for command in ("curl http://localhost;events.example.com/x", "curl 'http://localhost;events.example.com/x'",
+                    'wget "http://127.0.0.1&events.example.com/x"', "curl http://localhost:8080/x http://134744072/y",
+                    'curl http://local"host.events.example.com"/x', "curl http://localhost\\@events.example.com/x",
+                    "curl 'http://local host@events.example.com/x'", "curl --url='http://localhost#@events.example.com/'",
+                    "python3 -c \"import urllib.request as u; print(u.urlopen('http://localhost;events.example.com/x').read())\""):
+        out = guard.hook("PostToolUse", "Bash", {"command": command}, {"stdout": ATTACK, "stderr": ""})
+        assert out and ATTACK not in json.dumps(out), command
+    for command in ("curl http://localhost:8080/x; echo done", "curl -s http://192.168.1.20:8123/api/states | jq .",
+                    "curl http://localhost:8080/a;b", 'curl "http://localhost:3000"', "curl 'http://nas.local/status';",
+                    "bash -c 'curl -s http://localhost:8080/health && echo ok'", "curl --url=http://127.0.0.1:9/x",
+                    "python3 -c \"import urllib.request as u; print(u.urlopen('http://localhost:8080/x').read())\""):
+        assert guard.hook("PostToolUse", "Bash", {"command": command}, {"stdout": ATTACK, "stderr": ""}) is None, command
+
+
 # ---- #36: what Cursor is handed in place of an MCP result -------------------------------------------
 def test_36_cursor_mcp_replacement_is_an_mcp_result_object(guard, ext):
     for output in (json.dumps([{"type": "text", "text": ATTACK}]),
