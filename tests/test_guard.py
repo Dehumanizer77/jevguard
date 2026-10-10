@@ -76,7 +76,8 @@ def test_released_content_passes(guard):
     guard.hook("PostToolUse", "WebFetch", FETCH, webfetch(ATTACK))
     cfg = SimpleNamespace(quarantine_dir=guard.home / "state" / "quarantine",
                           released_file=guard.home / "state" / "released.txt",
-                          released_dir=guard.home / "released")
+                          released_dir=guard.home / "released",
+                          released_manifest=guard.home / "state" / "released-files.json")
     from jevguard import store
     store.release(cfg, guard.log()[-1]["quarantine_id"])
     assert guard.hook("PostToolUse", "WebFetch", FETCH, webfetch(ATTACK)) is None

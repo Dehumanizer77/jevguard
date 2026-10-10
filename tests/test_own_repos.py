@@ -96,10 +96,11 @@ def test_a_clear_injection_in_an_own_repository_is_still_withheld(guard):
     assert run(guard, "gh pr view 14 --repo acme/widget", BORDERLINE + " again") is not None
 
 
-def test_the_reply_to_ones_own_change_is_only_logged(guard):
+def test_the_reply_to_what_the_command_created_is_only_logged(guard):
     guard.configure(mode="block", own_repos=OWN)
     for command in ("gh pr create --repo acme/widget --title x --body y",
-                    "gh api -X PATCH repos/acme/widget/pulls/14 -f title=x",
+                    "gh api repos/acme/widget/issues/7/comments -f body=done",
+                    "gh api -X POST repos/acme/widget/pulls -f title=x -f head=fix -f base=main",
                     "gh issue comment 7 --repo acme/widget --body done"):
         assert run(guard, command, "https://github.com/acme/widget/pull/14 " + ATTACK) is None, command
         assert guard.log()[-1]["mode"] == "echo" and guard.log()[-1]["action"] == "would-block"

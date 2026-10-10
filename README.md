@@ -239,10 +239,13 @@ When a result is withheld, Claude says the source was blocked and names a quaran
 `jevguard release <id>`. That does two things:
 
 - The original is written to `~/.local/state/jevguard-released/<id>.txt`. Tell Claude it is
-  released; the notice it received names that file, and reading it is not scanned again. This
-  is what makes a release work for a source that never comes back the same: a web page is
-  summarised afresh on every fetch, an API answer carries a timestamp. Claude reads exactly the
-  text you read.
+  released; the notice it received names that file, and reading it with the Read tool is not
+  scanned again. This is what makes a release work for a source that never comes back the same:
+  a web page is summarised afresh on every fetch, an API answer carries a timestamp. Claude
+  reads exactly the text you read: the guard keeps a record of every file `release` wrote and
+  of its hash, and only a file that still matches that record is exempt. Anything else in that
+  directory (a file put there some other way, a released original that was edited since) is
+  scanned as outside content, and the hook asks you before a call that would write there.
 - The content goes on the release list, so if a tool returns the very same content again it
   passes. An edited version is scanned as usual.
 
@@ -255,20 +258,38 @@ jevguard untrust https://developers.openai.com/codex/
 ```
 
 Content from a trusted address is scanned and logged as before (`would-block` in the log when
-it scores as an injection) and is not withheld. It applies to `WebFetch` and to commands whose
-every public address is on the list. Keep the prefixes narrow: whatever such an address returns
-later, or redirects to, reaches Claude unread by anyone. For MCP tools the equivalent is the
-`warn_tools` setting.
+it scores as an injection) and is not withheld. Keep the prefixes narrow: whatever such an
+address returns later, or redirects to, reaches Claude unread by anyone. For MCP tools the
+equivalent is the `warn_tools` setting.
+
+It applies to `WebFetch` and to a plain download in the shell, and to nothing that only looks
+like one:
+
+- The address has to be plain: no percent escapes in the path (`%2e%2e` is `..` to the server),
+  no `..`, `;` or doubled slash, no braces or brackets.
+- In the shell the whole command has to be `curl` or `wget` fetching trusted addresses with
+  everyday options (`-s -S -L -f -o -H 'Accept: ...'` and the like), optionally piped through
+  `head`, `tail`, `grep`, `jq`, `wc`, `sort` and similar. A proxy, `--resolve`, `--connect-to`,
+  a `Host` header, `-k`, a config file (`-K`, `wget -i`), a variable, `$(...)`, a second
+  program in the same command: any of these and the result is handled as ordinary outside
+  content. So is every `curl` download while a `~/.curlrc` exists, and every `wget` download
+  while a `~/.wgetrc` does: such a file can name a proxy, and the guard cannot tell who wrote
+  it.
 
 `gh` is a special case. Everything it prints counts as outside content, and short status lines
 and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false` scored 0.38. List
 your own repositories in `own_repos` (`"acme/*"`, `"solo/tool"`) and what `gh` returns about
-them is withheld only from 0.6 up; between 0.38 and 0.6 it is logged as flagged. The reply to a
-change the command itself made there (`gh pr create`, `gh api -X PATCH`) is only logged. This is
-deliberately not an exemption: anyone can open an issue or write a comment in a public
-repository, and a clear injection scores near 1 either way. A command counts only when its
-repository is plain to see (`--repo`, an `api repos/owner/name/...` path, or the checkout it
-runs in) and it fetches nothing else.
+them is withheld only from 0.6 up; between 0.38 and 0.6 it is logged as flagged. The reply to
+something the command itself just created there (`gh pr create`, `gh issue comment`, a comment
+or an issue posted through `gh api`) is only logged: it holds what the command sent. A change
+to something that already exists is not treated that way, because the reply carries the thing
+itself: `gh api -X PATCH .../issues/7 -f state=closed` returns the whole issue and
+`gh issue close 7` prints its title, and either may be a stranger's text. This is deliberately
+not an exemption: anyone can open an issue or write a comment in a public repository, and a
+clear injection scores near 1 either way. A command counts only when its repository is plain
+to see (`--repo`, an `api repos/owner/name/...` path, or the checkout it runs in) and it
+fetches nothing else; a `gh api` call with an option the guard does not know, `--hostname`, two
+methods or `..` in its path gets no leniency at all.
 
 `show` and `release` are for you, reading what was blocked. They refuse to run without a
 terminal or when started from inside Claude Code, and the hook asks you before any call that

@@ -7,9 +7,9 @@
 "trusted":  outside content from an address the owner put on the trusted list: scanned and
             logged like any other, never withheld.
 "own":      what `gh` returns about the owner's own repositories: withheld only from a higher
-            score up. "echo": the reply to a change the command itself made there; never withheld.
-"local":    files on this machine and output of local commands.
-"warn":     output of commands that only report on the agent's own work; never blocked.
+            score up. "echo": the reply to something the command itself just created there;
+            never withheld.
+"warn":   output of commands that only report on the agent's own work; never blocked.
 None:       not scanned at all.
 """
 
@@ -20,7 +20,7 @@ import os
 import re
 from urllib.parse import urlsplit
 
-from . import shell
+from . import shell, store
 from .shell import canonical, under
 
 # Commands that only ever talk to a remote service.
@@ -58,8 +58,8 @@ def _url_parts(url: str):
     that does not parse cleanly: a backslash, a password part, an odd port. Those are how one
     address is made to look like another, and an address on the trusted list is not scored
     for blocking, so a doubtful one is simply not trusted."""
-    if "\\" in url or any(ord(c) < 33 for c in url):
-        return None
+    if any(ord(c) < 33 or c in "\\{}[]*$`^|<>\"'" for c in url):
+        return None  # also what a shell or curl would expand into a second address: {a,b}, [1-3]
     try:
         u = urlsplit(url)
         port = u.port
@@ -77,18 +77,29 @@ def trusted_source(url: str, prefixes: list) -> bool:
     `/guide` and `/guide/x`, not `/guide-2`, not `docs.example.com.evil.net`, not
     `docs.example.com@evil.net`."""
     target = _url_parts(url)
-    if not target:
+    if not target or not _plain_path(target[3]):
         return False
     for prefix in prefixes:
         base = _url_parts(str(prefix))
-        if not base or base[:3] != target[:3]:
+        if not base or base[:3] != target[:3] or not _plain_path(base[3]):
             continue
         root = base[3].rstrip("/")
-        if "/../" in target[3] + "/" or "/./" in target[3] + "/" or "%" in target[3][:len(root) + 1]:
-            continue  # a path that climbs out of the prefix, or hides a separator in an escape
         if target[3] == root or target[3].startswith(root + "/"):
             return True
     return False
+
+
+def _plain_path(path: str) -> bool:
+    """A path that means the same to every server that might receive it. No percent escape
+    anywhere: `%2e%2e` and `%2f` are dots and slashes to whatever decodes them, and a server may
+    decode twice. No parameter (`..;/` climbs on some servers), no empty segment, no segment that
+    starts with two dots. An address that needs any of these is fetched as ordinary outside
+    content; nothing is lost but the exemption."""
+    if "%" in path or ";" in path:
+        return False
+    segments = path.split("/")[1:]
+    return not any(s in ("", ".") or s.startswith("..") for s in segments[:-1]) and \
+        not segments[-1].startswith("..") and segments[-1] != "."
 
 
 def fetched_urls(cmd: str) -> list[str]:
@@ -150,7 +161,20 @@ def outside_roots(cfg, session_paths: list[str]) -> list[str]:
     """Everything whose content counts as coming from outside: the configured directories, the
     quarantined originals and what this session downloaded. The rest of the guard's state (its
     log, counters, session records) holds no content from outside."""
-    return [canonical(p) for p in cfg.external_paths] + [canonical(str(cfg.quarantine_dir))] + list(session_paths)
+    # The files in the released directory are on the list as well. Being there exempts nothing:
+    # only a file the release command wrote is exempt, only while unchanged, and only when read
+    # with Read (store.released_artifact). Listed one by one, not as a directory, so that a text
+    # which merely names the directory (the README does) is not taken for its content.
+    return ([canonical(p) for p in cfg.external_paths] + [canonical(str(cfg.quarantine_dir))]
+            + _released_files(cfg) + list(session_paths))
+
+
+def _released_files(cfg) -> list[str]:
+    folder = canonical(str(cfg.released_dir))
+    try:
+        return [os.path.join(folder, name) for name in sorted(os.listdir(folder))[-500:]]
+    except OSError:
+        return []
 
 
 def mentions(text: str, roots: list[str], bases: list[str]) -> bool:
@@ -185,16 +209,18 @@ def mentions(text: str, roots: list[str], bases: list[str]) -> bool:
 _file_name = re.compile(r"[\w@%+-][\w@%+.-]{2,}\.[A-Za-z0-9]{1,8}")  # page.html, data-2.json; not "main" or "out"
 
 
-def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: list[str], output: str) -> bool:
+def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: list[str], output: str,
+                        folders: list[str] = ()) -> bool:
     """The command, as far as it can be read, takes its output from an outside file: it runs in an
     outside directory, names an outside file (directly, relatively, after `cd`, through a variable
     it set, by glob, or inside a quoted script), or prints one's name among its results. When the
-    session has downloaded files and the command picks its files at run time, it counts too."""
+    session has downloaded files and the command picks its files at run time, it counts too.
+    folders count when the command names them or works in them, not when its output does."""
     try:
         c = shell.read(cmd, cwd)
     except Exception:
         return True  # a command that cannot be read is not assumed to be local
-    if any(c.names(r) for r in roots):
+    if any(c.names(r) for r in [*roots, *folders]):
         return True
     if any(_file_name.fullmatch(os.path.basename(p)) and os.path.basename(p) in cmd for p in session_paths):
         return True  # named in a way the reader did not resolve; only for names that read as a file's
@@ -208,9 +234,10 @@ _OTHER_REMOTE = {"himalaya", "yt-dlp", "lynx", "w3m", "notmuch"}
 
 def _own_repo_mode(cmd: str, cwd: str, cfg) -> str | None:
     """"own" when the only thing the command fetches is `gh` output about the owner's own
-    repositories; "echo" when all of it is the reply to a change the command itself made there
-    (gh pr create, gh api -X PATCH); None when anything about the command is not plain: another
-    remote tool, a repository that cannot be told, a value computed at run time."""
+    repositories; "echo" when all of it is the reply to something the command itself just created
+    there (gh pr create, a comment posted through gh api); None when anything about the command
+    is not plain: another remote tool, a repository that cannot be told, a value computed at run
+    time."""
     if "GH_REPO" in cmd or "GH_HOST" in cmd:
         return None
     try:
@@ -221,12 +248,165 @@ def _own_repo_mode(cmd: str, cwd: str, cfg) -> str | None:
     calls = [(argv, dirs) for name, argv, dirs in programs if name == "gh"]
     if not calls or c.dynamic or any(name in _OTHER_REMOTE for name, _, _ in programs):
         return None
-    from . import gate, github
+    from . import github
     for argv, dirs in calls:
         repos = github.gh_repos(argv, dirs)
         if not repos or not all(github.is_own(r, cfg.own_repos) for r in repos):
             return None
-    return "echo" if all(gate._gh_changes(argv[1:]) for argv, _ in calls) else "own"
+    return "echo" if all(github.gh_echo(argv) for argv, _ in calls) else "own"
+
+
+# ---- a fetch that is plainly from a trusted address -------------------------------------------------
+# Programs that add nothing from elsewhere to a pipeline: what they print comes from their input,
+# a local file or their own arguments. awk, a sed script and sort --compress-program can run
+# other programs, so they are not here.
+_FILTERS = {"head", "tail", "grep", "egrep", "fgrep", "jq", "wc", "cut", "tr", "cat", "tee", "nl", "uniq", "sort",
+            "echo", "printf", "true", "cd"}
+_SED_PRINT = re.compile(r"\d+(?:,\d+)?p")  # sed -n '1,80p', and nothing else of sed
+_FD = re.compile(r"(?<=\s)\d(?=>)")        # the 2 of 2>/dev/null
+# The options a plain download uses: (short flags, short options with a value, long flags, long
+# options with a value). Anything else (a proxy, --resolve, --connect-to, a config file, -k) can
+# make a trusted address return someone else's content, so a command using it is handled as
+# ordinary outside content.
+_CURL = (set("sSLfiIvgO46"), set("omAHwe"),
+         {"silent", "show-error", "location", "fail", "fail-with-body", "include", "head", "verbose", "compressed",
+          "ipv4", "ipv6", "remote-name", "globoff", "no-progress-meter", "tlsv1.2", "tlsv1.3"},
+         {"output", "output-dir", "max-time", "connect-timeout", "retry", "retry-delay", "retry-max-time",
+          "user-agent", "header", "write-out", "referer", "url", "proto"})
+_WGET = (set("qSc"), set("OPTtU"),
+         {"quiet", "no-verbose", "server-response", "continue"},
+         {"output-document", "directory-prefix", "timeout", "tries", "user-agent", "header"})
+# Request headers that do not choose whose content comes back. Host does, and so can a
+# forwarding header on a server that honours it.
+_HEADERS = {"accept", "accept-language", "accept-encoding", "user-agent", "cache-control", "pragma",
+            "if-none-match", "if-modified-since", "referer", "authorization", "x-github-api-version"}
+
+
+def _plain_header(value: str) -> bool:
+    name, colon, _ = value.partition(":")
+    return bool(colon) and name.strip().lower() in _HEADERS  # `@file` and `Host;` have no such name
+
+
+def _plain_download(args: list[str], spec: tuple) -> list[str] | None:
+    """The addresses one curl or wget invocation fetches, or None when it uses anything outside
+    the plain set."""
+    flags, values, long_flags, long_values = spec
+    urls, i = [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if not a.startswith("-") or a == "-":
+            urls.append(a)
+        elif a.startswith("--"):
+            name, eq, value = a[2:].partition("=")
+            if name in long_flags and not eq:
+                continue
+            if name not in long_values:
+                return None
+            if not eq:
+                if i >= len(args):
+                    return None
+                value = args[i]
+                i += 1
+            if name == "url":
+                urls.append(value)
+            elif name == "header" and not _plain_header(value):
+                return None
+        elif a == "-nv" and spec is _WGET:
+            continue
+        else:
+            for j, c in enumerate(a[1:], 1):
+                if c in flags:
+                    continue
+                if c not in values:
+                    return None
+                value = a[j + 1:]
+                if not value:
+                    if i >= len(args):
+                        return None
+                    value = args[i]
+                    i += 1
+                if c == "H" and not _plain_header(value):
+                    return None
+                break
+    return urls
+
+
+def _own_settings(program: str) -> bool:
+    """A settings file that curl or wget reads on its own exists. It can name a proxy or further
+    addresses, nothing in the command shows it, and the guard cannot tell who wrote it."""
+    env, home = os.environ, os.path.expanduser("~")
+    if program == "wget":
+        places = [env.get("WGETRC"), os.path.join(home, ".wgetrc")]
+    else:
+        places = [env.get("CURL_HOME") and os.path.join(env["CURL_HOME"], ".curlrc"),
+                  env.get("XDG_CONFIG_HOME") and os.path.join(env["XDG_CONFIG_HOME"], "curlrc"),
+                  os.path.join(home, ".curlrc"), os.path.join(home, ".config", "curlrc")]
+    return any(p and os.path.exists(p) for p in places)
+
+
+def _trusted_fetch(cmd: str, cfg) -> bool:
+    """The command is nothing but plain curl or wget downloads from addresses on the trusted list,
+    and filters. Trust is read off what is fetched: an address printed by echo, left in a comment
+    or kept in a config file proves nothing, and neither does a command the shell still has to
+    put together or one that runs anything else beside the download."""
+    cmd = cmd.replace("\\\n", " ")
+    if not cfg.trusted_sources or "<<" in cmd or shell.expands(cmd):
+        return False
+    programs = set()
+    for words in shell.simple_commands(_FD.sub("", cmd)):
+        words = shell.without_redirections(words[1:] if words[0] == "rtk" else words)
+        if not words:
+            continue
+        name, args = words[0], words[1:]  # the bare name only: ./curl and /tmp/curl are other programs
+        if name in ("curl", "wget"):
+            urls = _plain_download(args, _CURL if name == "curl" else _WGET)
+            if not urls or not all(trusted_source(u, cfg.trusted_sources) for u in urls):
+                return False
+            programs.add(name)
+        elif name == "sed":
+            if not (len(args) == 2 and args[0] == "-n" and _SED_PRINT.fullmatch(args[1])):
+                return False
+        elif name not in _FILTERS or any(a.startswith("--compress-program") for a in args):
+            return False
+    return bool(programs) and not any(_own_settings(p) for p in programs)
+
+
+def _has_option(args: list[str], letter: str, long: str, value_letters: set) -> bool:
+    for a in args:
+        if a.startswith("--"):
+            name = a.split("=", 1)[0]
+            if len(name) >= 6 and long.startswith(name):  # --conf is --config to the program too
+                return True
+        elif a.startswith("-"):
+            for c in a[1:]:
+                if c == letter:
+                    return True
+                if c in value_letters:
+                    break
+    return False
+
+
+def _hidden_fetch(cmd: str, cwd: str) -> bool:
+    """curl or wget told to take its addresses from a file. Where it fetches from cannot be seen,
+    so the result is outside content. A variable in the address is another matter: that is
+    usually a service on this network (see fetches_outside)."""
+    try:
+        c = shell.read(cmd, cwd)
+    except Exception:
+        return False
+    for argv in c.programs:
+        name, args = os.path.basename(argv[0]), argv[1:]
+        if name == "curl" and _has_option(args, "K", "--config", shell._CURL_VALUE_OPTS):
+            return True
+        if name == "wget" and _has_option(args, "i", "--input-file", shell._WGET_VALUE_OPTS):
+            return True
+    return False
+
+
+def _public_urls(cmd: str, cfg) -> list[str]:
+    hosts = [(u, _URL.match(u)) for u in fetched_urls(cmd)]
+    return [u for u, m in hosts if m and (cfg.scan_private_hosts or not private_host(m.group(1)))]
 
 
 def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str], output: str = "") -> str | None:
@@ -246,16 +426,16 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
                 return "trusted"
         return "external"
     roots = outside_roots(cfg, session_paths)
+    released = canonical(str(cfg.released_dir))
     if tool == "Bash":
         cmd = str(tool_input.get("command") or "")
-        if _bash_reads_outside(cmd, cwd, roots, session_paths, output):
+        if _bash_reads_outside(cmd, cwd, roots, session_paths, output, [released]):
             return "external"
-        if fetches_outside(cmd, cfg.scan_private_hosts):
-            # Trusted only if every public address the command names is on the list and nothing in
-            # it talks to a service whose address is not in the command (gh, ...).
-            public = [u for u in fetched_urls(cmd)
-                      if cfg.scan_private_hosts or not private_host(_URL.match(u).group(1))]
-            if public and not _REMOTE_TOOL.search(cmd) and all(trusted_source(u, cfg.trusted_sources) for u in public):
+        if fetches_outside(cmd, cfg.scan_private_hosts) or _hidden_fetch(cmd, cwd):
+            # Trusted only if every public address the text of the command holds is on the list,
+            # and the command is nothing but a plain download of those addresses.
+            public = _public_urls(cmd, cfg)
+            if public and all(trusted_source(u, cfg.trusted_sources) for u in public) and _trusted_fetch(cmd, cfg):
                 return "trusted"
             if not public and cfg.own_repos:
                 return _own_repo_mode(cmd, cwd, cfg) or "external"
@@ -264,11 +444,11 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
     if tool in ("Read", "Grep"):
         base = canonical(cwd) if cwd else ""
         path = canonical(str(tool_input.get("file_path") or tool_input.get("path") or cwd or "/"), cwd)
-        if any(under(path, r) for r in roots):
+        if tool == "Read" and store.released_artifact(cfg, path):
+            return None  # an original the owner read and released, unchanged: not scanned a second time
+        if any(under(path, r) for r in [*roots, released]):
             return "external"
         if tool == "Grep" and mentions(output, roots, [path, base]):
             return "external"
-        if tool == "Read" and under(path, canonical(str(cfg.released_dir))):
-            return None  # an original the owner read and released: not scanned a second time
         return "local"
     return None  # tools that carry no outside content, and tools this list does not know

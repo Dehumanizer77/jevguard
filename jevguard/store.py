@@ -120,16 +120,25 @@ def release(cfg, qid: str) -> tuple[str, list[Path]]:
     a web page summarised afresh on every fetch, or an answer with a timestamp in it, never
     comes back the same, so waiting for it to be repeated would release nothing. What the agent
     reads is exactly what the owner read."""
+    import hashlib
     from . import toolio
     rec = json.loads((cfg.quarantine_dir / f"{qid}.json").read_text())
     text, images = toolio.text_of(rec.get("tool", ""), rec.get("raw"))
+    if cfg.released_dir.is_symlink():
+        raise OSError(f"{cfg.released_dir} is a symbolic link; refusing to write released originals through it")
     _private_dir(cfg.released_dir)
-    files = [released_copy(cfg, qid)]
-    _write_private(files[0], text.encode("utf-8", "surrogatepass"))
+    contents = {released_copy(cfg, qid): text.encode("utf-8", "surrogatepass")}
     for n, image in enumerate(images, 1):
         kind = next((ext for magic, ext in _IMAGE_TYPES if image.startswith(magic)), "bin")
-        files.append(cfg.released_dir / f"{qid}-{n}.{kind}")
-        _write_private(files[-1], image)
+        contents[cfg.released_dir / f"{qid}-{n}.{kind}"] = image
+    for path, data in contents.items():
+        _write_private(path, data)
+    # The record of what was written goes into the closed state directory. Being in the released
+    # directory exempts nothing by itself; matching this record does.
+    with _locked(cfg.released_manifest) as manifest:
+        for path, data in contents.items():
+            manifest[path.name] = hashlib.sha256(data).hexdigest()
+    files = list(contents)
     line = f"{rec['content_sha256']} {qid} {rec.get('tool', '?')} released {time.strftime('%Y-%m-%d')}\n"
     _private_dir(cfg.released_file.parent)
     fd = os.open(cfg.released_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
@@ -141,9 +150,34 @@ def release(cfg, qid: str) -> tuple[str, list[Path]]:
 
 
 def _write_private(path: Path, data: bytes) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+    """Write a new file and move it into place in one step. The name was known to the agent
+    before the release (the notice gives it), so something may already sit there: a link planted
+    to send the original elsewhere is replaced, never followed."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def released_artifact(cfg, path: str) -> bool:
+    """The file is one the owner's release command wrote, and it still holds what was written:
+    its name is in the record, it is a plain file in the released directory, and the hash of the
+    whole file matches. Checked on the whole file whatever part of it was read."""
+    import hashlib
+    p = Path(path)
+    try:
+        if p.parent.resolve() != cfg.released_dir.resolve() or p.is_symlink() or not p.is_file():
+            return False
+        record = json.loads(cfg.released_manifest.read_text())
+        expected = record.get(p.name) if isinstance(record, dict) else None
+        return bool(expected) and hashlib.sha256(p.read_bytes()).hexdigest() == expected
+    except (OSError, ValueError):
+        return False
 
 
 # ---- per-session state: files saved by fetching commands, and what the session has seen ----

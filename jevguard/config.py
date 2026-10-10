@@ -110,6 +110,9 @@ def load() -> SimpleNamespace:
     # on purpose: that one is closed to Claude Code's file tools, this one has to be readable.
     home = os.environ.get("JEVGUARD_HOME")
     cfg.released_dir = Path(home) / "released" if home else state_dir.with_name(state_dir.name + "-released")
+    # Which files there the owner's release command wrote, and what was in them. Kept in the
+    # closed state directory: a file counts as released only while it matches this record.
+    cfg.released_manifest = state_dir / "released-files.json"
     return cfg
 
 

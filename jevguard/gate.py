@@ -14,6 +14,7 @@ import os
 import re
 
 from . import shell
+from .github import WRITE_VERBS
 from .shell import canonical, under
 
 CODE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -24,17 +25,16 @@ _CURL_DATA_LONG = {"data", "data-raw", "data-binary", "data-urlencode", "data-as
                    "upload-file", "json", "config", "mail-rcpt", "url-query"}
 _WGET_DATA = {"--post-data", "--post-file", "--body-data", "--body-file"}
 _HTTPIE_ITEM = re.compile(r"[\w.\-\[\]]+(?::=|=(?!=)|@)")
-_GH_VERBS = {"create", "comment", "edit", "merge", "close", "reopen", "delete", "upload", "set", "run", "fork",
-             "review", "ready", "lock", "unlock", "transfer", "rename", "archive", "unarchive", "sync", "enable",
-             "disable", "rerun", "cancel", "add", "remove", "import", "pin", "unpin", "develop", "revert"}
 _CONNECT = {"ssh", "scp", "sftp", "ftp", "nc", "ncat", "netcat", "socat", "telnet"}
 _MAIL = {"mail", "mailx", "sendmail", "msmtp", "mutt", "swaks"}
 _MCP_WRITE = re.compile(r"(?:^|_)(?:send|create|update|delete|post|write|reply|upload|share|publish|batch|"
                         r"move|remove|add|insert|modify|forward|draft|edit|set|invite|comment)(?:_|$)", re.I)
-# Files that run or grant access later.
+# Files that run or grant access later, and the settings curl and wget read on their own: a
+# proxy written there decides whose content every later download returns.
 _STARTUP = re.compile(r"(?:^|/)(?:\.ssh(?:/|$)|\.claude/(?:hooks(?:/|$)|CLAUDE\.md$)|\.git/hooks(?:/|$)|"
                       r"\.bashrc$|\.bash_profile$|\.bash_login$|\.profile$|\.zshrc$|\.zprofile$|\.gitconfig$|"
-                      r"\.config/systemd(?:/|$)|\.config/autostart(?:/|$)|CLAUDE\.md$|\.mcp\.json$)")
+                      r"\.config/systemd(?:/|$)|\.config/autostart(?:/|$)|CLAUDE\.md$|\.mcp\.json$|"
+                      r"\.curlrc$|\.config/curlrc$|\.wgetrc$|\.netrc$)")
 # Claude Code settings files: the hooks live there, and one line in any of them switches hooks off.
 _SETTINGS = re.compile(r"(?:^|/)\.claude/settings[^/]*\.json$")
 _ADMIN = {"mode", "gate", "install", "uninstall", "release", "show", "trust", "untrust"}
@@ -139,7 +139,7 @@ def _gh_changes(args: list[str]) -> bool:
     if not words:
         return False
     if words[0] != "api":
-        return len(words) > 1 and words[1] in _GH_VERBS
+        return len(words) > 1 and words[1] in WRITE_VERBS
     for i, a in enumerate(args):
         following = args[i + 1] if i + 1 < len(args) else ""
         name, _, value = a.partition("=")
@@ -235,20 +235,30 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
     """Why this call would change the guard itself (its settings, state, release list, code, or
     the Claude Code settings that run it), or an empty string. Asked about in every session."""
     roots = [canonical(str(cfg.config_dir)), canonical(str(cfg.state_dir)), CODE_ROOT]
+    # The originals the owner released. The agent has to read them, so looking is free; putting
+    # a file there, changing one or removing one is asked about like a change to a settings file.
+    released = canonical(str(cfg.released_dir))
     # What must not be removed from above either: the guard's directories and the user's settings.
-    targets = roots + [canonical(os.path.join("~", ".claude", name)) for name in _SETTINGS_NAMES]
+    targets = roots + [released] + [canonical(os.path.join("~", ".claude", name)) for name in _SETTINGS_NAMES]
 
     def protected(path: str) -> bool:
-        return bool(_SETTINGS.search(path)) or any(under(path, r) for r in roots)
+        return bool(_SETTINGS.search(path)) or any(under(path, r) for r in [*roots, released])
 
     def above(path: str) -> bool:
         return any(path != t and under(t, path) for t in targets)
+
+    def kind(path: str) -> str:
+        if any(under(path, r) or shell.glob_reaches(path, r) for r in roots):
+            return "one of the guard's own files"
+        if under(path, released) or shell.glob_reaches(path, released):
+            return "the directory of originals the owner released (the agent reads those unscanned)"
+        return "a Claude Code settings file (the hooks that run the guard are set there)"
 
     # Every reason names the program and the exact path that set it off. The person asked to
     # approve cannot review a two-hundred-line command; they can check one named thing.
     if tool in ("Write", "Edit", "NotebookEdit"):
         path = canonical(str(tool_input.get("file_path") or ""), cwd)
-        return f"{tool} writes to {_show(path)}, {_kind(path, roots)}" if protected(path) else ""
+        return f"{tool} writes to {_show(path)}, {kind(path)}" if protected(path) else ""
     if tool != "Bash":
         return ""
     cmd = str(tool_input.get("command") or "")
@@ -270,7 +280,7 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
                 "which reads like a jevguard administration command")
     written = next((p for p in sorted(shell.written_paths(c)) if protected(p)), None)
     if written:  # -o/path, --output-dir with -O, cd there and download, cp -t, dd of=
-        return f"the command writes to {_show(written)}, {_kind(written, roots)}"
+        return f"the command writes to {_show(written)}, {kind(written)}"
     for argv, dirs, paths, globs, fed in zip(c.programs, c.program_dirs, c.program_paths, c.program_globs,
                                              c.program_fed):
         program = os.path.basename(argv[0])
@@ -281,20 +291,22 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
             # (`jevguard scan <file>`), not words like "status" resolved against the directory.
             paths = {p for a in argv[1:] if "/" in a or a.startswith("~") for p in shell.resolve(a, dirs)}
         elif not _reads_only(argv):
-            inside = next((d for d in dirs for r in roots if under(d, r)), None)
+            inside = next((d for d in dirs for r in [*roots, released] if under(d, r)), None)
             if inside:  # `git reset --hard` there names no file and changes them all
-                return f"`{program}` runs inside {_show(inside)}, one of the guard's own directories"
+                own = any(under(inside, r) for r in roots)
+                return f"`{program}` runs inside {_show(inside)}, " + \
+                    ("one of the guard's own directories" if own else kind(inside))
         # The guard's own directories hold the API key and the release list: any program counts.
         hit = next((p for p in sorted(paths) if any(under(p, r) for r in roots)), None) or \
             next((g for g in globs if any(shell.glob_reaches(g, r) for r in roots)), None)
         if hit:
-            return f"`{program}` {_names(argv, hit)} {_show(hit)}, {_kind(hit, roots)}"
+            return f"`{program}` {_names(argv, hit)} {_show(hit)}, {kind(hit)}"
         if _reads_only(argv):
-            continue  # cat .claude/settings.json, ls ~: looking is not a change
-        hit = next((p for p in sorted(paths) if _SETTINGS.search(p)), None) or \
-            next((g for g in globs if _settings_glob(g)), None)
+            continue  # cat .claude/settings.json, cat a released original, ls ~: looking is not a change
+        hit = next((p for p in sorted(paths) if _SETTINGS.search(p) or under(p, released)), None) or \
+            next((g for g in globs if _settings_glob(g) or shell.glob_reaches(g, released)), None)
         if hit:
-            return f"`{program}` {_names(argv, hit)} {_show(hit)}, {_kind(hit, roots)}"
+            return f"`{program}` {_names(argv, hit)} {_show(hit)}, {kind(hit)}"
         # also any project's .claude directory: unpacking or copying into it can plant a settings file
         hit = next((p for p in sorted(paths) if above(p) or os.path.basename(p) == ".claude"), None) or \
             next((g for g in globs if any(shell.glob_reaches_above(g, t) for t in targets)), None)
@@ -307,12 +319,6 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
 def _show(path: str) -> str:
     home = os.path.expanduser("~")
     return "~" + path[len(home):] if path != home and under(path, home) else path
-
-
-def _kind(path: str, roots: list[str]) -> str:
-    if any(under(path, r) or shell.glob_reaches(path, r) for r in roots):
-        return "one of the guard's own files"
-    return "a Claude Code settings file (the hooks that run the guard are set there)"
 
 
 def _names(argv: list[str], hit: str) -> str:

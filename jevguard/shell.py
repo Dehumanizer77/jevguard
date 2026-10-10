@@ -57,6 +57,55 @@ def tokens(cmd: str) -> list[str]:
         return re.findall(r"[();|&<>]+|[^\s();|&<>]+", cmd)
 
 
+def simple_commands(cmd: str) -> list[list[str]]:
+    """The command cut at ; | & and parentheses, each piece as its words. Nothing is expanded and
+    no wrapper is removed: this is what was written, for callers that accept only plain forms."""
+    out, current = [], []
+    for token in tokens(cmd):
+        if token and set(token) <= _SEPARATORS:
+            out.append(current)
+            current = []
+        else:
+            current.append(token)
+    return [words for words in [*out, current] if words]
+
+
+def without_redirections(words: list[str]) -> list[str]:
+    """The words a program is given, without `> file`, `>&1`, `< file` and the like."""
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+        elif w and set(w) <= _REDIRECT_CHARS:
+            skip = True
+        else:
+            out.append(w)
+    return out
+
+
+def expands(cmd: str) -> bool:
+    """The shell would rewrite part of this command before running it: a variable or a command
+    substitution anywhere but in single quotes, a brace list or a glob outside quotes. What then
+    runs is not what is written. A lone `?` is let through: addresses are full of them."""
+    quote, i = "", 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote == "'":
+            quote = "" if ch == "'" else quote
+        elif ch == "\\":
+            i += 1
+        elif ch in "$`":
+            return True
+        elif quote:
+            quote = "" if ch == '"' else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "{}*[]":
+            return True
+        i += 1
+    return bool(quote)  # an open quote: not readable either
+
+
 class Command:
     def __init__(self, cwd: str = ""):
         self.programs: list[list[str]] = []  # argv of each simple command, wrappers removed

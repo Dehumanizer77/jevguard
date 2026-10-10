@@ -65,6 +65,7 @@ class Guard:
 
     def __init__(self, home: Path, url: str):
         self.home, self.url = home, url
+        self.env = {}  # extra environment for the hook process
         (home / "config").mkdir(parents=True)
         (home / "config" / "typesafe.key").write_text("test-key\n")
         self.configure()
@@ -81,7 +82,7 @@ class Guard:
         if tool_response is not None:
             payload["tool_response"] = tool_response
         r = subprocess.run([str(ROOT / "bin" / "jevguard-hook")], input=json.dumps(payload), text=True,
-                           capture_output=True, timeout=60, env={**os.environ, "JEVGUARD_HOME": str(self.home)})
+                           capture_output=True, timeout=60, env={**os.environ, "JEVGUARD_HOME": str(self.home), **self.env})
         assert r.returncode == 0, r.stderr
         return json.loads(r.stdout) if r.stdout.strip() else None
 
