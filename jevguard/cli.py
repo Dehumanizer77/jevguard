@@ -127,6 +127,31 @@ def install(cfg, settings_path: Path, remove: bool = False) -> str:
     return f"updated {settings_path}" + (f" (backup: {backup.name})" if backup else "")
 
 
+def cmd_trust(cfg, a) -> int:
+    """Put a URL prefix on the trusted list, or take it off. Content from a trusted address is
+    scanned and logged as before; it is no longer withheld."""
+    from . import provenance
+    prefix = a.prefix.strip()
+    if not provenance.trusted_source(prefix, [prefix]):
+        print("give an address starting with https:// or http://, without a password part, "
+              "for example https://developers.openai.com/codex/", file=sys.stderr)
+        return 1
+    user = json.loads(cfg.config_file.read_text()) if cfg.config_file.exists() else {}
+    sources = [s for s in user.get("trusted_sources", []) if s != prefix]
+    if a.cmd == "trust":
+        sources.append(prefix)
+    user["trusted_sources"] = sources
+    cfg.config_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cfg.config_file.write_text(json.dumps(user, indent=2) + "\n")
+    print("trusted sources:" if sources else "trusted sources: none")
+    for s in sources:
+        print(" ", s)
+    if a.cmd == "trust":
+        print("content from there is still scanned and logged, but no longer withheld, "
+              "whatever the address returns or redirects to")
+    return 0
+
+
 def _set(cfg, settings_path: Path, key: str, value: str) -> None:
     user = json.loads(cfg.config_file.read_text()) if cfg.config_file.exists() else {}
     user[key] = value
@@ -150,6 +175,7 @@ def cmd_status(cfg, a) -> int:
     print(f"API key: {'present' if key else 'MISSING'} ({cfg.key_file})")
     print(f"scan local content: {cfg.scan_local}   private hosts: {cfg.scan_private_hosts}   "
           f"track clones: {cfg.track_clones}")
+    print("trusted sources (never withheld): " + (", ".join(cfg.trusted_sources) or "none"))
     print(f"tokens today: {today:,} of {cfg.daily_token_budget:,}")
     blocked_by = store.scanner_available(cfg)
     if blocked_by:
@@ -248,7 +274,10 @@ def cmd_release(cfg, a) -> int:
         if not store.QID.fullmatch(qid) or not (cfg.quarantine_dir / f"{qid}.json").is_file():
             print(f"{qid}: no such quarantine entry", file=sys.stderr)
             return 1
-        print("released", qid, store.release(cfg, qid)[:16])
+        digest, files = store.release(cfg, qid)
+        print("released", qid, digest[:16])
+        print("  the original is now in", ", ".join(str(f) for f in files))
+        print("  tell Claude it is released; the notice it received names that file")
     return 0
 
 
@@ -311,11 +340,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("value", choices=["off", "log", "ask-flagged", "ask-external"])
     sub.add_parser("install", help="add the hooks to the Claude Code settings file")
     sub.add_parser("uninstall", help="remove the hooks")
+    p = sub.add_parser("trust", help="never withhold content from this address (a URL prefix); it is still scanned and logged")
+    p.add_argument("prefix")
+    p = sub.add_parser("untrust", help="take an address off the trusted list")
+    p.add_argument("prefix")
     a = ap.parse_args(argv)
     cfg = config.load()
     if a.cmd in ("mode", "gate"):
         _set(cfg, a.settings, a.cmd, a.value)
         return 0
+    if a.cmd in ("trust", "untrust"):
+        return cmd_trust(cfg, a)
     if a.cmd in ("install", "uninstall"):
         print(install(cfg, a.settings, remove=a.cmd == "uninstall"))
         return 0

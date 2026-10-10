@@ -34,6 +34,11 @@ DEFAULTS = {
                    "mcp__claude_ai_Google_Calendar__.*", "mcp__claude_ai_Claude_Docs__.*"],
     "warn_tools": [],
     "trusted_commands": [],
+    # Addresses whose content is scanned and logged but never withheld, as URL prefixes
+    # ("https://developers.openai.com/codex/"). For sources that keep scoring as an injection
+    # without being one: documentation about hooks, articles about prompt injection. Whatever such
+    # an address returns later, or redirects to, passes unread by anyone; keep the prefixes narrow.
+    "trusted_sources": [],
     # When scanning fails: "open" passes the result, "closed" withholds outside content.
     "on_error": "open",
     # Ask before any call that would change the guard: its settings, state, release list, code,
@@ -75,6 +80,9 @@ def load() -> SimpleNamespace:
         raise ValueError(f"{path}: gate must be off, log, ask-flagged or ask-external")
     if values["on_error"] not in ("open", "closed"):
         raise ValueError(f"{path}: on_error must be open or closed")
+    for source in values["trusted_sources"]:
+        if not isinstance(source, str) or not source.lower().startswith(("https://", "http://")):
+            raise ValueError(f"{path}: trusted_sources takes URL prefixes starting with https:// or http://")
     cfg = SimpleNamespace(**values)
     cfg.config_dir, cfg.state_dir, cfg.config_file = cfg_dir, state_dir, path
     if os.environ.get("JEVGUARD_HOME") and values["key_file"] == DEFAULTS["key_file"]:
@@ -85,6 +93,10 @@ def load() -> SimpleNamespace:
     cfg.scan_log = state_dir / "scans.jsonl"
     cfg.released_file = state_dir / "released.txt"
     cfg.usage_file = state_dir / "usage.json"
+    # Released originals are handed to the agent as files. They live outside the state directory
+    # on purpose: that one is closed to Claude Code's file tools, this one has to be readable.
+    home = os.environ.get("JEVGUARD_HOME")
+    cfg.released_dir = Path(home) / "released" if home else state_dir.with_name(state_dir.name + "-released")
     return cfg
 
 

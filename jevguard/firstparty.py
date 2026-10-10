@@ -62,12 +62,17 @@ def seal_line(line: str) -> str:
     return f"{line}\t#jg:{_mac(line)[:16]}"
 
 
-def notice(tool: str, verdict: dict, qid: str = "") -> str:
-    return json.dumps(seal_object({
-        "firewall": "blocked", "verdict": verdict.get("verdict", "unavailable"),
-        "score": verdict.get("score"), "source": tool[:80],
-        "reasons": [str(r)[:80] for r in (verdict.get("reasons") or [])][:5],
-        "quarantine_id": qid, "note": NOTE}), ensure_ascii=False)
+def notice(tool: str, verdict: dict, qid: str = "", released_copy: str = "") -> str:
+    """released_copy: where the original will be if the owner releases it. Naming the place in
+    the notice means the owner only has to say that it is released."""
+    body = {"firewall": "blocked", "verdict": verdict.get("verdict", "unavailable"),
+            "score": verdict.get("score"), "source": tool[:80],
+            "reasons": [str(r)[:80] for r in (verdict.get("reasons") or [])][:5],
+            "quarantine_id": qid, "note": NOTE}
+    if released_copy:
+        body["if_released"] = (f"Only the owner can release it. If they tell you they have, "
+                               f"the original is in the file {released_copy}")
+    return json.dumps(seal_object(body), ensure_ascii=False)
 
 
 def _genuine(obj) -> bool:

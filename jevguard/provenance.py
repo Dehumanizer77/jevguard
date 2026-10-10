@@ -4,6 +4,9 @@
             files those commands saved, files under the configured external paths, and whatever
             a command or a search reads back out of those files.
 "local":    files on this machine and output of local commands.
+"trusted":  outside content from an address the owner put on the trusted list: scanned and
+            logged like any other, never withheld.
+"local":    files on this machine and output of local commands.
 "warn":     output of commands that only report on the agent's own work; never blocked.
 None:       not scanned at all.
 """
@@ -13,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+from urllib.parse import urlsplit
 
 from . import shell
 from .shell import canonical, under
@@ -41,6 +45,52 @@ def private_host(host: str) -> bool:
         return ip.is_private or ip.is_loopback or ip.is_link_local
     except ValueError:
         return host == "localhost" or "." not in host or host.endswith(_PRIVATE_SUFFIX)
+
+
+_URL_FULL = re.compile(r"\b(?:https?|wss?|ftp)://[^\s'\"<>|;&)\\]+", re.I)
+_DEFAULT_PORT = {"http": 80, "https": 443}
+
+
+def _url_parts(url: str):
+    """(scheme, host, port, path) of an http(s) address, or None for anything else or anything
+    that does not parse cleanly: a backslash, a password part, an odd port. Those are how one
+    address is made to look like another, and an address on the trusted list is not scored
+    for blocking, so a doubtful one is simply not trusted."""
+    if "\\" in url or any(ord(c) < 33 for c in url):
+        return None
+    try:
+        u = urlsplit(url)
+        port = u.port
+    except ValueError:
+        return None
+    scheme = u.scheme.lower()
+    if scheme not in _DEFAULT_PORT or not u.hostname or u.username is not None or u.password is not None:
+        return None
+    return scheme, u.hostname.lower().rstrip("."), port or _DEFAULT_PORT[scheme], u.path or "/"
+
+
+def trusted_source(url: str, prefixes: list) -> bool:
+    """The address lies under one of the trusted prefixes: same scheme, same host, same port, and
+    its path is the prefix's path or below it. `https://docs.example.com/guide` covers
+    `/guide` and `/guide/x`, not `/guide-2`, not `docs.example.com.evil.net`, not
+    `docs.example.com@evil.net`."""
+    target = _url_parts(url)
+    if not target:
+        return False
+    for prefix in prefixes:
+        base = _url_parts(str(prefix))
+        if not base or base[:3] != target[:3]:
+            continue
+        root = base[3].rstrip("/")
+        if "/../" in target[3] + "/" or "/./" in target[3] + "/" or "%" in target[3][:len(root) + 1]:
+            continue  # a path that climbs out of the prefix, or hides a separator in an escape
+        if target[3] == root or target[3].startswith(root + "/"):
+            return True
+    return False
+
+
+def fetched_urls(cmd: str) -> list[str]:
+    return [u.rstrip(".,") for u in _URL_FULL.findall(cmd)]
 
 
 def fetches_outside(cmd: str, scan_private_hosts: bool = False) -> bool:
@@ -159,15 +209,26 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
     if _matches(tool, cfg.warn_tools):
         return "warn"
     if tool in ("WebFetch", "WebSearch") or tool.startswith("mcp__"):
-        if tool == "WebFetch" and not cfg.scan_private_hosts:
-            m = _URL.match(str(tool_input.get("url") or ""))
-            if m and private_host(m.group(1)):
+        if tool == "WebFetch":
+            url = str(tool_input.get("url") or "")
+            m = _URL.match(url)
+            if m and private_host(m.group(1)) and not cfg.scan_private_hosts:
                 return "local"
+            if trusted_source(url, cfg.trusted_sources):
+                return "trusted"
         return "external"
     roots = outside_roots(cfg, session_paths)
     if tool == "Bash":
         cmd = str(tool_input.get("command") or "")
-        if fetches_outside(cmd, cfg.scan_private_hosts) or _bash_reads_outside(cmd, cwd, roots, session_paths, output):
+        if _bash_reads_outside(cmd, cwd, roots, session_paths, output):
+            return "external"
+        if fetches_outside(cmd, cfg.scan_private_hosts):
+            # Trusted only if every public address the command names is on the list and nothing in
+            # it talks to a service whose address is not in the command (gh, ...).
+            public = [u for u in fetched_urls(cmd)
+                      if cfg.scan_private_hosts or not private_host(_URL.match(u).group(1))]
+            if public and not _REMOTE_TOOL.search(cmd) and all(trusted_source(u, cfg.trusted_sources) for u in public):
+                return "trusted"
             return "external"
         return "warn" if trusted_command(cmd, set(cfg.trusted_commands)) else "local"
     if tool in ("Read", "Grep"):
@@ -177,5 +238,7 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
             return "external"
         if tool == "Grep" and mentions(output, roots, [path, base]):
             return "external"
+        if tool == "Read" and under(path, canonical(str(cfg.released_dir))):
+            return None  # an original the owner read and released: not scanned a second time
         return "local"
     return None  # tools that carry no outside content, and tools this list does not know

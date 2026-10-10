@@ -37,9 +37,9 @@ _STARTUP = re.compile(r"(?:^|/)(?:\.ssh(?:/|$)|\.claude/(?:hooks(?:/|$)|CLAUDE\.
                       r"\.config/systemd(?:/|$)|\.config/autostart(?:/|$)|CLAUDE\.md$|\.mcp\.json$)")
 # Claude Code settings files: the hooks live there, and one line in any of them switches hooks off.
 _SETTINGS = re.compile(r"(?:^|/)\.claude/settings[^/]*\.json$")
-_ADMIN = {"mode", "gate", "install", "uninstall", "release", "show"}
+_ADMIN = {"mode", "gate", "install", "uninstall", "release", "show", "trust", "untrust"}
 # The same commands named inside code the reader cannot take apart: ['.../jevguard', 'release', id].
-_ADMIN_TEXT = re.compile(r"jevguard\b(?!-hook)[^|;&\n]{0,80}?\b(?:mode|gate|install|uninstall|release|show)\b")
+_ADMIN_TEXT = re.compile(r"jevguard\b(?!-hook)[^|;&\n]{0,80}?\b(?:mode|gate|install|uninstall|release|show|trust|untrust)\b")
 _LONG_URL = 300  # a fetch can carry data out in its address
 _UNREADABLE = "could not be read as a command, so what it does cannot be ruled out"
 

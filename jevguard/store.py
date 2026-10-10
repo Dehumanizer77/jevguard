@@ -104,8 +104,32 @@ def released(cfg) -> frozenset:
     return frozenset(l.split()[0] for l in lines if l.strip() and not l.startswith("#"))
 
 
-def release(cfg, qid: str) -> str:
+def released_copy(cfg, qid: str) -> Path:
+    """Where the original of a quarantined result is put once the owner releases it."""
+    return cfg.released_dir / f"{qid}.txt"
+
+
+_IMAGE_TYPES = ((bytes.fromhex("89504e47"), "png"), (bytes.fromhex("ffd8"), "jpg"), (b"GIF8", "gif"), (b"RIFF", "webp"))
+
+
+def release(cfg, qid: str) -> tuple[str, list[Path]]:
+    """Release a quarantined result: (content hash, the files its original was written to).
+
+    Two things happen. The hash goes on the release list, so the same content passes when a tool
+    returns it again. And the original is written out as a plain file for the agent to read:
+    a web page summarised afresh on every fetch, or an answer with a timestamp in it, never
+    comes back the same, so waiting for it to be repeated would release nothing. What the agent
+    reads is exactly what the owner read."""
+    from . import toolio
     rec = json.loads((cfg.quarantine_dir / f"{qid}.json").read_text())
+    text, images = toolio.text_of(rec.get("tool", ""), rec.get("raw"))
+    _private_dir(cfg.released_dir)
+    files = [released_copy(cfg, qid)]
+    _write_private(files[0], text.encode("utf-8", "surrogatepass"))
+    for n, image in enumerate(images, 1):
+        kind = next((ext for magic, ext in _IMAGE_TYPES if image.startswith(magic)), "bin")
+        files.append(cfg.released_dir / f"{qid}-{n}.{kind}")
+        _write_private(files[-1], image)
     line = f"{rec['content_sha256']} {qid} {rec.get('tool', '?')} released {time.strftime('%Y-%m-%d')}\n"
     _private_dir(cfg.released_file.parent)
     fd = os.open(cfg.released_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
@@ -113,7 +137,13 @@ def release(cfg, qid: str) -> str:
         os.write(fd, line.encode())
     finally:
         os.close(fd)
-    return rec["content_sha256"]
+    return rec["content_sha256"], files
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
 
 
 # ---- per-session state: files saved by fetching commands, and what the session has seen ----

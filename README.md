@@ -59,7 +59,7 @@ size, timing, a hash. Never the content.
 Two checks that read the call itself, no model:
 
 - *Changes to the guard.* A call that would change the guard's settings, state, release list
-  or code, run `jevguard mode|gate|install|uninstall|release|show`, or touch a Claude Code
+  or code, run `jevguard mode|gate|install|uninstall|release|show|trust|untrust`, or touch a Claude Code
   `settings*.json` (the hooks live there) is held for your approval. That holds whether the
   file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`),
   through a directory above it (`rm -rf ~/.claude`), or as the place a command writes to in
@@ -219,7 +219,7 @@ second line also deletes the API key file, the scan log and everything in quaran
 
 ```bash
 jevguard uninstall
-rm -rf ~/.local/share/jevguard ~/.config/jevguard ~/.local/state/jevguard ~/.local/bin/jevguard
+rm -rf ~/.local/share/jevguard ~/.config/jevguard ~/.local/state/jevguard ~/.local/state/jevguard-released ~/.local/bin/jevguard
 ```
 
 ## Everyday use
@@ -228,14 +228,37 @@ rm -rf ~/.local/share/jevguard ~/.config/jevguard ~/.local/state/jevguard ~/.loc
 jevguard status                 # settings, key, token use, counts from the log
 jevguard log                    # recent scans that were not a plain pass (--all for every scan)
 jevguard show fw-20261009-ab12cd      # read a quarantined result (your own terminal only)
-jevguard release fw-20261009-ab12cd   # let exactly that content pass from now on
+jevguard release fw-20261009-ab12cd   # hand the original to Claude and let that content pass from now on
+jevguard trust https://docs.example.com/guide/   # never withhold content from this address
 jevguard mode block             # start withholding; `jevguard mode log` to go back
 jevguard gate ask-flagged       # ask before risky actions once something was flagged
 ```
 
 When a result is withheld, Claude says the source was blocked and names a quarantine id
 (`fw-…`). If you think it was harmless, read it with `jevguard show <id>` and, if so, run
-`jevguard release <id>`; the same content then passes, an edited version is scanned again.
+`jevguard release <id>`. That does two things:
+
+- The original is written to `~/.local/state/jevguard-released/<id>.txt`. Tell Claude it is
+  released; the notice it received names that file, and reading it is not scanned again. This
+  is what makes a release work for a source that never comes back the same: a web page is
+  summarised afresh on every fetch, an API answer carries a timestamp. Claude reads exactly the
+  text you read.
+- The content goes on the release list, so if a tool returns the very same content again it
+  passes. An edited version is scanned as usual.
+
+For an address that keeps being withheld without reason (documentation about hooks, articles
+about prompt injection), there is a list of trusted addresses:
+
+```bash
+jevguard trust https://developers.openai.com/codex/     # a URL prefix: this path and below
+jevguard untrust https://developers.openai.com/codex/
+```
+
+Content from a trusted address is scanned and logged as before (`would-block` in the log when
+it scores as an injection) and is not withheld. It applies to `WebFetch` and to commands whose
+every public address is on the list. Keep the prefixes narrow: whatever such an address returns
+later, or redirects to, reaches Claude unread by anyone. For MCP tools the equivalent is the
+`warn_tools` setting.
 
 `show` and `release` are for you, reading what was blocked. They refuse to run without a
 terminal or when started from inside Claude Code, and the hook asks you before any call that
@@ -260,6 +283,8 @@ longer recognises them as its own.
 | `external_paths` | `["~/Downloads"]` | directories whose files are outside content |
 | `track_clones` | `false` | treat directories created by `git clone` as outside content |
 | `skip_tools` | claude.ai Gmail, Drive, Calendar, Docs connectors | tool-name patterns never scanned |
+| `warn_tools` | `[]` | tool-name patterns that are scanned and logged, never withheld |
+| `trusted_sources` | `[]` | URL prefixes whose content is scanned and logged, never withheld (`jevguard trust`) |
 | `on_error` | `open` | `closed` withholds outside content that could not be fully scanned: the API failed, the guard hit an error, or part of the result was unreadable (block mode). Without `tesseract` that includes every image from outside |
 | `protect_guard` | `true` | ask before any call that would change the guard or the Claude Code settings that run it |
 | `daily_token_budget` | 5,000,000 | scanning stops for the day beyond this |

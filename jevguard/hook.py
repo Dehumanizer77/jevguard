@@ -60,7 +60,7 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     ctx["mode"] = mode  # what the error path needs to know if anything below fails
     if mode is None:
         return None
-    if mode == "external":
+    if mode in ("external", "trusted"):
         if not session:
             store.prune_sessions(cfg)  # first outside content of a session: drop old session files
         paths = _existing(cfg, provenance.saved_paths(str(tool_input.get("command") or ""), cwd, cfg.track_clones)) if tool == "Bash" else []
@@ -76,7 +76,7 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     if digest in store.released(cfg):
         store.audit(cfg, **base, action="passed-released")
         return None
-    enforce = cfg.mode == "block" and mode != "warn"
+    enforce = cfg.mode == "block" and mode not in ("warn", "trusted")
     # Outside content the scan could not vouch for (the API failed, part of it was unreadable) is
     # withheld when the owner chose on_error = closed.
     withhold_unscanned = enforce and cfg.on_error == "closed" and mode == "external"
@@ -85,7 +85,7 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     def unavailable(error: str, verdict: dict | None = None, **extra) -> dict | None:
         store.audit(cfg, **base, action="blocked-unavailable" if withhold_unscanned else "passed-unscanned",
                     verdict="unavailable", error=error[:200], **(_evidence(verdict) if verdict else {}), **extra)
-        if mode == "external":
+        if mode in ("external", "trusted"):
             store.session_update(cfg, sid, flagged="unscanned")
         if withhold_unscanned:
             return _replace(tool, resp, firstparty.notice(tool, {"verdict": "unavailable",
@@ -115,15 +115,15 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
         # Kept in log mode too: it is what the owner reads to judge a would-be block.
         qid = store.quarantine(cfg, tool, tool_input, resp, verdict, digest)
         store.audit(cfg, **rec, action="blocked" if enforce else "would-block", quarantine_id=qid)
-        return _replace(tool, resp, firstparty.notice(tool, verdict, qid)) if enforce else None
+        return _replace(tool, resp, firstparty.notice(tool, verdict, qid, str(store.released_copy(cfg, qid)))) if enforce else None
     if incomplete:  # an image without OCR, undecodable data, more images than the limit
-        if mode == "external":
+        if mode in ("external", "trusted"):
             store.session_update(cfg, sid, flagged="unscanned")
         if withhold_unscanned:
             held = dict(verdict, verdict="incomplete")
             qid = store.quarantine(cfg, tool, tool_input, resp, held, digest)
             store.audit(cfg, **rec, action="blocked-incomplete", quarantine_id=qid)
-            return _replace(tool, resp, firstparty.notice(tool, held, qid))
+            return _replace(tool, resp, firstparty.notice(tool, held, qid, str(store.released_copy(cfg, qid))))
     store.audit(cfg, **rec, action="flagged" if v == "suspicious" else "passed")
     return None
 
