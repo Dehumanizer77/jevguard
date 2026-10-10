@@ -226,11 +226,13 @@ def test_issue6_unreadable_key_withholds_tracked_download(guard):
 def test_issue6_guard_error_after_classification_withholds(guard):
     guard.configure(mode="block", on_error="closed")
     fetch_to_file(guard)
-    (guard.home / "state" / "usage.json").unlink(missing_ok=True)
-    (guard.home / "state" / "usage.json").mkdir(parents=True)  # bookkeeping now raises after the scan
+    # The guard itself trips, after it has worked out where the content came from and before it
+    # has a verdict: a setting of the wrong kind. (This test used to break the usage counter for
+    # that. A counter that cannot be written is no longer an error of the scan: see #35.)
+    guard.configure(mode="block", on_error="closed", min_words="three")
     out = guard.hook("PostToolUse", "Read", {"file_path": "/work/page.html"}, read("/work/page.html", BENIGN), cwd="/work")
     assert out is not None and guard.log()[-1]["action"] == "blocked-error"
-    guard.configure(mode="block")  # open: the same failure passes the result
+    guard.configure(mode="block", min_words="three")  # open: the same failure passes the result
     assert guard.hook("PostToolUse", "Read", {"file_path": "/work/page.html"}, read("/work/page.html", BENIGN), cwd="/work") is None
     assert guard.log()[-1]["action"] == "passed-error"
 

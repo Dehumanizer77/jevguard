@@ -86,6 +86,14 @@ class Guard:
         assert r.returncode == 0, r.stderr
         return json.loads(r.stdout) if r.stdout.strip() else None
 
+    def raw(self, payload: dict, *args: str, env: dict | None = None):
+        """Run the hook on an agent's own input, as that agent would: `jevguard-hook [--agent NAME]`."""
+        r = subprocess.run([str(ROOT / "bin" / "jevguard-hook"), *args], input=json.dumps(payload), text=True,
+                           capture_output=True, timeout=60,
+                           env={**os.environ, "JEVGUARD_HOME": str(self.home), **self.env, **(env or {})})
+        assert r.returncode == 0, r.stderr
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
     def log(self) -> list[dict]:
         p = self.home / "state" / "scans.jsonl"
         return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []

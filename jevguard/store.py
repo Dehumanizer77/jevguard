@@ -85,14 +85,60 @@ def content_hash(text: str, images: list) -> str:
     return h.hexdigest()
 
 
-def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str) -> str:
+def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str,
+               text: str | None = None, images: list = ()) -> str:
+    """Keep a withheld result. raw is the result as the agent gave it; text and images are what
+    the model would have read of it. Those are kept as well, so that a release can hand the
+    original over without knowing how that agent shapes its results."""
+    import base64
     qid = f"fw-{time.strftime('%Y%m%d')}-{os.urandom(3).hex()}"
+    rec = {"tool": tool, "tool_input": tool_input, "verdict": verdict, "content_sha256": digest, "raw": raw}
+    if text is not None:
+        rec.update(text=text, images=[base64.b64encode(i).decode() for i in images])
     p = _private_dir(cfg.quarantine_dir) / f"{qid}.json"
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump({"tool": tool, "tool_input": tool_input, "verdict": verdict,
-                   "content_sha256": digest, "raw": raw}, f, ensure_ascii=False)
+        json.dump(rec, f, ensure_ascii=False, default=str)
     return qid
+
+
+_MARK_SECONDS = 900  # longer than the longest a command may run before the agent gives up on it
+
+
+def printed(text) -> str:
+    """What a command printed, as a wrapper and the hook after it can both name it. The agent
+    trims the output and frames it in its own way between the two, so all space is left out."""
+    import hashlib
+    return hashlib.sha256("".join(str(text or "").split()).encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def judged(cfg, session: str, command: str, mark: bool = False, output: str = "") -> bool:
+    """Whether a wrapper (`jevguard-run`, `jevguard-shell`) has judged what this command printed.
+    The wrapper leaves a mark when it has (mark=True); the agent's hook after the call asks, and
+    the asking takes the mark away. No mark means the wrapper could not do its work, as inside a
+    sandbox that allows it neither the network nor a file of its own, and the hook then judges
+    the output itself.
+
+    output: printed() of what the wrapper handed over. With it the mark is for that very output
+    and no other result of the same command can use it: a mark by command alone, left by a call
+    whose hook never came to ask, would let the next call's output past the hook unjudged (a
+    Monitor's mark was taken by a Bash call in just this way, #41). Cursor's hook is not given
+    the output in a form that can be compared and passes none; nothing can be withheld there by
+    then anyway. A mark nobody came for is not believed after a quarter of an hour."""
+    import hashlib
+    key = hashlib.sha256(f"{session}\0{command}\0{output}".encode("utf-8", "replace")).hexdigest()[:32]
+    p = cfg.state_dir / "judged" / key
+    if mark:
+        _private_dir(p.parent)
+        p.touch(mode=0o600)
+        os.utime(p)
+        return True
+    try:
+        fresh = time.time() - p.stat().st_mtime < _MARK_SECONDS
+        p.unlink()
+        return fresh
+    except OSError:
+        return False
 
 
 def released(cfg) -> frozenset:
@@ -120,10 +166,14 @@ def release(cfg, qid: str) -> tuple[str, list[Path]]:
     a web page summarised afresh on every fetch, or an answer with a timestamp in it, never
     comes back the same, so waiting for it to be repeated would release nothing. What the agent
     reads is exactly what the owner read."""
+    import base64
     import hashlib
-    from . import toolio
     rec = json.loads((cfg.quarantine_dir / f"{qid}.json").read_text())
-    text, images = toolio.text_of(rec.get("tool", ""), rec.get("raw"))
+    if "text" in rec:
+        text, images = rec["text"], [base64.b64decode(i) for i in rec.get("images", [])]
+    else:  # an entry written before the text was kept: a Claude Code result
+        from . import toolio
+        text, images = toolio.text_of(rec.get("tool", ""), rec.get("raw"))
     if cfg.released_dir.is_symlink():
         raise OSError(f"{cfg.released_dir} is a symbolic link; refusing to write released originals through it")
     _private_dir(cfg.released_dir)
@@ -204,10 +254,14 @@ def session(cfg, session_id: str) -> dict:
 
 
 def session_update(cfg, session_id: str, *, paths: list = (), external: bool = False,
-                   flagged: str = "") -> None:
+                   flagged: str = "", tasks: list = ()) -> None:
+    """tasks: background tasks whose command was outside content. What they print is that too,
+    whenever and by whatever tool the agent picks it up."""
     with _locked(_session_file(cfg, session_id), UNREADABLE_SESSION) as s:
         if paths:
             s["paths"] = list(dict.fromkeys([*s.get("paths", []), *paths]))[-500:]
+        if tasks:
+            s["tasks"] = list(dict.fromkeys([*s.get("tasks", []), *map(str, tasks)]))[-200:]
         if external:
             s["external"] = s.get("external", 0) + 1
         if flagged:

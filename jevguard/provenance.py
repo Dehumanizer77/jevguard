@@ -27,20 +27,86 @@ from .shell import canonical, under
 
 # Commands that only ever talk to a remote service.
 _REMOTE_TOOL = re.compile(r"(?:^|[\s;|&(])(?:rtk\s+)?(?:gh|himalaya|yt-dlp|lynx|w3m|notmuch)\b")
-_URL = re.compile(r"\b(?:https?|wss?|ftp)://([^\s/'\"<>|;&)\\]+)", re.I)
 _PRIVATE_SUFFIX = (".local", ".lan", ".home", ".internal", ".localdomain", ".home.arpa")
 
+# An address that names this machine or a host on this network is not sent for scoring (unless
+# scan_private_hosts), and a Monitor on one is not asked about. That is an exemption, so the
+# address has to name such a host beyond doubt, to every program that might be given it. It is
+# decided here and nowhere else.
+#
+# What went wrong before. The host was read with an expression made for the text of a shell
+# command, which stops at `;` and `&`: `ws://localhost;events.example.com/` was "localhost". And
+# a host with no dot in it counted as a name on the local network, though 134744072 is 8.8.8.8
+# to curl and to a browser, as are 0x08080808 and 010.8.8.8 in their ways.
+_ADDRESS = re.compile(r"(?:https?|wss?|ftp)://([^/?#]*)", re.I)
+_AUTHORITY = re.compile(r"(?:[A-Za-z0-9._~%!$&'()*+,;=:-]*@)?"                 # user and password: what RFC 3986 allows there
+                        r"(\[[0-9A-Fa-f:.]{2,45}\]|[A-Za-z0-9.-]{1,253})"       # a bracketed IPv6 address, or a name or IPv4 address
+                        r"(?::\d{1,5})?")                                       # a port
+_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
+_NUMBER = re.compile(r"0x[0-9a-f]*|\d+")
+_SCHEME = re.compile(r"\b(?:https?|wss?|ftp)://", re.I)
+_URL_IN_TEXT = re.compile(r"\b(?:https?|wss?|ftp)://\S*", re.I)
+
+
+def _private_ip(ip) -> bool:
+    ip = getattr(ip, "ipv4_mapped", None) or ip  # ::ffff:8.8.8.8 is 8.8.8.8
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
 def private_host(host: str) -> bool:
-    host = host.rsplit("@", 1)[-1].lower()
-    if host.startswith("["):  # [::1]:8080
-        host = host[1:].split("]", 1)[0]
-    elif host.count(":") == 1:
-        host = host.split(":", 1)[0]
+    """host: a name, an IPv4 address or a bracketed IPv6 address, and nothing else."""
+    host = host.lower()
+    if host.startswith("["):
+        try:
+            return _private_ip(ipaddress.ip_address(host[1:-1])) if host.endswith("]") else False
+        except ValueError:
+            return False
+    host = host[:-1] if host.endswith(".") else host
+    labels = host.split(".")
+    if not host or not all(_LABEL.fullmatch(label) for label in labels):
+        return False
+    if all(_NUMBER.fullmatch(label) for label in labels):
+        # Nothing but numbers: an IP address to whatever is given it, in one of the many ways of
+        # writing one (2130706433, 0x7f.1, 127.1, 010.0.0.1). Only the plain four-part form is
+        # taken at its word here; the others are not taken for private.
+        try:
+            return _private_ip(ipaddress.IPv4Address(host))
+        except ValueError:
+            return False
+    return host == "localhost" or len(labels) == 1 or host.endswith(_PRIVATE_SUFFIX)
+
+
+def private_address(url) -> bool:
+    """The address names, beyond doubt, this machine or a host on this network: a scheme, then
+    nothing but an optional user part, a host and an optional port up to the first `/`, `?` or
+    `#`, and that host a private one. Anything a program might read another way (a backslash, a
+    semicolon in the host, a number that is an address in disguise) is not."""
+    found = _ADDRESS.match(url) if isinstance(url, str) else None
+    if not found or url[found.end():found.end() + 1] not in ("", "/"):
+        return False  # `http://localhost#@other.example/` is localhost by the book and has not been to every program
+    clean = _AUTHORITY.fullmatch(found.group(1))
+    port = clean.group(0).rsplit(":", 1)[-1] if clean and re.search(r":\d+\Z", clean.group(0)) else "0"
+    return bool(clean) and int(port) < 65536 and private_host(clean.group(1))
+
+
+def _addresses(cmd: str) -> list[str]:
+    """Every address a shell command may be handing to a program, read both ways there are of
+    reading it. As the text stands: from the scheme to the next space, without a quote, bracket
+    or semicolon that closes it. And as the shell would hand it over: an argument that is an
+    address is that whole argument, whatever is in it (`'http://local host/'`,
+    `http://local"host.example.com"/`). A command is taken to stay on this machine or network
+    only if every one of these is private."""
+    found = [m.group(0).rstrip("'\");,") for m in _URL_IN_TEXT.finditer(cmd)]
     try:
-        ip = ipaddress.ip_address(host)
-        return ip.is_private or ip.is_loopback or ip.is_link_local
-    except ValueError:
-        return host == "localhost" or "." not in host or host.endswith(_PRIVATE_SUFFIX)
+        for argv in shell.read(cmd, "").programs:
+            for arg in argv:
+                if _SCHEME.match(arg):
+                    found.append(arg)  # an argument that is an address: all of it, spaces and quotes and all
+                else:
+                    found += [m.group(0).rstrip("'\");,") for m in _URL_IN_TEXT.finditer(arg)]
+    except Exception:
+        pass  # the text has been read; a command the reader cannot take apart is not assumed local elsewhere
+    return found
 
 
 _DEFAULT_PORT = {"http": 80, "https": 443}
@@ -99,8 +165,10 @@ def fetches_outside(cmd: str, scan_private_hosts: bool = False) -> bool:
     """The command reads from a public address: a literal URL of a public host, or a tool that
     only talks to a remote service. A fetch whose address is not visible in the command (a
     variable, a script) counts as local: its output may be private data from this network."""
-    hosts = _URL.findall(cmd)
-    if any(scan_private_hosts or not private_host(h) for h in hosts):
+    # A `;` may end the command or, inside quotes, belong to the address; a quote may close the
+    # address or splice two halves of a host together. An address that is private on one reading
+    # only is not taken for private.
+    if any(scan_private_hosts or not private_address(u) for u in _addresses(cmd)):
         return True
     return bool(_REMOTE_TOOL.search(cmd))
 
@@ -283,8 +351,7 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
     if tool in ("WebFetch", "WebSearch") or tool.startswith("mcp__"):
         if tool == "WebFetch":
             url = str(tool_input.get("url") or "")
-            m = _URL.match(url)
-            if m and private_host(m.group(1)) and not cfg.scan_private_hosts:
+            if private_address(url) and not cfg.scan_private_hosts:
                 return "local"
             if trusted_source(url, cfg.trusted_sources):
                 return "trusted"

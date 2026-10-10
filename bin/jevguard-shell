@@ -1,0 +1,17 @@
+#!/bin/sh
+# jevguard-shell: Claude Code's CLAUDE_CODE_SHELL_PREFIX. Claude Code starts every shell command
+# of a tool, and every hook, as `jevguard-shell '<the whole line>'`, and takes what this prints
+# for the command's output. See jevguard/shellwrap.py.
+#
+# Every shell command depends on this file. It does as little as can be done here and runs the
+# line as it is whenever something is not as expected. If it ever stands in the way, take the
+# CLAUDE_CODE_SHELL_PREFIX line out of ~/.claude/settings.json and start Claude Code again.
+case "${SHELL##*/}" in bash|zsh) shell=$SHELL ;; *) shell=/bin/bash ;; esac
+[ "$#" -eq 1 ] || exec "$@"
+case "$1" in
+  *" eval "*)   # a tool's command; a hook's has no eval around it
+    wrap="${0%/*}/jevguard-shellwrap"
+    if [ -x "$wrap" ] && [ -x /usr/bin/python3 ]; then exec "$wrap" "$shell" "$1"; fi
+    ;;
+esac
+exec "$shell" -c "$1"

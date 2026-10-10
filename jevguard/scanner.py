@@ -73,7 +73,10 @@ def unscanned(flag: str, reason: str) -> dict:
 class Scanner:
     def __init__(self, cfg, key: str):
         self.policy, self.policy_id = load_policy()
-        firstparty.use(cfg)
+        try:
+            firstparty.use(cfg)  # the seal key: with it the guard's own sealed text is taken out before scoring
+        except Exception:
+            pass  # without it nothing is taken out; that the key cannot be read or made is no reason not to scan
         self.jev = JevDetector(key, model=cfg.model, questions=self.policy.questions, timeout=cfg.timeout,
                                attempts=2, url=cfg.url, max_wait=cfg.deadline)
         self.deadline_s = cfg.deadline
