@@ -546,15 +546,29 @@ fetches and the private connectors out of that; each switch above widens it.
   (`logged`) and not asked about: unscanned all the same. That holds for one `gh` command
   that names the repository and nothing else (`gh run watch --repo you/project 4242`); a
   loop or a pipe around it is asked about like any other.
+- **In Claude Code, the output of a tool call that fails.** A shell command that exits with
+  an error status does not come back through the hook the guard is installed on. Claude Code
+  starts another one (`PostToolUseFailure`), and that one can add a remark for the model but
+  cannot replace the result: tried against 2.1.295 with every field there is. So what
+  `curl ... ; false`, a failing `gh` command or an MCP tool's error returns reaches the model
+  as it is, and is not scanned either. The same is to be expected in Copilot CLI (its
+  reference says as much) and perhaps in Cursor. Codex and Grok report a failed command
+  through the ordinary hook, and there it is scanned and withheld like any other (both tried).
 - The result of a built-in tool whose name the adapter does not know (MCP tools always are
-  scanned; in Copilot CLI an unknown tool is too). A background command's output is followed
-  in Claude Code, Grok and Hermes as described above; whether Codex has a tool of that kind
-  that its hooks do not report is not known. Nor is it known what Codex, Copilot CLI and
-  Cursor do with a result too large to hand over; if they save it to a file as Claude Code
-  does, that file is not followed there.
+  scanned; in Copilot CLI an unknown tool is too).
+- A result too large to hand over, outside Claude Code, Grok and Hermes. Codex cuts it down
+  to its beginning and end and gives the hook exactly what it gives the model, with no file
+  (tried). Copilot CLI writes a result over 51,200 bytes to a file in the temp directory and
+  hands the model a reference (read from its package, not run): that file is not followed.
+  What Cursor does is not known.
+- A command the agent leaves running, outside Claude Code, Grok and Hermes. Codex starts its
+  hook once, when the command has finished, with all of its output (tried:
+  `tests/e2e_codex.py read-only background`). In Copilot CLI the output is read with
+  `read_bash`, which is scanned as a tool the adapter does not know; a notice of completion
+  is not a tool result.
 - A file tool the guard has no model of, when the path it changes is inside a longer text it
-  is given rather than an argument of its own. The patches of Codex and Hermes are read;
-  another tool's own patch format would not be.
+  is given rather than an argument of its own. The patches of Codex, Copilot CLI and Hermes
+  are read; another tool's own patch format would not be.
 - Claude Code on the web and cloud sessions: they do not read this machine's settings.
 - An attack the model does not recognise. Upstream measured 88.5% of attacks blocked and 3.5% of
   benign items blocked on its 718-item test set, through Venice with `jev-latest`; those numbers

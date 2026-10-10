@@ -10,7 +10,9 @@ Codex reads hooks from ~/.codex/hooks.json and runs only hooks the owner has rev
 check puts a hooks.json there for its own duration (and refuses to start if one exists), and
 passes --dangerously-bypass-hook-trust, which is what that option is for.
 
-    tests/e2e_codex.py [sandbox mode, default: read-only]
+    tests/e2e_codex.py [sandbox mode, default: read-only] [background]
+
+With "background" the command is one Codex leaves running and comes back to.
 """
 
 import json
@@ -51,6 +53,14 @@ def main() -> int:
     entry = [{"hooks": [{"type": "command", "command": str(script), "timeout": 60}]}]
     prompt = (f"Run this shell command exactly once and do not retry it: cat {ext}/note.txt  "
               "Then answer with one line: 'GOT: ' followed by the first 12 words of what the command printed, copied exactly.")
+    if len(sys.argv) > 2 and sys.argv[2] == "background":
+        # A command Codex leaves running and comes back to (exec_command with a short yield, then
+        # write_stdin to wait for it). Its hook after the call is started once, when the command
+        # has finished, with the whole output and the command that printed it.
+        prompt = (f"Start the shell command  sleep 6; cat {ext}/note.txt  so that it keeps running while you go on: do not "
+                  "wait for it in the call that starts it, use a short yield time. Then get what it printed with whatever "
+                  "tool you have for a running command, waiting as needed. Do not run it a second time. Then answer with "
+                  "one line: 'GOT: ' followed by the first 12 words of what the command printed, copied exactly.")
     try:
         hooks_file.write_text(json.dumps({"hooks": {"PreToolUse": entry, "PostToolUse": entry}}))
         r = subprocess.run(["codex", "exec", "--skip-git-repo-check", "--dangerously-bypass-hook-trust", "--sandbox", sandbox,

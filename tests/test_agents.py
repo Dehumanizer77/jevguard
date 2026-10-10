@@ -140,6 +140,24 @@ def test_copilot_result_is_replaced_and_a_call_is_asked_about(guard, ext):
     assert out["permissionDecision"] == "ask" and out["modifiedArgs"]["command"].startswith("# jevguard: CHANGES THE GUARD\n")
 
 
+def test_copilot_edit_tools_named_in_its_reference_reach_the_gate(guard, tmp_path):
+    """str_replace_editor, apply_patch and rg are in the hooks reference beside edit and grep."""
+    cfg = str(guard.home / "config" / "config.json")
+
+    def before(tool, args):
+        out = guard.raw({"sessionId": "c1", "timestamp": 1, "cwd": "/work", "toolName": tool, "toolArgs": args}, "--agent", "copilot")
+        return out["permissionDecision"] if out else None
+
+    assert before("str_replace_editor", {"path": cfg, "old_str": "a", "new_str": "b"}) == "ask"
+    assert before("str_replace_editor", {"path": str(tmp_path / "a.txt"), "old_str": "a", "new_str": "b"}) is None
+    patch = f"*** Begin Patch\n*** Update File: {cfg}\n@@\n-a\n+b\n*** End Patch"
+    assert before("apply_patch", {"patch": patch}) == "ask" and before("apply_patch", {"input": patch}) == "ask"
+    assert before("apply_patch", patch) == "ask"                          # the patch as the whole argument
+    assert before("apply_patch", {"patch": patch.replace(cfg, str(tmp_path / "a.txt"))}) is None
+    assert before("apply_patch", {"something": "else"}) == "ask"          # no patch to be found in it: held
+    assert before("rg", {"pattern": "apikey", "path": str(guard.home / "config")}) == "ask"
+
+
 # ---- Codex CLI ------------------------------------------------------------------------------------
 def codex(event, tool, tool_input, response=None):
     """Input as codex 0.160.0 really sends it (recorded 2026-10-10): the shell is "Bash" and its
