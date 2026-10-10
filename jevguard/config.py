@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +40,12 @@ DEFAULTS = {
     # without being one: documentation about hooks, articles about prompt injection. Whatever such
     # an address returns later, or redirects to, passes unread by anyone; keep the prefixes narrow.
     "trusted_sources": [],
+    # Your own GitHub repositories, as "owner/name" or "owner/*". What `gh` returns about them is
+    # still scanned, but withheld only from own_repos_block up instead of the policy level: short
+    # status lines and one's own commit titles score in between. Not an exemption: anyone can
+    # write an issue or a comment in a public repository.
+    "own_repos": [],
+    "own_repos_block": 0.6,
     # When scanning fails: "open" passes the result, "closed" withholds outside content.
     "on_error": "open",
     # Ask before any call that would change the guard: its settings, state, release list, code,
@@ -54,6 +61,9 @@ DEFAULTS = {
     # every later output that happens to contain such a word would be sent for scoring.
     "track_missing_files": False,
 }
+
+
+_OWN_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?:\*|[A-Za-z0-9._-]+)")  # no wildcard for the owner
 
 
 def root() -> tuple[Path, Path]:
@@ -83,6 +93,9 @@ def load() -> SimpleNamespace:
     for source in values["trusted_sources"]:
         if not isinstance(source, str) or not source.lower().startswith(("https://", "http://")):
             raise ValueError(f"{path}: trusted_sources takes URL prefixes starting with https:// or http://")
+    for repo in values["own_repos"]:
+        if not isinstance(repo, str) or not _OWN_REPO.fullmatch(repo):
+            raise ValueError(f'{path}: own_repos takes "owner/name" or "owner/*", not {repo!r}')
     cfg = SimpleNamespace(**values)
     cfg.config_dir, cfg.state_dir, cfg.config_file = cfg_dir, state_dir, path
     if os.environ.get("JEVGUARD_HOME") and values["key_file"] == DEFAULTS["key_file"]:

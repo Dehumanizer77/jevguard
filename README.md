@@ -260,6 +260,16 @@ every public address is on the list. Keep the prefixes narrow: whatever such an 
 later, or redirects to, reaches Claude unread by anyone. For MCP tools the equivalent is the
 `warn_tools` setting.
 
+`gh` is a special case. Everything it prints counts as outside content, and short status lines
+and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false` scored 0.38. List
+your own repositories in `own_repos` (`"acme/*"`, `"solo/tool"`) and what `gh` returns about
+them is withheld only from 0.6 up; between 0.38 and 0.6 it is logged as flagged. The reply to a
+change the command itself made there (`gh pr create`, `gh api -X PATCH`) is only logged. This is
+deliberately not an exemption: anyone can open an issue or write a comment in a public
+repository, and a clear injection scores near 1 either way. A command counts only when its
+repository is plain to see (`--repo`, an `api repos/owner/name/...` path, or the checkout it
+runs in) and it fetches nothing else.
+
 `show` and `release` are for you, reading what was blocked. They refuse to run without a
 terminal or when started from inside Claude Code, and the hook asks you before any call that
 runs them. Neither is a lock; see the limits below.
@@ -285,6 +295,8 @@ longer recognises them as its own.
 | `skip_tools` | claude.ai Gmail, Drive, Calendar, Docs connectors | tool-name patterns never scanned |
 | `warn_tools` | `[]` | tool-name patterns that are scanned and logged, never withheld |
 | `trusted_sources` | `[]` | URL prefixes whose content is scanned and logged, never withheld (`jevguard trust`) |
+| `own_repos` | `[]` | your own GitHub repositories, as `owner/name` or `owner/*`; what `gh` returns about them is withheld only from `own_repos_block` up |
+| `own_repos_block` | `0.6` | that level |
 | `on_error` | `open` | `closed` withholds outside content that could not be fully scanned: the API failed, the guard hit an error, or part of the result was unreadable (block mode). Without `tesseract` that includes every image from outside |
 | `protect_guard` | `true` | ask before any call that would change the guard or the Claude Code settings that run it |
 | `daily_token_budget` | 5,000,000 | scanning stops for the day beyond this |

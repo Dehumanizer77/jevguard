@@ -25,7 +25,9 @@ class _Jev(BaseHTTPRequestHandler):
             self.send_response(self.server.status)
             self.end_headers()
             return
-        p = 0.97 if "ignore your previous instructions" in str(body["state"]).lower() else 0.02
+        state = str(body["state"]).lower()
+        # 0.5 stands for the short status lines and commit titles that scored 0.38 to 0.57 live
+        p = 0.97 if "ignore your previous instructions" in state else 0.5 if "borderline-sample" in state else 0.02
         answers = {}
         for name, q in body["questions"].items():
             if q["type"] == "choice":

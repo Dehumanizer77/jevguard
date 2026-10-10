@@ -176,6 +176,7 @@ def cmd_status(cfg, a) -> int:
     print(f"scan local content: {cfg.scan_local}   private hosts: {cfg.scan_private_hosts}   "
           f"track clones: {cfg.track_clones}")
     print("trusted sources (never withheld): " + (", ".join(cfg.trusted_sources) or "none"))
+    print(f"own repositories (gh output withheld from {cfg.own_repos_block} up): " + (", ".join(cfg.own_repos) or "none"))
     print(f"tokens today: {today:,} of {cfg.daily_token_budget:,}")
     blocked_by = store.scanner_available(cfg)
     if blocked_by:

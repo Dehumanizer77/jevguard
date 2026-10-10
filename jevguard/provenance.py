@@ -6,6 +6,8 @@
 "local":    files on this machine and output of local commands.
 "trusted":  outside content from an address the owner put on the trusted list: scanned and
             logged like any other, never withheld.
+"own":      what `gh` returns about the owner's own repositories: withheld only from a higher
+            score up. "echo": the reply to a change the command itself made there; never withheld.
 "local":    files on this machine and output of local commands.
 "warn":     output of commands that only report on the agent's own work; never blocked.
 None:       not scanned at all.
@@ -201,6 +203,32 @@ def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: lis
     return mentions(output, roots, c.dirs)
 
 
+_OTHER_REMOTE = {"himalaya", "yt-dlp", "lynx", "w3m", "notmuch"}
+
+
+def _own_repo_mode(cmd: str, cwd: str, cfg) -> str | None:
+    """"own" when the only thing the command fetches is `gh` output about the owner's own
+    repositories; "echo" when all of it is the reply to a change the command itself made there
+    (gh pr create, gh api -X PATCH); None when anything about the command is not plain: another
+    remote tool, a repository that cannot be told, a value computed at run time."""
+    if "GH_REPO" in cmd or "GH_HOST" in cmd:
+        return None
+    try:
+        c = shell.read(cmd, cwd)
+    except Exception:
+        return None
+    programs = [(os.path.basename(argv[0]), argv, dirs) for argv, dirs in zip(c.programs, c.program_dirs)]
+    calls = [(argv, dirs) for name, argv, dirs in programs if name == "gh"]
+    if not calls or c.dynamic or any(name in _OTHER_REMOTE for name, _, _ in programs):
+        return None
+    from . import gate, github
+    for argv, dirs in calls:
+        repos = github.gh_repos(argv, dirs)
+        if not repos or not all(github.is_own(r, cfg.own_repos) for r in repos):
+            return None
+    return "echo" if all(gate._gh_changes(argv[1:]) for argv, _ in calls) else "own"
+
+
 def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str], output: str = "") -> str | None:
     """output is the text of the result: a search over local directories that returns lines from
     an outside file is outside content, and only the result shows that."""
@@ -229,6 +257,8 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
                       if cfg.scan_private_hosts or not private_host(_URL.match(u).group(1))]
             if public and not _REMOTE_TOOL.search(cmd) and all(trusted_source(u, cfg.trusted_sources) for u in public):
                 return "trusted"
+            if not public and cfg.own_repos:
+                return _own_repo_mode(cmd, cwd, cfg) or "external"
             return "external"
         return "warn" if trusted_command(cmd, set(cfg.trusted_commands)) else "local"
     if tool in ("Read", "Grep"):
