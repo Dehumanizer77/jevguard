@@ -127,6 +127,27 @@ def install(cfg, settings_path: Path, remove: bool = False) -> str:
     return f"updated {settings_path}" + (f" (backup: {backup.name})" if backup else "")
 
 
+def cmd_own(cfg, a) -> int:
+    """Put repositories on the list of the owner's own, or take them off. A command of its own so
+    that the change can be asked about as `jevguard own 'acme/*'`, which says what it does, and
+    not as a script that rewrites the settings file."""
+    user = json.loads(cfg.config_file.read_text()) if cfg.config_file.exists() else {}
+    repos = [r for r in user.get("own_repos", []) if r not in a.repos]
+    if a.cmd == "own":
+        if not all(config._OWN_REPO.fullmatch(r) for r in a.repos):
+            print('give repositories as "owner/name" or "owner/*", for example acme/widget', file=sys.stderr)
+            return 1
+        repos = [*user.get("own_repos", []), *(r for r in a.repos if r not in user.get("own_repos", []))]
+    user["own_repos"] = repos
+    cfg.config_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cfg.config_file.write_text(json.dumps(user, indent=2) + "\n")
+    print("own repositories: " + (", ".join(repos) or "none"))
+    if a.cmd == "own":
+        print(f"what one `gh` command naming such a repository returns is withheld from {cfg.own_repos_block} up "
+              "instead of the usual level; it is still scanned")
+    return 0
+
+
 def cmd_trust(cfg, a) -> int:
     """Put a URL prefix on the trusted list, or take it off. Content from a trusted address is
     scanned and logged as before; it is no longer withheld."""
@@ -345,6 +366,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("prefix")
     p = sub.add_parser("untrust", help="take an address off the trusted list")
     p.add_argument("prefix")
+    p = sub.add_parser("own", help='list GitHub repositories as your own ("owner/name" or "owner/*"): '
+                                   "gh output about them is withheld from a higher score up")
+    p.add_argument("repos", nargs="+")
+    p = sub.add_parser("disown", help="take repositories off that list")
+    p.add_argument("repos", nargs="+")
     a = ap.parse_args(argv)
     cfg = config.load()
     if a.cmd in ("mode", "gate"):
@@ -352,6 +378,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.cmd in ("trust", "untrust"):
         return cmd_trust(cfg, a)
+    if a.cmd in ("own", "disown"):
+        return cmd_own(cfg, a)
     if a.cmd in ("install", "uninstall"):
         print(install(cfg, a.settings, remove=a.cmd == "uninstall"))
         return 0

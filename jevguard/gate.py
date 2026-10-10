@@ -37,7 +37,7 @@ _STARTUP = re.compile(r"(?:^|/)(?:\.ssh(?:/|$)|\.claude/(?:hooks(?:/|$)|CLAUDE\.
                       r"\.curlrc$|\.config/curlrc$|\.wgetrc$|\.netrc$|\.config/gh(?:/|$))")
 # Claude Code settings files: the hooks live there, and one line in any of them switches hooks off.
 _SETTINGS = re.compile(r"(?:^|/)\.claude/settings[^/]*\.json$")
-_ADMIN = {"mode", "gate", "install", "uninstall", "release", "show", "trust", "untrust"}
+_ADMIN = {"mode", "gate", "install", "uninstall", "release", "show", "trust", "untrust", "own", "disown"}
 # The same commands named inside code the reader cannot take apart: os.system("jevguard uninstall"),
 # ['.../jevguard', 'release', id], python3 -m jevguard.cli mode block. Only where the word stands
 # as the program and the subcommand is its next argument. The first version matched any of those

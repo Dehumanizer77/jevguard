@@ -179,7 +179,10 @@ def test_gate_logs_then_asks(guard):
     assert guard.hook("PreToolUse", "Bash", push) is None  # read outside content, nothing flagged
     guard.hook("PostToolUse", "WebFetch", FETCH, webfetch(ATTACK))
     out = guard.hook("PreToolUse", "Bash", push)["hookSpecificOutput"]
-    assert out["permissionDecision"] == "ask" and "updatedInput" not in out
+    assert out["permissionDecision"] == "ask"
+    # the command is passed on as it was, under comment lines that say why it is asked about
+    assert out["updatedInput"]["command"].endswith("\ngit push origin main")
+    assert out["updatedInput"]["command"].startswith("# jevguard: RISKY AFTER OUTSIDE CONTENT\n")
     assert guard.hook("PreToolUse", "Bash", {"command": "ls -la"}) is None
     assert guard.hook("PreToolUse", "Bash", push, session="other") is None
 
