@@ -85,13 +85,20 @@ def content_hash(text: str, images: list) -> str:
     return h.hexdigest()
 
 
-def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str) -> str:
+def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str,
+               text: str | None = None, images: list = ()) -> str:
+    """Keep a withheld result. raw is the result as the agent gave it; text and images are what
+    the model would have read of it. Those are kept as well, so that a release can hand the
+    original over without knowing how that agent shapes its results."""
+    import base64
     qid = f"fw-{time.strftime('%Y%m%d')}-{os.urandom(3).hex()}"
+    rec = {"tool": tool, "tool_input": tool_input, "verdict": verdict, "content_sha256": digest, "raw": raw}
+    if text is not None:
+        rec.update(text=text, images=[base64.b64encode(i).decode() for i in images])
     p = _private_dir(cfg.quarantine_dir) / f"{qid}.json"
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
-        json.dump({"tool": tool, "tool_input": tool_input, "verdict": verdict,
-                   "content_sha256": digest, "raw": raw}, f, ensure_ascii=False)
+        json.dump(rec, f, ensure_ascii=False, default=str)
     return qid
 
 
@@ -120,10 +127,14 @@ def release(cfg, qid: str) -> tuple[str, list[Path]]:
     a web page summarised afresh on every fetch, or an answer with a timestamp in it, never
     comes back the same, so waiting for it to be repeated would release nothing. What the agent
     reads is exactly what the owner read."""
+    import base64
     import hashlib
-    from . import toolio
     rec = json.loads((cfg.quarantine_dir / f"{qid}.json").read_text())
-    text, images = toolio.text_of(rec.get("tool", ""), rec.get("raw"))
+    if "text" in rec:
+        text, images = rec["text"], [base64.b64decode(i) for i in rec.get("images", [])]
+    else:  # an entry written before the text was kept: a Claude Code result
+        from . import toolio
+        text, images = toolio.text_of(rec.get("tool", ""), rec.get("raw"))
     if cfg.released_dir.is_symlink():
         raise OSError(f"{cfg.released_dir} is a symbolic link; refusing to write released originals through it")
     _private_dir(cfg.released_dir)
