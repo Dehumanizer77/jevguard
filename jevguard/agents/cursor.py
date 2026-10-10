@@ -6,9 +6,12 @@ conversation_id, hook_event_name and workspace_roots. What each event allows dec
 guard does there:
 
     preToolUse            {tool_name: "Shell", tool_input: {command, working_directory}}
-                          may rewrite the input (updated_input); "ask" is accepted but not enforced.
-                          The guard rewrites a shell command to run through `jevguard-run`, because
-                          nothing later can replace what it printed.
+                          may allow or deny, and rewrite the input (updated_input); "ask" is
+                          accepted but not enforced. The guard rewrites a shell command to run
+                          through `jevguard-run`, because nothing later can replace what it
+                          printed. For the tools that have no event of their own (Write, Delete,
+                          any other) this is also where the gate stands: what it would ask about
+                          is refused.
     beforeShellExecution  {command, cwd}            may answer permission: allow | deny | ask
                           The gate asks here.
     beforeMCPExecution    {tool_name, tool_input}   the same
@@ -17,7 +20,8 @@ guard does there:
                           scores as an injection is refused. So is one of the guard's own
                           files (the API key): the gate would ask, and here it cannot.
     postToolUse           {tool_name, tool_input, tool_output}
-                          may replace an MCP tool's output (updated_mcp_tool_output), no other.
+                          may replace an MCP tool's output (updated_mcp_tool_output, an object),
+                          no other.
 
 So in Cursor the guard replaces MCP results, refuses file reads, wraps shell commands, and
 cannot do anything about the results of Cursor's own web tools except log them.
@@ -79,7 +83,10 @@ class Cursor(Agent):
             call.given, call.wrapped = given, False
         call.ids["native_tool"] = native
         if event == "preToolUse":
-            return "rewrite", call  # no question is enforced here; only the shell command is rewritten
+            # Shell and MCP calls are asked about at their own events, where Cursor does ask; here
+            # only the shell command is rewritten. Every other tool (Write, Delete, one this
+            # adapter has no name for) has no event but this one, so it is gated here.
+            return ("rewrite" if tool == "Bash" or tool.startswith("mcp__") else "before"), call
         if tool == "Read":
             return None  # judged before the read
         if call.wrapped:
@@ -110,22 +117,31 @@ class Cursor(Agent):
                 return {"permission": "deny", "user_message": "jevguard withheld this file: it scores as a prompt injection. "
                                                               "See `jevguard log`."}
             if call.tool.startswith("mcp__"):
-                return {"updated_mcp_tool_output": decision.notice}
+                # An object, as the hooks page has it, and nothing of the original result in it.
+                return {"updated_mcp_tool_output": {"content": [{"type": "text", "text": decision.notice}]}}
             return None  # Cursor lets a hook replace nothing else; the log has it
         message = f"jevguard: {decision.reason}"
         if event == "beforeReadFile":  # allow or deny, nothing between
-            message += " Cursor cannot ask before a file is read, so it was not read."
+            return {"permission": "deny", "user_message": message + " Cursor cannot ask before a file is read, so it was not read."}
+        if event == "preToolUse":      # "ask" is accepted here and not enforced
+            message += " Cursor cannot ask at this point, so the call was refused; the owner can make the change himself."
             return {"permission": "deny", "user_message": message, "agent_message": message}
         return {"permission": "ask", "user_message": message, "agent_message": message}
 
     def untouched(self, d: dict, phase: str, call: Call) -> dict | None:
         from .. import config
-        if phase != "rewrite" or call.tool != "Bash" or call.wrapped or not call.tool_input.get("command"):
+        given = call.given.get("command") if phase == "rewrite" and call.tool == "Bash" else None
+        if not isinstance(given, str) or not call.tool_input.get("command"):
             return None
-        if not run.wanted(call, config.load()):
+        cfg = config.load()
+        closed = cfg.on_error == "closed"   # goes into the command: the wrapper may not be able to read it
+        inner = run.unwrap(given)
+        if inner is not None and given == run.wrap(inner, self.name, call.session, closed):
+            return None  # the wrapper this hook wrote for this conversation, and nothing else
+        if not run.wanted(call, cfg):
             return None
-        return {"permission": "allow",
-                "updated_input": {**call.given, "command": run.wrap(call.tool_input["command"], self.name, call.session)}}
+        # Anything else is a command like any other and is wrapped whole, a wrapper inside it included.
+        return {"permission": "allow", "updated_input": {**call.given, "command": run.wrap(given, self.name, call.session, closed)}}
 
 
 AGENT = Cursor()

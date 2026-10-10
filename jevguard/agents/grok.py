@@ -23,45 +23,74 @@ ask (permissionDecision "ask") and rewrite the input (updatedInput), as in Claud
 from __future__ import annotations
 
 import os
+import re
 
-from .. import engine
+from .. import engine, toolio
 from ..engine import Call, Decision
 from . import Agent
 
 NATIVE_HOOKS = os.path.join("~", ".grok", "hooks", "jevguard.json")
 _TOOLS = {"run_terminal_command": "Bash", "read_file": "Read", "grep": "Grep", "list_dir": "Grep",
           "web_fetch": "WebFetch", "web_search": "WebSearch", "search_replace": "Edit", "write_file": "Write"}
-# Fields of a result that repeat the call (kept as they are, and not text the model is given to
-# read), and fields that point at a copy of the original output (emptied in a replacement).
-_ECHO = {"type", "command", "description", "current_dir", "absolute_path", "absolute_root_path", "url",
-         "content_type", "pattern", "path", "query", "target_file", "target_directory"}
-_POINTERS = {"output_file"}
+# A built-in tool's result repeats parts of the call beside what the tool brought in (the command,
+# its description, the address), carries its own tag, and may point at a copy of the output. Those
+# are not text to scan and stay as they are in a replacement. But a field is taken for one of them
+# by its value, never by its name: the tag has to be one of Grok's tags, a repeat has to say what
+# the call said. The first version went by the name, and any result with a field called
+# "description" or "url" had that field passed over.
+_TAG = re.compile(r"[A-Za-z]{1,30}")  # "Bash", "ReadFile", "GrepSearch", "ListDir", "WebFetch": one word
+_POINTER = "output_file"  # where Grok keeps the whole output; emptied in a replacement
+_MEDIA_TYPE = re.compile(r"(?:text|image|audio|video|application|font|model|multipart|message)/[A-Za-z0-9.+-]{1,60}"
+                         r"(?:;\s*charset=[A-Za-z0-9._-]{1,30})?")
 
 
 def _is_bytes(o) -> bool:
     return isinstance(o, list) and bool(o) and all(isinstance(x, int) and not isinstance(x, bool) and 0 <= x < 256 for x in o)
 
 
-def _texts(o, out: list, key: str = "") -> None:
-    if key in _ECHO or key in _POINTERS:
-        return
+def said_by(given: dict, cwd: str) -> frozenset:
+    """What the call itself said, in the forms a result repeats it: its arguments, the directory
+    it ran in, and its paths made absolute."""
+    said = {cwd} if cwd else set()
+    for value in given.values():
+        if isinstance(value, str) and value:
+            said.add(value)
+            if not re.search(r"\s", value):
+                full = os.path.join(cwd, os.path.expanduser(value))
+                said.update((os.path.normpath(full), os.path.realpath(full)))
+    return frozenset(said)
+
+
+def _not_content(value: str, key: str, top: bool, said: frozenset) -> bool:
+    if top and key == "type":
+        return bool(_TAG.fullmatch(value))
+    if key == "content_type":  # "text/html; charset=utf-8": the server's, and a media type or it is text
+        return bool(_MEDIA_TYPE.fullmatch(value))
+    if top and key == _POINTER:
+        return not re.search(r"\s", value)  # a path
+    return value in said
+
+
+def _texts(o, out: list, said: frozenset, key: str = "", depth: int = 0) -> None:
     if isinstance(o, str):
-        out.append(o)
+        if not _not_content(o, key, depth == 1, said):
+            out.append(o)
     elif _is_bytes(o):
         out.append(bytes(o).decode("utf-8", "replace"))
     elif isinstance(o, dict):
         for k, v in o.items():
-            _texts(v, out, k)
+            _texts(v, out, said, k, depth + 1)
     elif isinstance(o, list):
         for v in o:
-            _texts(v, out, key)
+            _texts(v, out, said, key, depth)
 
 
-def text_of(result) -> str:
-    """What the model would read of a result. The same text often stands in it two or three
-    times (bytes and rendered, numbered and plain); a text contained in another is left out."""
+def text_of(result, said: frozenset = frozenset()) -> str:
+    """What the model would read of a built-in tool's result. The same text often stands in it
+    two or three times (bytes and rendered, numbered and plain); a text contained in another is
+    left out."""
     found: list = []
-    _texts(result, found)
+    _texts(result, found, said)
     found = sorted({t for t in found if t}, key=len, reverse=True)
     kept: list = []
     for t in found:
@@ -70,19 +99,17 @@ def text_of(result) -> str:
     return "\n".join(kept)
 
 
-def replaced(result, notice: str, key: str = ""):
+def replaced(result, notice: str, said: frozenset = frozenset(), key: str = "", depth: int = 0):
     """The result in its own shape with every text in it swapped for the notice: whichever field
     Grok renders for the model, that is what it finds there."""
-    if key in _ECHO:
-        return result
-    if key in _POINTERS:
-        return "" if isinstance(result, str) else result
     if isinstance(result, str):
-        return notice
+        if depth == 1 and key == _POINTER:
+            return ""
+        return result if _not_content(result, key, depth == 1, said) else notice
     if _is_bytes(result):
         return list(notice.encode())
     if isinstance(result, dict):
-        return {k: replaced(v, notice, k) for k, v in result.items()}
+        return {k: replaced(v, notice, said, k, depth + 1) for k, v in result.items()}
     if isinstance(result, list):
         return [] if any(isinstance(v, (dict, list)) for v in result) else [notice] if result else []
     return result
@@ -117,19 +144,25 @@ class Grok(Agent):
         call = Call(tool, tool_input, str(d.get("sessionId") or d.get("session_id") or ""), str(d.get("cwd") or ""),
                     {"tool_use_id": d.get("toolUseId") or d.get("tool_use_id"), "client": self.name, "native_tool": native},
                     self.title)
-        call.given = given
+        call.given, call.shaped, call.said = given, False, frozenset()
         if event == "PreToolUse":
             return "before", call
         call.raw = d.get("toolResult", d.get("tool_response"))
-        call.text = text_of(call.raw)
+        # Only a built-in tool's own result is read by its shape, and handed back in it. Anything
+        # else (an MCP server's result, whatever it calls its fields or itself) is read whole.
+        call.shaped = native in _TOOLS and isinstance(call.raw, dict)
+        if call.shaped:
+            call.said = said_by(given, call.cwd)
+            call.text = text_of(call.raw, call.said)
+        else:
+            call.text, call.images = toolio.text_of("", call.raw)
         return "after", call
 
     def answer(self, d: dict, phase: str, call: Call, decision: Decision) -> dict | None:
         if decision.action == "replace":
             # An MCP result has no shape to keep: a string becomes the text the model reads. So does
             # an oversized result, which reaches the hook as a plain string.
-            mcp = call.tool.startswith("mcp__") or not isinstance(call.raw, dict)
-            new = decision.notice if mcp else replaced(call.raw, decision.notice)
+            new = replaced(call.raw, decision.notice, call.said) if call.shaped else decision.notice
             return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": new}}
         out = {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                "permissionDecisionReason": f"jevguard: {decision.reason}"}

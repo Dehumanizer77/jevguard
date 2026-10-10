@@ -18,6 +18,9 @@ What a hook may answer is narrower than the schema suggests:
   outside Codex's sandbox, so this works whatever the sandbox allows the command itself.
 - Before a call, "ask" is not supported yet (the call would simply run). Where the guard would
   ask, the call is refused with the reason, and the owner can run it himself.
+
+Codex edits files with apply_patch, whose input is the patch itself: {command: "*** Begin Patch
+...*** End Patch"}. There is no file_path; the files are named in the patch.
 """
 
 from __future__ import annotations
@@ -40,7 +43,13 @@ class Codex(Agent):
         given = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
         tool = "Bash" if native in _SHELL else {"apply_patch": "Edit"}.get(native, native)
         tool_input = dict(given)
-        if isinstance(given.get("command"), str) and tool == "Bash":
+        if native == "apply_patch":
+            # The files it changes are named inside the patch, which arrives as "command" (or as
+            # the whole input). The gate reads them out of it; a patch it cannot read is refused.
+            text = d.get("tool_input") if isinstance(d.get("tool_input"), str) else \
+                next((given[k] for k in ("command", "input", "patch") if isinstance(given.get(k), str)), None)
+            tool_input = {"patch": text}
+        elif isinstance(given.get("command"), str) and tool == "Bash":
             tool_input["command"] = engine.without_own_lines(given["command"])
         call = Call(tool, tool_input, str(d.get("session_id") or ""), str(d.get("cwd") or ""),
                     {"tool_use_id": d.get("tool_use_id"), "client": self.name, "native_tool": native}, self.title)

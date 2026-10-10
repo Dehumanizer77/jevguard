@@ -18,7 +18,15 @@ import binascii
 import re
 import unicodedata
 
-_PLUMBING_KEYS = {"type", "tool_use_id", "mimeType"}
+# Fields that say what kind of thing a block is, not text the model is given to read. A field is
+# passed over only when its value is such a marker; the name of the field proves nothing, and a
+# sentence under "type" or "mimeType" is read like any other text.
+_PLUMBING = {
+    "type": re.compile(r"text|image|audio|video|resource|resource_link|document|file|json|tool_use|tool_result|"
+                       r"web_search_result|web_search_tool_result|search_result"),
+    "mimeType": re.compile(r"(?:text|image|audio|video|application|font|model|multipart|message)/[A-Za-z0-9.+-]{1,60}"),
+    "tool_use_id": re.compile(r"(?=[A-Za-z_]*\d)(?:srv)?toolu_[A-Za-z0-9]{8,48}"),
+}
 _NL_WORD = re.compile(r"[^\W\d_]{2,}")
 _INVISIBLE = dict.fromkeys([0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x180E, *range(0x202A, 0x202F),
                             *range(0x2066, 0x206A), 0x00AD])
@@ -31,21 +39,39 @@ def words(text: str) -> int:
     return len(_NL_WORD.findall(unicodedata.normalize("NFKC", text.translate(_INVISIBLE))))
 
 
-def _leaves(o, out: list, images: list) -> None:
+def _leaves(o, out: list, images: list, key: str = "") -> None:
     if isinstance(o, str):
-        out.append(o)
+        if not (key in _PLUMBING and _PLUMBING[key].fullmatch(o)):
+            out.append(o)
     elif isinstance(o, dict):
+        taken = None
         if o.get("type") == "image":  # MCP image block {type, data, mimeType} or {source: {data}}
-            data = o.get("data") or (o.get("source") or {}).get("data")
-            if isinstance(data, str):
-                images.append(data)
-            return
-        for k, v in o.items():
-            if k not in _PLUMBING_KEYS:
-                _leaves(v, out, images)
+            source = o.get("source") if isinstance(o.get("source"), dict) else {}
+            taken = "data" if isinstance(o.get("data"), str) else "source" if isinstance(source.get("data"), str) else None
+            if taken:
+                images.append(o["data"] if taken == "data" else source["data"])
+        for k, v in o.items():  # the picture is taken as a picture; whatever else the block holds is read
+            if k == taken:
+                v = {a: b for a, b in v.items() if a != "data"} if k == "source" else None
+            _leaves(v, out, images, k)
     elif isinstance(o, list):
         for v in o:
-            _leaves(v, out, images)
+            _leaves(v, out, images, key)
+
+
+def _server_text(key: str, value) -> bool:
+    """A WebFetch result's status phrase or address that is more than that: text to scan, and to
+    leave out of a replacement."""
+    if not isinstance(value, str) or not value:
+        return False
+    if key == "url":
+        return not re.fullmatch(r"https?://\S{1,2000}", value)
+    from http import HTTPStatus
+    return value not in {s.phrase for s in HTTPStatus}
+
+
+def server_texts(resp: dict) -> list[str]:
+    return [resp[k] for k in ("codeText", "url") if _server_text(k, resp.get(k))]
 
 
 def text_of(tool: str, resp) -> tuple[str, list[bytes]]:
@@ -63,7 +89,9 @@ def text_of(tool: str, resp) -> tuple[str, list[bytes]]:
     elif isinstance(resp, dict) and tool == "Grep":
         texts = [str(resp.get("content") or ""), *map(str, resp.get("filenames") or [])]
     elif isinstance(resp, dict) and tool == "WebFetch":
-        texts = [str(resp.get("result") or "")]
+        # The status phrase and the address are the server's too. They are left out only when
+        # they are what they should be: a standard phrase, one address.
+        texts = [str(resp.get("result") or ""), *server_texts(resp)]
     elif isinstance(resp, dict) and tool == "WebSearch":
         _leaves(resp.get("results"), texts, b64)
     else:
@@ -140,11 +168,14 @@ def replaced(tool: str, resp, note: str):
         return {**resp, "mode": "content", "numFiles": 0, "filenames": [], "content": note,
                 "numLines": 1, "totalLines": 1}
     if isinstance(resp, dict) and tool == "WebFetch":
-        return {**resp, "result": note}
+        return {**resp, "result": note, **{k: "" for k in ("codeText", "url") if _server_text(k, resp.get(k))}}
     if isinstance(resp, dict) and tool == "WebSearch":
         return {**resp, "results": [note]}
     if isinstance(resp, list):
         return [{"type": "text", "text": note}]
     if isinstance(resp, dict) and isinstance(resp.get("content"), list):
-        return {**resp, "content": [{"type": "text", "text": note}]}
+        # Only the flags of the result are kept. Its other fields (structuredContent, ...) hold
+        # the same text a second time and would hand it over beside the note.
+        flags = {k: v for k, v in resp.items() if isinstance(v, (bool, int, float)) or v is None}
+        return {**flags, "content": [{"type": "text", "text": note}]}
     return note

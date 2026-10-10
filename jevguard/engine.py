@@ -172,11 +172,25 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
     rec = dict(base, verdict=v, **_evidence(verdict), ms=ms, policy=sc.policy_id, complete=not incomplete,
                block_at=block_at, error=f"later part not scanned: {err}"[:200] if err is not None else None)
     if v == "injection":
-        store.session_update(cfg, sid, flagged="injection")
+        def recorded(step):
+            """The session mark, the quarantine and the log are records of the verdict, not part of
+            it. If one cannot be written (a full disk, a damaged state directory) the result is
+            withheld all the same, whatever on_error says: that setting is for a scan that failed,
+            and this one did not."""
+            try:
+                return step()
+            except Exception:
+                if not enforce:
+                    raise
+                return None
+
+        recorded(lambda: store.session_update(cfg, sid, flagged="injection"))
         # Kept in log mode too: it is what the owner reads to judge a would-be block.
-        qid = keep(verdict)
-        store.audit(cfg, **rec, action="blocked" if enforce else "would-block", quarantine_id=qid)
-        return Decision("replace", firstparty.notice(tool, verdict, qid, str(store.released_copy(cfg, qid)))) if enforce else None
+        qid = recorded(lambda: keep(verdict)) or ""
+        recorded(lambda: store.audit(cfg, **rec, action="blocked" if enforce else "would-block", quarantine_id=qid or None))
+        if not enforce:
+            return None
+        return Decision("replace", firstparty.notice(tool, verdict, qid, str(store.released_copy(cfg, qid)) if qid else ""))
     if incomplete:  # an image without OCR, undecodable data, more images than the limit
         if mode in OUTSIDE:
             store.session_update(cfg, sid, flagged="unscanned")

@@ -30,14 +30,27 @@ def _write(path: Path, content: dict | None) -> str:
     return f"wrote {path}"
 
 
-def _merge(path: Path, events: dict, ours, remove: bool, top: dict | None = None) -> str:
+def without(group, is_ours):
+    """A group of hooks ({matcher, hooks: [...]}) with the guard's own hook taken out of it, or
+    None when nothing else was in it. The owner's hooks in the same group stay, with the group's
+    other fields. Anything that is not such a group is left as it is."""
+    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+        return group
+    rest = [h for h in group["hooks"] if not (isinstance(h, dict) and is_ours(h))]
+    if len(rest) == len(group["hooks"]):
+        return group
+    return {**group, "hooks": rest} if rest else None
+
+
+def _merge(path: Path, events: dict, strip, remove: bool, top: dict | None = None) -> str:
     """Add the guard's entries to a hooks file that may hold the owner's own, or take them out.
-    events: {event name: the entry to add}; ours(entry): the entry is the guard's."""
+    events: {event name: the entry to add}; strip(entry): the entry without what the guard put
+    there, or None when that was all of it."""
     settings = json.loads(path.read_text()) if path.exists() else {}
     before = json.dumps(settings, sort_keys=True)
     hooks = settings.setdefault("hooks", {})
     for event, entry in events.items():
-        entries = [e for e in hooks.get(event, []) if not ours(e)]
+        entries = [e for e in map(strip, hooks.get(event, [])) if e is not None]
         if not remove:
             entries.append(entry)
         if entries:
@@ -82,7 +95,7 @@ def cursor(remove: bool) -> str:
     command = f"{HOOK} --agent cursor"
     events = ("preToolUse", "postToolUse", "beforeShellExecution", "beforeMCPExecution", "beforeReadFile")
     return _merge(Path.home() / ".cursor" / "hooks.json", {e: {"command": command, "timeout": 60} for e in events},
-                  lambda e: e.get("command") == command, remove, {"version": 1})
+                  lambda e: None if isinstance(e, dict) and e.get("command") == command else e, remove, {"version": 1})
 
 
 def codex(remove: bool) -> str:
@@ -92,7 +105,7 @@ def codex(remove: bool) -> str:
     command = f"{HOOK} --agent codex"
     group = {"hooks": [{"type": "command", "command": command, "timeout": 60}]}
     done = _merge(Path.home() / ".codex" / "hooks.json", {"PreToolUse": group, "PostToolUse": group},
-                  lambda g: any(h.get("command") == command for h in g.get("hooks", [])), remove)
+                  lambda g: without(g, lambda h: h.get("command") == command), remove)
     return done if remove or done == "no change" else done + "; Codex will ask you to review the new hooks when it next starts"
 
 

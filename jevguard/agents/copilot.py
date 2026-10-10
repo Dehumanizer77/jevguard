@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import json
 
-from .. import engine
+from .. import engine, toolio
 from ..engine import Call, Decision
 from . import Agent
 
+_RESULT_TYPES = {"success", "failure", "rejected", "denied"}
 _TOOLS = {"bash": "Bash", "powershell": "Bash", "view": "Read", "grep": "Grep", "glob": "Grep", "web_fetch": "WebFetch",
           "web_search": "WebSearch", "create": "Write", "edit": "Edit"}
 _LOCAL = {"task", "ask_user", "report_intent", "update_todo"}  # bring nothing in from outside
@@ -57,7 +58,13 @@ class Copilot(Agent):
         if "toolResult" not in d:
             return "before", call
         call.raw = d.get("toolResult")
-        call.text = str((call.raw or {}).get("textResultForLlm") or "") if isinstance(call.raw, dict) else str(call.raw or "")
+        if isinstance(call.raw, dict):
+            # Everything in it is read, not one field by name: the reference names two, and what
+            # else a result may carry to the model is not known here.
+            rest = {k: v for k, v in call.raw.items() if not (k == "resultType" and v in _RESULT_TYPES)}
+            call.text, call.images = toolio.text_of("", rest)
+        else:
+            call.text = str(call.raw or "")
         return "after", call
 
     def answer(self, d: dict, phase: str, call: Call, decision: Decision) -> dict | None:

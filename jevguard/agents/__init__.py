@@ -11,11 +11,21 @@ What an agent lets a hook do decides how much of the guard works there:
     hermes    every tool (in process)      no: refuse with a note   replaced
     codex     every tool, by way of the    no: refuse with a note   replaced
               hook's feedback
-    cursor    MCP tools; file reads are    shell and MCP            run through `jevguard-run`
-              refused before they happen
+    cursor    MCP tools; file reads are    shell and MCP; refuse    run through `jevguard-run`
+              refused before they happen   for its other tools
 
 Where an agent cannot replace what a shell command printed (Cursor), the adapter rewrites the
 command so that it runs through `jevguard-run`, which scans the output before the agent gets it.
+
+Three things an adapter must not get wrong, each of which the first version did (PR #31 review):
+
+- Every event that comes before a tool runs has to reach the gate (phase "before"), with every
+  file the call changes: also when the files are named inside a patch, and also for a tool the
+  adapter has no name for. Where the agent cannot ask at that event, the answer is a refusal.
+- A result is read whole. A field is left out of the scan, or kept in a replacement, only when
+  its value shows it is not content (a tag, a media type, something the call itself said),
+  never because of what the field is called.
+- A replacement holds the notice and nothing else of the original.
 """
 
 from __future__ import annotations

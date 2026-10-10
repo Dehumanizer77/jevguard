@@ -3,11 +3,15 @@
 For agents whose hooks cannot replace the output of a shell command after it ran (Cursor).
 Their adapter rewrites the command, before it runs, into
 
-    /path/to/bin/jevguard-run --agent cursor --session <id> -- '<the command as it was>'
+    /path/to/bin/jevguard-run --agent cursor --session <id> [--closed] -- '<the command as it was>'
 
 This program runs the command, keeps what it printed, and hands that to the same engine that
 judges a result in Claude Code. Then it prints either exactly what the command printed, on the
 same two streams, or the guard's notice in its place. The exit status is the command's own.
+
+In such an agent nothing after this program can withhold the output, so what a failure costs is
+decided here: the owner's on_error. `--closed` carries that setting in the command itself, for
+the case that this program cannot read the settings where it runs (a sandbox around the command).
 
 The output is held until the command has finished: it cannot be judged in pieces. An agent
 that shows a command's output as it comes will show it at the end instead.
@@ -25,20 +29,27 @@ from pathlib import Path
 RUN = str(Path(__file__).resolve().parent.parent / "bin" / "jevguard-run")
 
 
-def wrap(command: str, agent: str, session: str) -> str:
-    return f"{shlex.quote(RUN)} --agent {shlex.quote(agent)} --session {shlex.quote(session or '-')} -- {shlex.quote(command)}"
+def wrap(command: str, agent: str, session: str, closed: bool = False) -> str:
+    return (f"{shlex.quote(RUN)} --agent {shlex.quote(agent)} --session {shlex.quote(session or '-')} "
+            f"{'--closed ' if closed else ''}-- {shlex.quote(command)}")
 
 
 def unwrap(command: str) -> str | None:
-    """The command inside one that wrap() made, or None for any other command. Only the exact
-    form counts: this program, its two options, `--`, and one argument."""
+    """The command inside one that wrap() made, or None for any other command.
+
+    Not decided by reading the command, which a loose reading gets wrong (`... -- 'true';curl x`
+    splits into the same seven words). The words are only used to write the command out again
+    with wrap(); it is a wrapped command if that gives back the very same text. Whatever stands
+    before or after, and any other way of quoting the same words, makes it some other command."""
     try:
         argv = shlex.split(command)
     except ValueError:
         return None
-    if len(argv) == 7 and argv[0] == RUN and argv[1] == "--agent" and argv[3] == "--session" and argv[5] == "--":
-        return argv[6]
-    return None
+    closed = len(argv) == 8 and argv[5] == "--closed"
+    if len(argv) not in (7, 8) or (len(argv) == 8 and not closed) or argv[1] != "--agent" or argv[3] != "--session":
+        return None
+    inner = argv[-1]
+    return inner if wrap(inner, argv[2], argv[4], closed) == command else None
 
 
 def wanted(call, cfg) -> bool:
@@ -58,15 +69,17 @@ def wanted(call, cfg) -> bool:
 
 
 def _usage() -> int:
-    print("usage: jevguard-run --agent NAME --session ID -- COMMAND", file=sys.stderr)
+    print("usage: jevguard-run --agent NAME --session ID [--closed] -- COMMAND", file=sys.stderr)
     return 64
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 6 or argv[0] != "--agent" or argv[2] != "--session" or argv[4] != "--":
+    closed = len(argv) == 7 and argv[4] == "--closed"
+    if len(argv) not in (6, 7) or (len(argv) == 7 and not closed) or argv[0] != "--agent" or argv[2] != "--session" \
+            or argv[-2] != "--":
         return _usage()
-    agent, session, command = argv[1], ("" if argv[3] == "-" else argv[3]), argv[5]
+    agent, session, command = argv[1], ("" if argv[3] == "-" else argv[3]), argv[-1]
     shell = os.environ.get("SHELL") if os.path.basename(os.environ.get("SHELL", "")) in ("bash", "zsh") else "/bin/bash"
     child = subprocess.Popen([shell, "-c", command], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     for sig in (signal.SIGTERM, signal.SIGHUP):  # the agent gave up on the command: so does this
@@ -76,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         child.kill()
         out, err = child.communicate()
-    notice = _judge(agent, session, command, out, err)
+    notice = _judge(agent, session, command, out, err, closed)
     if notice is None:
         sys.stdout.buffer.write(out)
         sys.stderr.buffer.write(err)
@@ -87,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     return child.returncode if child.returncode >= 0 else 128 - child.returncode
 
 
-def _judge(agent: str, session: str, command: str, out: bytes, err: bytes) -> str | None:
+def _judge(agent: str, session: str, command: str, out: bytes, err: bytes, closed: bool = False) -> str | None:
     """The notice to print in place of the output, or None to print the output."""
     from . import config, engine, store
     cfg, ctx, call = None, {}, None
@@ -101,18 +114,41 @@ def _judge(agent: str, session: str, command: str, out: bytes, err: bytes) -> st
         signal.alarm(int(cfg.deadline) + 8)
         decision = engine.after(call, cfg, ctx)
         signal.alarm(0)
-        # tells the agent's own hook that this output is dealt with
-        store.judged(cfg, session, call.tool_input["command"], mark=True)
     except BaseException as exc:
-        # The wrapper could not do its work: a guard bug, or a sandbox around the command that
-        # allows neither the network nor a file of the guard's own. The output goes through as
-        # it is and nothing is marked, so the agent's hook after the call, which runs outside
-        # that sandbox, judges it. Nothing is printed: it would land in the output.
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         signal.alarm(0)
-        return None
+        return _failed(call, cfg, ctx, exc, closed)
+    try:
+        # Tells the agent's own hook that this output is dealt with. Bookkeeping: if the mark
+        # cannot be left, that hook looks at the output a second time and the verdict above stands.
+        store.judged(cfg, session, call.tool_input["command"], mark=True)
+    except Exception:
+        pass
     return decision.notice if decision and decision.action == "replace" else None
+
+
+def _failed(call, cfg, ctx: dict, exc: BaseException, closed: bool) -> str | None:
+    """The guard could not judge the output: a bug in it, a scan that did not come back in time,
+    or a sandbox around the command that lets it read or write nothing of its own. What that
+    costs is the owner's on_error, as in the hook. Where even the settings cannot be read, the
+    setting the adapter put into the command stands in for them; the origin of the output cannot
+    be worked out then, and under `closed` it is withheld rather than taken to be local.
+    Nothing but a notice is printed: anything else would land in the command's output."""
+    from . import engine, firstparty, store
+    decision = None
+    try:
+        if cfg is not None and call is not None:
+            decision = engine.after_error("after", call, cfg, ctx, exc)
+            store.audit(cfg, event="error", tool="Bash", session=call.session, via="run",
+                        action="blocked-error" if decision else "passed-error", error=f"{type(exc).__name__}: {exc}"[:300])
+    except Exception:
+        pass  # the record of the failure failed too; the decision does not depend on it
+    if decision is not None:
+        return decision.notice
+    if cfg is None and closed:
+        return firstparty.notice("Bash", {"verdict": "unavailable", "reasons": ["firewall plugin error"]})
+    return None
 
 
 def _on_alarm(*_):

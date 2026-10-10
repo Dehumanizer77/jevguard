@@ -74,15 +74,24 @@ Two checks that read the call itself, no model:
 
 - *Changes to the guard.* A call that would change the guard's settings, state, release list
   or code, run `jevguard mode|gate|install|uninstall|release|show|trust|untrust|own|disown`, or touch a file
-  the hooks are set up in (a Claude Code `settings*.json`, and the hook files of the other
-  agents the guard installs into) is held for your approval. That holds whether the
+  that decides whether an agent runs the hooks is held for your approval. Those files are a
+  Claude Code `settings*.json`, the hook files the guard installs into for the other agents,
+  and each agent's own switches for hooks (`~/.grok/disabled-hooks` and Grok's `*.toml`,
+  `~/.codex/config.toml`, `~/.copilot/config.json`, `~/.hermes/config.yaml`), in the home
+  directory and in a project. That holds whether the
   file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`),
-  through a directory above it (`rm -rf ~/.claude`), or as the place a command writes to in
+  through a directory above it (`rm -rf ~/.claude`, `mv ~/.grok/hooks x`), or as the place a command writes to in
   any spelling (`curl -o/path`, `--output-dir` with `-O`, `cd` there and download,
   `cp -t`, `dd of=`), and for commands run from inside the guard's directories. Reading a
   settings file (`cat`, `jq`, `grep`) is not held; reading the guard's own directory is,
   because the API key is there. In every session, whatever `gate` says. Switch off with
   `protect_guard: false`.
+
+  The same goes for the file tools, by every file the call changes: a patch (Codex's
+  `apply_patch`, Hermes' `patch`) is read for the files named in it, and one that cannot be
+  read is held. A tool the guard has no model of, an MCP server's or one an agent added
+  under a name its adapter does not know, is held when one of its arguments is the path of
+  such a file.
 - *Risky actions after outside content.* An HTTP request with a body, or one whose address
   or headers are filled in when it runs, `git push`, `ssh`/`scp`, sending mail, publishing,
   an MCP tool that sends or changes something, or touching `~/.ssh`, shell startup files and
@@ -438,7 +447,7 @@ depends on what that agent lets a hook do:
 | Grok Build | every tool | asks you | live against grok 1.0.30 (`tests/e2e_grok.py`) |
 | Codex CLI | every tool | refuses the call | live against codex 0.160.0 (`tests/e2e_codex.py`) |
 | Copilot CLI | every tool | asks you | from its documentation only |
-| Cursor | MCP tools, file reads, shell output | asks you for shell and MCP | from its documentation only |
+| Cursor | MCP tools, file reads, shell output | asks you for shell and MCP, refuses for its other tools | from its documentation only |
 | Hermes | every tool | refuses the call | from the notes of the plugin it is derived from |
 
 How to put the guard into each of them is in [Install](#install), step 4. Settings, log,
@@ -458,9 +467,16 @@ Things to know:
   run against the programs. Cursor lets a hook replace only MCP results, so there a shell
   command whose output the guard would look at is rewritten to run through `bin/jevguard-run`,
   which scans what the command printed before Cursor gets it; that needs the command to be
-  allowed the network. Cursor's own web tools cannot be covered.
+  allowed the network. Nothing after that program can withhold the output, so a failure in it
+  costs what `on_error` says, and that setting is written into the rewritten command for the
+  case that the program cannot read the settings where it runs. Cursor asks only for shell
+  and MCP calls; for its file tools the one event before the call can allow or deny, so what
+  the guard would ask about is refused there. Cursor's own web tools cannot be covered.
 - **Hermes** has no way to ask from a plugin; where the guard would ask, the call is refused.
 - The output of a command run through `jevguard-run` is held until the command has finished.
+- A result is read whole, whatever its fields are called. A field is passed over only when its
+  value shows it is not content: a tag such as `"type": "text"`, a media type, or, in a
+  built-in tool's result, something the call itself said (its command, its address).
 
 ## Settings
 
@@ -506,6 +522,13 @@ fetches and the private connectors out of that; each switch above widens it.
 - Text in the pixels of an image, unless `tesseract` is installed. Image metadata is read.
 - Results shorter than three words, and reports returned by subagents (their own tool calls are
   scanned).
+- The output of a command run in the background, which the agent picks up later through
+  another tool: the hook is installed for the tools that fetch, run and read, and that tool is
+  none of them. More generally, the result of a built-in tool whose name the adapter does not
+  know is not scanned (MCP tools always are; in Copilot CLI an unknown tool is too).
+- A file tool the guard has no model of, when the path it changes is inside a longer text it
+  is given rather than an argument of its own. The patches of Codex and Hermes are read;
+  another tool's own patch format would not be.
 - Claude Code on the web and cloud sessions: they do not read this machine's settings.
 - An attack the model does not recognise. Upstream measured 88.5% of attacks blocked and 3.5% of
   benign items blocked on its 718-item test set, through Venice with `jev-latest`; those numbers

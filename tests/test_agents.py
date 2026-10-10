@@ -205,7 +205,7 @@ def test_cursor_file_is_refused_before_the_read_and_mcp_output_replaced(guard, e
     assert guard.raw(cursor("beforeReadFile", file_path=f"{ext}/ok.txt", content=BENIGN), "--agent", "cursor") is None
     assert guard.raw(cursor("beforeReadFile", file_path="/work/a.py", content=ATTACK), "--agent", "cursor") is None  # local
     mcp = cursor("postToolUse", tool_name="MCP:read_mail", tool_input={}, tool_output=json.dumps([{"type": "text", "text": ATTACK}]))
-    assert notice_in(guard.raw(mcp, "--agent", "cursor")["updated_mcp_tool_output"])
+    assert notice_in(guard.raw(mcp, "--agent", "cursor")["updated_mcp_tool_output"]["content"][0]["text"])
     # a wrapped shell command was judged by the wrapper; one that was not is logged, which is all Cursor allows
     shell = cursor("postToolUse", tool_name="Shell", tool_input={"command": f"cat {ext}/note.txt"}, tool_output=json.dumps({"output": ATTACK + " x"}))
     assert guard.raw(shell, "--agent", "cursor") is None and guard.log()[-1]["action"] == "blocked"

@@ -102,7 +102,9 @@ def install(cfg, settings_path: Path, remove: bool = False) -> str:
             "PreToolUse": (_PRE, cfg.gate.startswith("ask") or cfg.protect_guard,
                            cfg.gate != "off" or cfg.protect_guard)}
     for event, (matchers, sync, wanted) in plan.items():
-        groups = [g for g in hooks.get(event, []) if not _ours(g)]
+        # only the guard's own hook is taken out: a group may hold the owner's hooks beside it
+        groups = [g for g in (agent_setup.without(g, lambda h: h.get("command") == HOOK) for g in hooks.get(event, []))
+                  if g is not None]
         if not remove and wanted:
             groups += [{"matcher": m, "hooks": [_hook_entry(sync)]} for m in matchers]
         if groups:
