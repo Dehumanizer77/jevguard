@@ -75,7 +75,9 @@ def test_released_content_passes(guard):
     guard.configure(mode="block")
     guard.hook("PostToolUse", "WebFetch", FETCH, webfetch(ATTACK))
     cfg = SimpleNamespace(quarantine_dir=guard.home / "state" / "quarantine",
-                          released_file=guard.home / "state" / "released.txt")
+                          released_file=guard.home / "state" / "released.txt",
+                          released_dir=guard.home / "released",
+                          released_manifest=guard.home / "state" / "released-files.json")
     from jevguard import store
     store.release(cfg, guard.log()[-1]["quarantine_id"])
     assert guard.hook("PostToolUse", "WebFetch", FETCH, webfetch(ATTACK)) is None
@@ -101,8 +103,9 @@ def test_local_content_blocks_at_the_higher_level_when_enabled(guard):
     assert rec["mode"] == "local" and rec["verdict"] == "suspicious" and rec["action"] == "flagged"
     guard.configure(mode="block", scan_local=True)
     assert guard.hook("PostToolUse", "Read", {"file_path": "/home/u/n.md"}, read("/home/u/n.md", ATTACK)) is not None
-    assert guard.hook("PostToolUse", "Bash", {"command": "git status"}, bash(ATTACK)) is None  # trusted command
-    assert guard.log()[-1]["mode"] == "warn" and guard.log()[-1]["action"] == "would-block"
+    # no command is let off because of what it looks like
+    assert guard.hook("PostToolUse", "Bash", {"command": "git status"}, bash(ATTACK + " again")) is not None
+    assert guard.log()[-1]["mode"] == "local" and guard.log()[-1]["action"] == "blocked"
 
 
 def test_file_saved_by_a_fetch_is_outside_content(guard):

@@ -57,6 +57,57 @@ def tokens(cmd: str) -> list[str]:
         return re.findall(r"[();|&<>]+|[^\s();|&<>]+", cmd)
 
 
+_BARE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-")
+_STDERR_ONLY = (" 2>&1", " 2>/dev/null")
+
+
+def literal_command(cmd: str) -> list[str] | None:
+    """The words of a command line that is one program with its arguments written out, or None.
+
+    This is the only reading of a command that anything lenient may rest on, and it is narrow on
+    purpose. The shell does much before it runs a line (it expands variables, globs and braces,
+    it honours operators, redirections and assignments, and bash and zsh do not agree on all of
+    it), and a reader that follows some of that is wrong about the rest. So nothing is followed.
+    A line is accepted only when there is nothing to follow:
+
+    - outside quotes, only letters, digits and _ @ % + = : , . / - . No ? * [ ] { } ~ # ! $ and
+      no backslash: a `?` in an address is a glob to the shell;
+    - in single quotes, anything; in double quotes, anything but $ ` and backslash;
+    - no operator and no redirection at all: no ; | & ( ) < >. The one exception is a line that
+      ends in `2>&1` or `2>/dev/null`, which moves or drops the program's own error output;
+    - no control character, line breaks included.
+
+    One program, then, and exactly these arguments. Which program a bare name runs is for the
+    caller to worry about."""
+    cmd = cmd.strip()
+    for ending in _STDERR_ONLY:
+        if cmd.endswith(ending):
+            cmd = cmd[:-len(ending)].rstrip()
+            break
+    if any(ord(c) < 32 or ord(c) == 127 for c in cmd):
+        return None
+    words, word, i = [], None, 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch == " ":
+            if word is not None:
+                words.append("".join(word))
+            word = None
+        elif ch in "'\"":
+            close = cmd.find(ch, i + 1)
+            if close < 0 or (ch == '"' and any(c in "$`\\" for c in cmd[i + 1:close])):
+                return None
+            word, i = (word or []) + [cmd[i + 1:close]], close
+        elif ch in _BARE and not (ch == "=" and word is None):  # zsh expands a leading = to a path
+            word = (word or []) + [ch]
+        else:
+            return None
+        i += 1
+    if word is not None:
+        words.append("".join(word))
+    return words or None
+
+
 class Command:
     def __init__(self, cwd: str = ""):
         self.programs: list[list[str]] = []  # argv of each simple command, wrappers removed

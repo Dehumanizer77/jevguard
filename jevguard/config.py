@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,7 +34,23 @@ DEFAULTS = {
     "skip_tools": ["mcp__claude_ai_Gmail__.*", "mcp__claude_ai_Google_Drive__.*",
                    "mcp__claude_ai_Google_Calendar__.*", "mcp__claude_ai_Claude_Docs__.*"],
     "warn_tools": [],
+    # Program names whose output is scanned and logged but never withheld, e.g. "make". Your word
+    # for that program: the guard does not check what it prints. It counts only when the whole
+    # command is that one program with literal arguments (no pipe, no second command).
     "trusted_commands": [],
+    # Addresses whose content is scanned and logged but never withheld, as URL prefixes
+    # ("https://developers.openai.com/codex/"). For sources that keep scoring as an injection
+    # without being one: documentation about hooks, articles about prompt injection. Whatever such
+    # an address returns later, or redirects to, passes unread by anyone; keep the prefixes narrow.
+    # It holds for WebFetch, where the address is a field of the call, and not for curl or wget:
+    # what a shell command really fetches cannot be read off it.
+    "trusted_sources": [],
+    # Your own GitHub repositories, as "owner/name" or "owner/*". What one `gh` command that names
+    # such a repository returns is still scanned, but withheld only from own_repos_block up
+    # instead of the policy level: short status lines and one's own commit titles score in
+    # between. Not an exemption: anyone can write an issue or a comment in a public repository.
+    "own_repos": [],
+    "own_repos_block": 0.6,
     # When scanning fails: "open" passes the result, "closed" withholds outside content.
     "on_error": "open",
     # Ask before any call that would change the guard: its settings, state, release list, code,
@@ -49,6 +66,9 @@ DEFAULTS = {
     # every later output that happens to contain such a word would be sent for scoring.
     "track_missing_files": False,
 }
+
+
+_OWN_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?:\*|[A-Za-z0-9._-]+)")  # no wildcard for the owner
 
 
 def root() -> tuple[Path, Path]:
@@ -75,6 +95,12 @@ def load() -> SimpleNamespace:
         raise ValueError(f"{path}: gate must be off, log, ask-flagged or ask-external")
     if values["on_error"] not in ("open", "closed"):
         raise ValueError(f"{path}: on_error must be open or closed")
+    for source in values["trusted_sources"]:
+        if not isinstance(source, str) or not source.lower().startswith(("https://", "http://")):
+            raise ValueError(f"{path}: trusted_sources takes URL prefixes starting with https:// or http://")
+    for repo in values["own_repos"]:
+        if not isinstance(repo, str) or not _OWN_REPO.fullmatch(repo):
+            raise ValueError(f'{path}: own_repos takes "owner/name" or "owner/*", not {repo!r}')
     cfg = SimpleNamespace(**values)
     cfg.config_dir, cfg.state_dir, cfg.config_file = cfg_dir, state_dir, path
     if os.environ.get("JEVGUARD_HOME") and values["key_file"] == DEFAULTS["key_file"]:
@@ -85,6 +111,13 @@ def load() -> SimpleNamespace:
     cfg.scan_log = state_dir / "scans.jsonl"
     cfg.released_file = state_dir / "released.txt"
     cfg.usage_file = state_dir / "usage.json"
+    # Released originals are handed to the agent as files. They live outside the state directory
+    # on purpose: that one is closed to Claude Code's file tools, this one has to be readable.
+    home = os.environ.get("JEVGUARD_HOME")
+    cfg.released_dir = Path(home) / "released" if home else state_dir.with_name(state_dir.name + "-released")
+    # Which files there the owner's release command wrote, and what was in them. Kept in the
+    # closed state directory: a file counts as released only while it matches this record.
+    cfg.released_manifest = state_dir / "released-files.json"
     return cfg
 
 

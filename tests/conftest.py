@@ -25,7 +25,9 @@ class _Jev(BaseHTTPRequestHandler):
             self.send_response(self.server.status)
             self.end_headers()
             return
-        p = 0.97 if "ignore your previous instructions" in str(body["state"]).lower() else 0.02
+        state = str(body["state"]).lower()
+        # 0.5 stands for the short status lines and commit titles that scored 0.38 to 0.57 live
+        p = 0.97 if "ignore your previous instructions" in state else 0.5 if "borderline-sample" in state else 0.02
         answers = {}
         for name, q in body["questions"].items():
             if q["type"] == "choice":
@@ -63,6 +65,7 @@ class Guard:
 
     def __init__(self, home: Path, url: str):
         self.home, self.url = home, url
+        self.env = {}  # extra environment for the hook process
         (home / "config").mkdir(parents=True)
         (home / "config" / "typesafe.key").write_text("test-key\n")
         self.configure()
@@ -79,7 +82,7 @@ class Guard:
         if tool_response is not None:
             payload["tool_response"] = tool_response
         r = subprocess.run([str(ROOT / "bin" / "jevguard-hook")], input=json.dumps(payload), text=True,
-                           capture_output=True, timeout=60, env={**os.environ, "JEVGUARD_HOME": str(self.home)})
+                           capture_output=True, timeout=60, env={**os.environ, "JEVGUARD_HOME": str(self.home), **self.env})
         assert r.returncode == 0, r.stderr
         return json.loads(r.stdout) if r.stdout.strip() else None
 

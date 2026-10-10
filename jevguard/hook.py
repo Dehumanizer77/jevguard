@@ -20,6 +20,8 @@ from . import config, store
 _CLASSIFIER_NOTE = ("jevguard withheld a tool result in this session as a likely prompt injection. Actions that "
                     "send data out, publish, or change startup and configuration files need the user's approval.")
 _UNKNOWN = "unknown"  # the origin of a result was not established before something failed
+# Origins that are content from outside, however strictly each is then handled (see provenance.py).
+_OUTSIDE = ("external", "trusted", "own")
 
 
 def _replace(tool: str, resp, text: str) -> dict:
@@ -60,7 +62,7 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     ctx["mode"] = mode  # what the error path needs to know if anything below fails
     if mode is None:
         return None
-    if mode == "external":
+    if mode in _OUTSIDE:
         if not session:
             store.prune_sessions(cfg)  # first outside content of a session: drop old session files
         paths = _existing(cfg, provenance.saved_paths(str(tool_input.get("command") or ""), cwd, cfg.track_clones)) if tool == "Bash" else []
@@ -76,16 +78,16 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     if digest in store.released(cfg):
         store.audit(cfg, **base, action="passed-released")
         return None
-    enforce = cfg.mode == "block" and mode != "warn"
+    enforce = cfg.mode == "block" and mode not in ("warn", "trusted")
     # Outside content the scan could not vouch for (the API failed, part of it was unreadable) is
     # withheld when the owner chose on_error = closed.
-    withhold_unscanned = enforce and cfg.on_error == "closed" and mode == "external"
+    withhold_unscanned = enforce and cfg.on_error == "closed" and mode in ("external", "own")
     firstparty.use(cfg)
 
     def unavailable(error: str, verdict: dict | None = None, **extra) -> dict | None:
         store.audit(cfg, **base, action="blocked-unavailable" if withhold_unscanned else "passed-unscanned",
                     verdict="unavailable", error=error[:200], **(_evidence(verdict) if verdict else {}), **extra)
-        if mode == "external":
+        if mode in _OUTSIDE:
             store.session_update(cfg, sid, flagged="unscanned")
         if withhold_unscanned:
             return _replace(tool, resp, firstparty.notice(tool, {"verdict": "unavailable",
@@ -105,25 +107,32 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     v = verdict.get("verdict")
     if err is not None and v != "injection":  # nothing conclusive found before the failure
         return unavailable(str(err), verdict, partial_verdict=v, outage=err.outage, ms=ms)
-    if v == "injection" and mode == "local" and (verdict.get("score") or 0) < cfg.local_block:
-        verdict, v = dict(verdict, verdict="suspicious"), "suspicious"  # below the local level
+    # Local content and what gh returns about the owner's own repositories are withheld only from
+    # a higher score up; between the policy level and that one they are logged as flagged.
+    # What gh prints can carry local content (a request body read from a file comes back in the
+    # reply, --dry-run prints the text of local commits), so where local output is scanned at all,
+    # own-repository output is never given the more lenient of the two levels.
+    own_block = min(cfg.own_repos_block, cfg.local_block) if cfg.scan_local else cfg.own_repos_block
+    block_at = {"local": cfg.local_block, "own": own_block}.get(mode)
+    if v == "injection" and block_at is not None and (verdict.get("score") or 0) < block_at:
+        verdict, v = dict(verdict, verdict="suspicious"), "suspicious"
     incomplete = sorted(set(verdict.get("flags") or []) & scanner.INCOMPLETE)
     rec = dict(base, verdict=v, **_evidence(verdict), ms=ms, policy=sc.policy_id, complete=not incomplete,
-               error=f"later part not scanned: {err}"[:200] if err is not None else None)
+               block_at=block_at, error=f"later part not scanned: {err}"[:200] if err is not None else None)
     if v == "injection":
         store.session_update(cfg, sid, flagged="injection")
         # Kept in log mode too: it is what the owner reads to judge a would-be block.
         qid = store.quarantine(cfg, tool, tool_input, resp, verdict, digest)
         store.audit(cfg, **rec, action="blocked" if enforce else "would-block", quarantine_id=qid)
-        return _replace(tool, resp, firstparty.notice(tool, verdict, qid)) if enforce else None
+        return _replace(tool, resp, firstparty.notice(tool, verdict, qid, str(store.released_copy(cfg, qid)))) if enforce else None
     if incomplete:  # an image without OCR, undecodable data, more images than the limit
-        if mode == "external":
+        if mode in _OUTSIDE:
             store.session_update(cfg, sid, flagged="unscanned")
         if withhold_unscanned:
             held = dict(verdict, verdict="incomplete")
             qid = store.quarantine(cfg, tool, tool_input, resp, held, digest)
             store.audit(cfg, **rec, action="blocked-incomplete", quarantine_id=qid)
-            return _replace(tool, resp, firstparty.notice(tool, held, qid))
+            return _replace(tool, resp, firstparty.notice(tool, held, qid, str(store.released_copy(cfg, qid))))
     store.audit(cfg, **rec, action="flagged" if v == "suspicious" else "passed")
     return None
 
@@ -131,6 +140,13 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
 def _ask(reason: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                                    "permissionDecisionReason": f"jevguard: {reason}"}}
+
+
+def _purpose(tool_input: dict) -> str:
+    """What the agent said the call is for, to go into the question. A long command says little
+    to the person asked; this one sentence is the agent's own claim, and is labelled as that."""
+    said = " ".join(str(tool_input.get("description") or "").split())[:140]
+    return f' Claude describes the call as: "{said}" (its own words, not checked).' if said else ""
 
 
 def pre_tool_use(d: dict, cfg) -> dict | None:
@@ -143,8 +159,9 @@ def pre_tool_use(d: dict, cfg) -> dict | None:
         why = gate.guard_change(tool, tool_input, cfg, cwd)
         if why:
             store.audit(cfg, **ids, why=why, taint="guard", action="asked")
-            return _ask(f"{why}. Approve only if you expect this session to be changing the guard "
-                        "or Claude Code's settings right now; you do not need to review the rest of the command.")
+            return _ask(f"asking because {why}.{_purpose(tool_input)} Approve only if you expect this "
+                        "session to be changing the guard or Claude Code's settings right now; you do not "
+                        "need to review the rest of the command.")
     if cfg.gate == "off":
         return None
     why = gate.risky(tool, tool_input, cwd)
@@ -164,7 +181,7 @@ def pre_tool_use(d: dict, cfg) -> dict | None:
         return None
     seen = ("a tool result scored as a prompt injection or passed without a full scan" if taint == "flagged"
             else "content from outside was read")
-    return _ask(f"earlier in this session {seen}, and this call {why}.")
+    return _ask(f"asking because earlier in this session {seen}, and this call {why}.{_purpose(tool_input)}")
 
 
 def _on_alarm(*_):
@@ -192,7 +209,7 @@ def _after_error(d: dict, cfg, ctx: dict, exc: BaseException) -> dict | None:
             mode = provenance.classify(tool, tool_input, cfg, cwd, _existing(cfg, store.session(cfg, sid).get("paths", [])), text)
         except Exception:
             mode = "external"
-    if mode != "external":
+    if mode not in ("external", "own"):
         return None
     try:
         firstparty.use(cfg)
