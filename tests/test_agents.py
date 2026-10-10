@@ -247,8 +247,13 @@ def test_install_writes_each_agents_own_file_and_uninstall_takes_it_out(guard, m
     assert [g["hooks"][0]["command"] for g in codex_hooks["PreToolUse"]] == ["mine", f"{hook} --agent codex"]
     assert (tmp_path / ".hermes" / "plugins" / "jevguard" / "plugin.yaml").exists()
     assert (tmp_path / ".hermes" / "plugins" / "jevguard" / "root").read_text().strip() == str(cli.Path(hook).parent.parent)
+    assert cli.main(["status"]) == 0
+    assert "installed for other agents: grok, copilot, cursor, codex, hermes" in capsys.readouterr().out
     for agent in ("grok", "copilot", "cursor", "codex", "hermes"):
         assert cli.main(["uninstall", "--agent", agent]) == 0
+    capsys.readouterr()
+    assert cli.main(["status"]) == 0
+    assert "installed for other agents: none" in capsys.readouterr().out   # the owner's own hooks do not count
     assert not (tmp_path / ".grok" / "hooks" / "jevguard.json").exists() and not (tmp_path / ".hermes" / "plugins" / "jevguard").exists()
     assert json.loads((tmp_path / ".cursor" / "hooks.json").read_text())["hooks"] == {"stop": [{"command": "./mine.sh"}]}
     assert json.loads((tmp_path / ".codex" / "hooks.json").read_text())["hooks"]["PreToolUse"] == [{"hooks": [{"type": "command", "command": "mine"}]}]
@@ -262,6 +267,40 @@ def test_the_other_agents_hook_files_are_guarded_like_claudes_settings(guard, pa
         assert out and out["hookSpecificOutput"]["permissionDecision"] == "ask", payload
     assert guard.hook("PreToolUse", "Write", {"file_path": path, "content": "{}"})["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert guard.hook("PreToolUse", "Bash", {"command": f"cat {path}"}) is None   # looking is not a change
+
+
+def test_an_agents_own_file_tools_do_not_read_the_guards_keys_unasked(guard, tmp_path, monkeypatch):
+    """Claude Code is kept out of the guard's directories by two permission rules. No other agent
+    has those: there the check before the call is all that stands in front of the API key."""
+    key = str(guard.home / "config" / "typesafe.key")
+    out = guard.raw(grok("PreToolUse", "read_file", {"target_file": key}), "--agent", "grok")["hookSpecificOutput"]
+    assert out["permissionDecision"] == "ask" and "API key" in out["permissionDecisionReason"]
+    # a search in the directory, and one from above it
+    for where in (str(guard.home / "state"), str(guard.home), str(tmp_path)):
+        out = guard.raw(grok("PreToolUse", "grep", {"pattern": "apikey", "path": where}), "--agent", "grok")
+        assert out["hookSpecificOutput"]["permissionDecision"] == "ask", where
+    listing = grok("PreToolUse", "list_dir", {"target_directory": str(guard.home / "config")})
+    assert guard.raw(listing, "--agent", "grok")["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert guard.log()[-1]["action"] == "asked" and guard.log()[-1]["taint"] == "guard"
+    # anything else is read as before
+    (tmp_path / "project").mkdir()
+    assert guard.raw(grok("PreToolUse", "read_file", {"target_file": str(tmp_path / "project" / "notes.txt")}), "--agent", "grok") is None
+    assert guard.raw(grok("PreToolUse", "grep", {"pattern": "x", "path": str(tmp_path / "project")}), "--agent", "grok") is None
+    # the other agents
+    view = {"sessionId": "c1", "timestamp": 1, "cwd": "/work", "toolName": "view", "toolArgs": {"path": key}}
+    assert guard.raw(view, "--agent", "copilot")["permissionDecision"] == "ask"
+    out = guard.raw(cursor("beforeReadFile", file_path=key, content="apikey_0000"), "--agent", "cursor")
+    assert out["permission"] == "deny" and "API key" in out["user_message"]   # this event cannot ask
+    assert guard.raw(cursor("beforeReadFile", file_path=str(tmp_path / "project" / "notes.txt"), content=BENIGN), "--agent", "cursor") is None
+    assert guard.raw(codex("PreToolUse", "Bash", {"command": f"cat {key}"}), "--agent", "codex")["hookSpecificOutput"]["permissionDecision"] == "deny"
+    from jevguard.agents import hermes
+    monkeypatch.setenv("JEVGUARD_HOME", str(guard.home))
+    ran = []
+    refused = hermes.around("read_file", {"path": key}, lambda args: ran.append(args) or "apikey_0000", {"session_id": "h1"})
+    assert "did not run this call" in refused and "API key" in refused and not ran
+    # with protect_guard off the owner has said he does not want these questions
+    guard.configure(protect_guard=False)
+    assert guard.raw(grok("PreToolUse", "read_file", {"target_file": key}), "--agent", "grok") is None
 
 
 # ---- Hermes ---------------------------------------------------------------------------------------

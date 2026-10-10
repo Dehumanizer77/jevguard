@@ -14,6 +14,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import config, firstparty, scanner, store
+from .agents import setup as agent_setup
 
 HOOK = str(Path(__file__).resolve().parent.parent / "bin" / "jevguard-hook")
 SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -193,6 +194,8 @@ def cmd_status(cfg, a) -> int:
     print(f"mode: {cfg.mode}   gate: {cfg.gate}   on_error: {cfg.on_error}   "
           f"protect_guard: {cfg.protect_guard}   model: {cfg.model}")
     print(f"hooks installed: {'yes' if installed(a.settings) else 'no'} ({a.settings})")
+    others = [name for name in agent_setup.AGENTS if name != "claude" and agent_setup.installed(name)]
+    print("installed for other agents: " + (", ".join(others) or "none"))
     print(f"API key: {'present' if key else 'MISSING'} ({cfg.key_file})")
     print(f"scan local content: {cfg.scan_local}   private hosts: {cfg.scan_private_hosts}   "
           f"track clones: {cfg.track_clones}")
@@ -360,7 +363,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("value", choices=["log", "block"])
     p = sub.add_parser("gate", help="what to do with risky actions after outside content was read")
     p.add_argument("value", choices=["off", "log", "ask-flagged", "ask-external"])
-    from .agents import setup as agent_setup
     for name, text in (("install", "add the guard's hooks to an agent's settings (Claude Code unless --agent says otherwise)"),
                        ("uninstall", "remove them")):
         p = sub.add_parser(name, help=text)

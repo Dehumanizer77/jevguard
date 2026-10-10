@@ -33,6 +33,11 @@ class ClaudeCode(Agent):
             return "before", call
         call.raw = d.get("tool_response")
         call.text, call.images = toolio.text_of(call.tool, call.raw)
+        if call.tool == "WebFetch":
+            # The tool's own notice of a redirect: only what the server put into it is outside content.
+            supplied = toolio.redirect_supplied(tool_input, call.text)
+            if supplied is not None:
+                call.text, call.ids["scanned"] = supplied, "redirect notice: address and status"
         return "after", call
 
     def answer(self, d: dict, phase: str, call: Call, decision: Decision) -> dict | None:

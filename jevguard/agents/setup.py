@@ -110,3 +110,26 @@ def hermes(remove: bool) -> str:
 
 def install(agent: str, remove: bool = False) -> str:
     return {"grok": grok, "copilot": copilot, "cursor": cursor, "codex": codex, "hermes": hermes}[agent](remove)
+
+
+_FILES = {"grok": ".grok/hooks/jevguard.json", "copilot": ".copilot/hooks/jevguard.json",
+          "cursor": ".cursor/hooks.json", "codex": ".codex/hooks.json"}
+
+
+def _holds(node, command: str) -> bool:
+    if isinstance(node, dict):
+        return any(_holds(v, command) for v in node.values())
+    if isinstance(node, list):
+        return any(_holds(v, command) for v in node)
+    return node == command
+
+
+def installed(agent: str) -> bool:
+    """The agent's settings start the hook of this checkout. For `jevguard status`; whether the
+    agent has loaded them (Codex: reviewed them) only the agent can say."""
+    try:
+        if agent == "hermes":
+            return (Path.home() / ".hermes" / "plugins" / "jevguard" / "root").read_text().strip() == str(ROOT)
+        return _holds(json.loads((Path.home() / _FILES[agent]).read_text()), f"{HOOK} --agent {agent}")
+    except (OSError, ValueError):
+        return False

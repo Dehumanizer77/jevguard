@@ -14,7 +14,8 @@ guard does there:
     beforeMCPExecution    {tool_name, tool_input}   the same
     beforeReadFile        {file_path, content}      may answer permission: allow | deny
                           The file's content is scanned before the model gets it; a file that
-                          scores as an injection is refused.
+                          scores as an injection is refused. So is one of the guard's own
+                          files (the API key): the gate would ask, and here it cannot.
     postToolUse           {tool_name, tool_input, tool_output}
                           may replace an MCP tool's output (updated_mcp_tool_output), no other.
 
@@ -57,6 +58,7 @@ class Cursor(Agent):
         if event == "beforeReadFile":  # the content is here before the model has it: judge it as a result
             call = Call("Read", {"file_path": str(d.get("file_path") or "")}, session, cwd, ids, self.title)
             call.text = call.raw = str(d.get("content") or "")
+            call.gate_first = True  # and the only event before a read: the guard's own files are refused here
             return "after", call
         if event == "beforeMCPExecution":
             name = f"mcp__{d.get('mcp_server_name') or 'server'}__{d.get('tool_name') or ''}"
@@ -111,6 +113,9 @@ class Cursor(Agent):
                 return {"updated_mcp_tool_output": decision.notice}
             return None  # Cursor lets a hook replace nothing else; the log has it
         message = f"jevguard: {decision.reason}"
+        if event == "beforeReadFile":  # allow or deny, nothing between
+            message += " Cursor cannot ask before a file is read, so it was not read."
+            return {"permission": "deny", "user_message": message, "agent_message": message}
         return {"permission": "ask", "user_message": message, "agent_message": message}
 
     def untouched(self, d: dict, phase: str, call: Call) -> dict | None:

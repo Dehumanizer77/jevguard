@@ -77,6 +77,57 @@ def text_of(tool: str, resp) -> tuple[str, list[bytes]]:
     return "\n".join(t for t in texts if t), images
 
 
+# WebFetch does not follow a redirect to another host. It returns a notice of its own instead,
+# captured here from Claude Code 2.1.295. Two things in it came from the server: the address in
+# the Location header and the status line. The rest is the tool's words, the address that was
+# asked for and the prompt the agent wrote.
+_REDIRECT_FIRST = "REDIRECT DETECTED: The URL redirects to a location that was not fetched automatically."
+_REDIRECT_SUPPLIED = re.compile(r"^Redirect URL \(from the server's Location header — server-supplied, not verified\): "
+                                r"(\S+)\nStatus: ([^\n]*)$", re.M)
+_ADDRESS = re.compile(r"https?://[!#-;=?-\[\]_a-z~]{1,2000}")  # printable ASCII without space " < > \ ^ ` { | }
+_STATUS = re.compile(r"3\d\d(?: [ -~]{0,60})?")
+
+
+def _redirect_notice(original: str, redirect: str, status: str, prompt: str) -> str:
+    return (f"{_REDIRECT_FIRST}\n\n"
+            f"Original URL: {original}\n"
+            f"Redirect URL (from the server's Location header — server-supplied, not verified): {redirect}\n"
+            f"Status: {status}\n\n"
+            "To complete your request, I need to fetch content from the redirected URL. "
+            "Please use WebFetch again with these parameters:\n"
+            f'- url: "{redirect}"\n'
+            f'- prompt: "{prompt}"')
+
+
+def _line_edges(text: str) -> str:
+    return "\n".join(line.strip() for line in text.strip().splitlines())
+
+
+def redirect_supplied(tool_input: dict, text: str) -> str | None:
+    """If a WebFetch result is that notice and nothing else: the two parts the server supplied,
+    which are then all there is to scan. Else None, and the result is scanned whole.
+
+    The notice is not recognised by its wording. It is written out again from the address and
+    the prompt of this very call and the two parts found in the text, and has to come out equal
+    to the text. A notice with a word added, another prompt or two different addresses is not
+    equal. What the server can choose is an address without spaces and a short status line; both
+    are still scored, the address also with its %-escapes decoded."""
+    url, prompt = tool_input.get("url"), tool_input.get("prompt")
+    if not text.startswith(_REDIRECT_FIRST) or not isinstance(url, str) or not isinstance(prompt, str):
+        return None
+    got = _line_edges(text)
+    found = _REDIRECT_SUPPLIED.search(got)
+    if not found or not _ADDRESS.fullmatch(found.group(1)) or not _STATUS.fullmatch(found.group(2)):
+        return None
+    redirect, status = found.groups()
+    asked = {url, "https://" + url[len("http://"):] if url.startswith("http://") else url}  # the tool upgrades http
+    if not any(got == _line_edges(_redirect_notice(original, redirect, status, prompt)) for original in asked):
+        return None
+    from urllib.parse import unquote
+    decoded = unquote(redirect, errors="replace")
+    return "\n".join([redirect, status] + ([decoded] if decoded != redirect else []))
+
+
 def replaced(tool: str, resp, note: str):
     """The tool result with its content replaced by note, in the shape the tool returns."""
     if isinstance(resp, dict) and tool == "Bash":

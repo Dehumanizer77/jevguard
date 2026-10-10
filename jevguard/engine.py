@@ -37,6 +37,7 @@ class Call:  # plain classes: the hook starts for every tool call, and dataclass
         self.text = ""                # after the call: what the model would read
         self.images: list = []        # ... the images in it, as bytes
         self.raw = None               # ... and the result as the agent gave it, for the quarantine
+        self.gate_first = False       # an event that is both: gate the call, then judge the content it carries
 
 
 class Decision:
@@ -192,7 +193,8 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
 def before(call: Call, cfg) -> Decision | None:
     from . import gate
     tool, tool_input, sid, cwd = call.tool, call.tool_input, call.session, call.cwd
-    detail = str(tool_input.get("command") or tool_input.get("url") or tool_input.get("file_path") or "")[:160]
+    detail = str(tool_input.get("command") or tool_input.get("url") or tool_input.get("file_path")
+                 or tool_input.get("path") or "")[:160]
     ids = {"event": "gate", "tool": tool, "session": sid, **call.ids, "cwd": cwd, "detail": detail}
     if cfg.protect_guard:
         why = gate.guard_change(tool, tool_input, cfg, cwd)

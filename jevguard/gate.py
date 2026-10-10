@@ -261,6 +261,18 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
     if tool in ("Write", "Edit", "NotebookEdit"):
         path = canonical(str(tool_input.get("file_path") or ""), cwd)
         return f"{tool} writes to {_show(path)}, {kind(path)}" if protected(path) else ""
+    if tool in ("Read", "Grep"):
+        # An agent's own file tools, and the API key and the seal key. Claude Code is kept away
+        # from them by the two permission rules `install` writes (its hook is not started before
+        # a Read); for every other agent this is what stands in front of them. A search from a
+        # directory above reads them as well.
+        path = canonical(str(tool_input.get("file_path") or tool_input.get("path") or ""), cwd)
+        keys = roots[:2]
+        if any(under(path, r) for r in keys):
+            return f"{tool} reads {_show(path)}, one of the guard's own files (the API key is kept there)"
+        if tool == "Grep" and any(under(r, path) for r in keys):
+            return f"{tool} searches {_show(path)}, which holds the guard's own files (the API key is kept there)"
+        return ""
     if tool != "Bash":
         return ""
     cmd = str(tool_input.get("command") or "")
