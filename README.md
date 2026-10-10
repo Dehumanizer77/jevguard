@@ -229,7 +229,7 @@ jevguard status                 # settings, key, token use, counts from the log
 jevguard log                    # recent scans that were not a plain pass (--all for every scan)
 jevguard show fw-20261009-ab12cd      # read a quarantined result (your own terminal only)
 jevguard release fw-20261009-ab12cd   # hand the original to Claude and let that content pass from now on
-jevguard trust https://docs.example.com/guide/   # never withhold content from this address
+jevguard trust https://docs.example.com/guide/   # never withhold what WebFetch gets from this address
 jevguard mode block             # start withholding; `jevguard mode log` to go back
 jevguard gate ask-flagged       # ask before risky actions once something was flagged
 ```
@@ -257,73 +257,57 @@ jevguard trust https://developers.openai.com/codex/     # a URL prefix: this pat
 jevguard untrust https://developers.openai.com/codex/
 ```
 
-Content from a trusted address is scanned and logged as before (`would-block` in the log when
-it scores as an injection) and is not withheld. Keep the prefixes narrow: whatever such an
-address returns later, or redirects to, reaches Claude unread by anyone. For MCP tools the
-equivalent is the `warn_tools` setting.
+What `WebFetch` gets from a trusted address is scanned and logged as before (`would-block` in
+the log when it scores as an injection) and is not withheld. Keep the prefixes narrow: whatever
+such an address returns later, or redirects to, reaches Claude unread by anyone. The address
+has to be plain: no percent escapes in the path (`%2e%2e` is `..` to the server), no `..`, `;`
+or doubled slash, no braces or brackets. For MCP tools the equivalent is the `warn_tools`
+setting.
 
-It applies to `WebFetch` and to a plain download in the shell, and to nothing that only looks
-like one:
+The list does not reach `curl` or `wget`. With `WebFetch` the address is a field of the call;
+what a shell command really fetches cannot be read off its text. An earlier version tried, and
+was got around through a printed address, a header with a line break in it, a redirection from
+`/dev/tcp`, `printf -v PATH`, a `?` the shell took for a glob, curl's own `%output` and a bare
+`cd`. So a download in the shell is ordinary outside content: scanned, and withheld if it
+scores as an injection. If that happens to a page you trust, fetch it with `WebFetch`, or
+release the blocked result.
 
-- The address has to be plain: no percent escapes in the path (`%2e%2e` is `..` to the server),
-  no `..`, `;` or doubled slash, no braces or brackets.
-- In the shell the whole command has to be `curl` or `wget` fetching trusted addresses with
-  everyday options (`-s -S -L -f -o -H 'Accept: ...'` and the like), written on one line,
-  optionally piped through filters. A proxy, `--resolve`, `--connect-to`, a `Host` or
-  forwarding header, a line break inside an argument (in a header that is a second header),
-  `-k`, a config file (`-K`, `wget -i`), a variable, `$(...)`, any other program in the same
-  command: any of these and the result is handled as ordinary outside content. So is every
-  `curl` download while a `~/.curlrc` exists, and every `wget` download while a `~/.wgetrc`
-  does: such a file can name a proxy, and the guard cannot tell who wrote it.
-- A filter here is `head`, `tail`, `grep`, `jq`, `wc`, `sort`, `uniq`, `cut`, `tr`,
-  `sed -n '1,80p'` or `tee`, with short options and reading only what it is piped. Given a
-  file to read (`head notes.txt`, `grep -r`, `jq -f`) it is a program that adds content of its
-  own, and the exemption ends.
-- Nothing may come in by a redirection either: `cat < /dev/tcp/host/port` is a network read
-  and `head < notes.txt` a file read, so any `<`, a here-document or a `/dev/tcp` address ends
-  the exemption. Redirecting output (`> out.html`, `2>&1`, `2>/dev/null`) is fine. The command
-  is read the way the shell reads it: a quoted `'>'` or `';'` is an argument, not an operator.
-- A bare `curl` has to be the program it seems. `printf` is no companion, because
-  `printf -v PATH ...` changes where programs are found; a command that writes to a program
-  or into a directory on your `PATH` (`echo ... > ~/.cargo/bin/rtk; rtk curl ...`) is not
-  exempt; and nothing is while `PATH` has an empty or relative entry.
+**No shell command is exempt from blocking because of what it looks like.** That is the rule
+the rest follows from. Two things are still read off a command, and both only when the whole
+command is one program with its arguments written out: no pipe, no second command, no
+redirection except `2>&1` or `2>/dev/null` at the end, nothing for the shell to expand (a
+variable, `$(...)`, a glob, `~`, a backslash), no line break.
 
-`gh` is a special case. Everything it prints counts as outside content, and short status lines
-and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false` scored 0.38. List
-your own repositories in `own_repos` (`"acme/*"`, `"solo/tool"`) and what `gh` returns about
-them is withheld only from 0.6 up; between 0.38 and 0.6 it is logged as flagged. Where the
-whole reply is the address of what the command just made or changed, it is only logged:
-`gh pr create`, `gh pr comment`, `gh pr edit`, the same three for `gh issue`, `gh release
-create` and `edit`, `gh label create` and `edit` (not with `--dry-run`, which prints the text
-it would use). Nothing else is treated that way. `gh issue close 7` prints the issue's title,
-and `gh api` returns the whole object for every write, with more in it than the command sent:
-a pull request made from an issue carries that issue's text, release notes can be generated
-from the titles of merged pull requests. Either may be a stranger's text. This is deliberately
-not an exemption: anyone can open an issue or write a comment in a public repository, and a
-clear injection scores near 1 either way. A command counts only when its repository is plain
-to see (`--repo`, an `api repos/owner/name/...` path, or the checkout it runs in) and nothing
-else in it can add to the output: beside `gh` there may be `cd`, `echo`, the same filters as
-above and plain `git`, and no other program (`gh issue comment ...; curl -K x` is ordinary
-outside content). A `gh api` call with an option the guard does not know, `--hostname`, two
-methods or `..` in its path gets no leniency at all, and neither does any `gh` call while
-`GH_HOST` or `GH_REPO` is set or gh's own settings send its requests through a socket
-(`http_unix_socket`).
+`gh` about your own repositories. Everything `gh` prints counts as outside content, and short
+status lines and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false`
+scored 0.38. List your own repositories in `own_repos` (`"acme/*"`, `"solo/tool"`) and what one
+`gh` command about them returns is withheld only from 0.6 up; between 0.38 and 0.6 it is logged
+as flagged. This is a higher level, not an exemption: anyone can open an issue or write a
+comment in a public repository, a clear injection scores near 1 either way, and the reply to
+your own `gh pr create` or `gh api -X PATCH` is scored like everything else. The command has to
+name the repository (`--repo owner/name`, `gh api repos/owner/name/...`, `gh repo view
+owner/name`); it is not taken from the directory, because which repository `gh` picks there
+depends on the remotes and settings of the checkout. So:
 
-Plain `git` beside `gh` means two things. `git status`, `add`, `commit -m`, `checkout -b`,
-`switch`, `branch`, `restore`, `tag` and `rev-parse` fetch nothing and change nothing about how
-the result is handled, as long as they are in a form that prints neither file content nor the
-text of someone's commit (not `status -v`, `commit -F file`, `branch -vv`, `tag -n`, `stash`, a
-`checkout` of anything but a new branch). `git push` brings back what the server says, so with it the result is
-never "only logged", and it counts as about your own repository only when the push plainly
-goes to one: `git push`, `git push origin <branch>` with everyday options (`-u`, `--tags`,
-`--force-with-lease`, ...), in a checkout that talks to one repository only. That is a
-checkout whose only remote is `origin` with a single github.com address, with no `pushurl`,
-`insteadOf`, `pushDefault`, `pushRemote`, `sshCommand`, `proxy` or `include` in its settings or
-in your `~/.gitconfig`.
-The same holds for a `gh` command that names no repository and takes it from the checkout:
-with a second remote `gh` may pick that one. Anything else (`git -c ...`, `git -C dir`,
-another remote, an address in place of a remote, `git log`, `git fetch`, `git pull`) and the
-command is ordinary outside content; name the repository with `--repo` and run git separately.
+```bash
+gh pr view 14 --repo acme/widget --json title,state      # your repository: the higher level
+gh pr view 14 --repo acme/widget | head -20              # a pipe: ordinary outside content
+git push && gh pr create --repo acme/widget --fill       # two programs: ordinary outside content
+gh pr list                                               # no repository named: ordinary outside content
+```
+
+Use `--jq` or `--json` instead of a pipe, and run `git push` as a command of its own. No
+higher level either for a `gh api` call with an option the guard does not know, `--hostname`
+or `..` in its path, for an address among the arguments, or while `GH_HOST` or `GH_REPO` is set,
+gh's own settings send its requests through a socket (`http_unix_socket`), or `PATH` has an
+empty or relative entry.
+
+A program you vouch for. `trusted_commands` takes program names (`"make"`); the output of such
+a program is scanned and logged, never withheld. That is your word for the program, not
+something the guard checks, and it holds for the same narrow form only: `make test`, not
+`make test | head`, `./make test` or `cd elsewhere && make test`. There is no built-in list:
+`git status`, `cp` or `date` look harmless and are not (`cp notes.txt /dev/stdout` prints a
+file, `git switch main` prints the title of a commit someone else wrote).
 
 `show` and `release` are for you, reading what was blocked. They refuse to run without a
 terminal or when started from inside Claude Code, and the hook asks you before any call that
@@ -343,15 +327,15 @@ longer recognises them as its own.
 |---|---|---|
 | `mode` | `log` | `log` or `block` |
 | `gate` | `log` | `off`, `log`, `ask-flagged`, `ask-external` |
-| `scan_local` | `false` | also scan local files and local command output (they block at `local_block`, 0.6). Commands that only report on the agent's own work (`git status`, `git commit -m`, `cp`, `mkdir`, `echo`, `date`, ...) are then scanned and logged, never withheld, as long as they stand in a form that prints nothing else: `cp notes.txt /dev/stdout`, `date -f notes.txt`, `git status -v` or `./date` are ordinary local output |
-| `trusted_commands` | `[]` | further program names to treat that way, e.g. `make`; by bare name, in a command that runs as written |
+| `scan_local` | `false` | also scan local files and local command output (they block at `local_block`, 0.6); output of `gh` about your own repositories is then withheld from the lower of the two levels |
+| `trusted_commands` | `[]` | program names whose output is scanned and logged, never withheld, e.g. `make`: your word for that program. Only when the whole command is that one program with its arguments written out |
 | `scan_private_hosts` | `false` | treat fetches from localhost and private addresses as outside content |
 | `external_paths` | `["~/Downloads"]` | directories whose files are outside content |
 | `track_clones` | `false` | treat directories created by `git clone` as outside content |
 | `skip_tools` | claude.ai Gmail, Drive, Calendar, Docs connectors | tool-name patterns never scanned |
 | `warn_tools` | `[]` | tool-name patterns that are scanned and logged, never withheld |
-| `trusted_sources` | `[]` | URL prefixes whose content is scanned and logged, never withheld (`jevguard trust`) |
-| `own_repos` | `[]` | your own GitHub repositories, as `owner/name` or `owner/*`; what `gh` returns about them is withheld only from `own_repos_block` up |
+| `trusted_sources` | `[]` | URL prefixes; what `WebFetch` gets from them is scanned and logged, never withheld (`jevguard trust`). Not for `curl` or `wget` |
+| `own_repos` | `[]` | your own GitHub repositories, as `owner/name` or `owner/*`; what one `gh` command naming such a repository returns is withheld only from `own_repos_block` up |
 | `own_repos_block` | `0.6` | that level |
 | `on_error` | `open` | `closed` withholds outside content that could not be fully scanned: the API failed, the guard hit an error, or part of the result was unreadable (block mode). Without `tesseract` that includes every image from outside |
 | `protect_guard` | `true` | ask before any call that would change the guard or the Claude Code settings that run it |

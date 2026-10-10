@@ -1,8 +1,10 @@
 """Which GitHub repository a `gh` command is about.
 
-Used to treat what `gh` returns about the owner's own repositories less strictly than what it
-returns about anyone else's. Everything here errs towards "cannot tell": a command whose
-repository is not plain to see is handled as any other outside content.
+Used to withhold what `gh` returns about the owner's own repositories from a higher score up
+than what it returns about anyone else's. The repository has to be written in the command
+(`--repo owner/name`, `api repos/owner/name/...`); it is never taken from the directory the
+command runs in, because which repository gh then picks depends on the remotes and settings of
+that checkout. Everything here errs towards "cannot tell".
 """
 
 from __future__ import annotations
@@ -12,125 +14,33 @@ import os
 import re
 
 _NAME = r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+"
-_GITHUB_URL = re.compile(r"(?:https?://(?:[^@/\s]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
-                         r"(" + _NAME + r"?)(?:\.git)?/?", re.I)
 _API_PATH = re.compile(r"/?repos/(" + _NAME + r")(?:/.*)?")
-# Subcommands that act on one repository: the one named with --repo, else the one checked out
-# in the directory. `search`, `status`, `gist` and `api` paths outside repos/ range over GitHub.
+# Subcommands that act on one repository. `search`, `status`, `gist` and `api` paths outside
+# repos/ range over GitHub.
 _REPO_SCOPED = {"pr", "issue", "run", "workflow", "release", "label", "cache", "secret", "variable", "ruleset"}
+# What `gh <noun> <verb>` changes something with. gate.py asks about these.
+WRITE_VERBS = {"create", "comment", "edit", "merge", "close", "reopen", "delete", "upload", "set", "run", "fork",
+               "review", "ready", "lock", "unlock", "transfer", "rename", "archive", "unarchive", "sync", "enable",
+               "disable", "rerun", "cancel", "add", "remove", "import", "pin", "unpin", "develop", "revert"}
 
 
 def slug(value: str) -> str | None:
-    """owner/name from what `--repo` or a git remote holds; None for another host or anything else."""
-    value = value.strip()
-    m = _GITHUB_URL.fullmatch(value)
-    if m:
-        return m.group(1)
-    value = re.sub(r"^github\.com/", "", value, flags=re.I)
+    """owner/name from what `--repo` holds; None for another host or anything else."""
+    value = re.sub(r"^github\.com/", "", value.strip(), flags=re.I)
     return value if re.fullmatch(_NAME, value) else None
-
-
-# ---- the checkout a command runs in ----------------------------------------------------------------
-# Git's settings files are searched as text, not parsed: a key counts wherever it stands (at the
-# start of a line or after a section header on the same line, in a comment too), and anything
-# that is not exactly the plain form ends in "cannot tell". Wider than the truth, never narrower.
-_KEY = r"(?:^|[\]\s])"
-_REMOTE_HEADER = re.compile(r"\[\s*remote\b[^\]\n]*\]?", re.I)
-_ORIGIN_HEADER = re.compile(r'\[\s*(?i:remote)\s+"origin"\s*\]')
-_URL_KEY = re.compile(_KEY + r"url\s*=[ \t]*(\S*)", re.I | re.M)
-_BRANCH_REMOTE = re.compile(_KEY + r"remote\s*=[ \t]*(\S*)", re.I | re.M)
-_GH_RESOLVED = re.compile(_KEY + r"gh-resolved\s*=[ \t]*(\S*)", re.I | re.M)
-# Settings that send git somewhere other than the address written for origin, put a program or
-# a proxy of someone's choosing between git and that address, or pull in settings this reader
-# does not see.
-_ELSEWHERE = re.compile(_KEY + r"(?:pushurl|pushdefault|pushremote|(?:push)?insteadof|worktreeconfig|sshcommand|"
-                        r"(?:git)?proxy|sslverify|hookspath|fsmonitor)\s*=|^\s*\[\s*include", re.I | re.M)
-_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_PARAMETERS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND")
-
-
-def _read(path: str) -> str | None:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read(200_000)
-    except OSError:
-        return None
-
-
-def _checkout_settings(directory: str) -> str | None:
-    """The text of .git/config of the checkout around a directory."""
-    d = directory
-    for _ in range(40):
-        config = os.path.join(d, ".git", "config")
-        if os.path.isfile(config):
-            return _read(config)
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-    return None
-
-
-def _user_git_settings() -> str:
-    home = os.path.expanduser("~")
-    folder = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-    return "\n".join(_read(p) or "" for p in (os.path.join(home, ".gitconfig"), os.path.join(folder, "git", "config")))
-
-
-def origin_repo(directory: str) -> str | None:
-    """The one github.com repository the git checkout around a directory talks to, or None when
-    that is not plain. It is plain when origin is the only remote and has one address, every
-    branch follows origin, and neither the checkout's settings nor the user's own hold anything
-    that sends git elsewhere (pushurl, insteadOf, pushDefault, an include). With a second remote
-    `gh` may pick that one, and a bare `git push` may go to it."""
-    text = _checkout_settings(directory)
-    if text is None or any(name in os.environ for name in _GIT_ENV):
-        return None
-    if _ELSEWHERE.search(text) or _ELSEWHERE.search(_user_git_settings()):
-        return None
-    remotes, urls = _REMOTE_HEADER.findall(text), _URL_KEY.findall(text)
-    if len(remotes) != 1 or not _ORIGIN_HEADER.fullmatch(remotes[0]) or len(urls) != 1:
-        return None
-    if any(remote not in ("origin", ".") for remote in _BRANCH_REMOTE.findall(text)):
-        return None
-    if any(chosen != "base" for chosen in _GH_RESOLVED.findall(text)):
-        return None  # `gh repo set-default` pointed gh at another repository of the same network
-    return slug(urls[0])
-
-
-# ---- git push beside gh -----------------------------------------------------------------------------
-_PUSH_FLAGS = {"-u", "--set-upstream", "-q", "--quiet", "-v", "--verbose", "-f", "--force", "--force-with-lease",
-               "--tags", "--follow-tags", "--no-verify", "-n", "--dry-run", "-d", "--delete"}
-_REFSPEC = re.compile(r"\+?[A-Za-z0-9._/-]*(?::[A-Za-z0-9._/-]*)?")
-
-
-def push_repos(args: list[str], dirs: list[str]) -> list[str] | None:
-    """The github.com repositories a `git push` with these arguments sends to, one for each
-    directory the command may be running in; None when that cannot be told. It can be told when
-    the push names origin or no remote at all, uses everyday options, and the checkout talks to
-    one repository only (see origin_repo). A remote given as an address, another remote's name,
-    --receive-pack, --recurse-submodules: not told."""
-    words = [a for a in args if a not in _PUSH_FLAGS]
-    if any(a.startswith("-") for a in words):
-        return None
-    if words and (words[0] != "origin" or not all(_REFSPEC.fullmatch(w) for w in words[1:])):
-        return None
-    repos = [origin_repo(d) for d in dirs] or [None]
-    return None if any(r is None for r in repos) else repos
 
 
 # ---- gh api, taken apart ---------------------------------------------------------------------------
 _API_FLAGS = {"-i", "--include", "--paginate", "--silent", "--slurp", "--verbose"}
-_API_VALUES = {"-X": "method", "--method": "method", "-f": "field", "--raw-field": "field", "-F": "field",
-               "--field": "field", "--input": "field", "--hostname": "host", "-H": "", "--header": "",
-               "-q": "", "--jq": "", "-t": "", "--template": "", "-p": "", "--preview": "", "--cache": ""}
+_API_VALUES = {"-X", "--method", "-f", "--raw-field", "-F", "--field", "--input", "-H", "--header", "-q", "--jq",
+               "-t", "--template", "-p", "--preview", "--cache"}  # not --hostname: that is another server
 
 
-def _api(args: list[str]) -> tuple[str, str, bool] | None:
-    """(endpoint, method, takes what it sends from a file) of the arguments after `gh api`. None
-    when they hold an option this reader does not know, another host, two different methods, or
-    anything but one endpoint: the caller then assumes nothing about the call."""
-    methods, fields, from_file, words, i = set(), False, False, [], 0
+def _endpoint(args: list[str]) -> str | None:
+    """The endpoint among the arguments after `gh api`. None when they hold an option this
+    reader does not know, another host, or anything but one endpoint: the caller then assumes
+    nothing about the call."""
+    words, i = [], 0
     while i < len(args):
         a = args[i]
         i += 1
@@ -138,31 +48,18 @@ def _api(args: list[str]) -> tuple[str, str, bool] | None:
             words.append(a)
             continue
         if a.startswith("--"):
-            name, attached, value = a.partition("=")
+            name, attached, _ = a.partition("=")
         else:
-            name, value = a[:2], a[2:]  # -XGET, -fkey=value
-            attached = value
+            name, attached = a[:2], a[2:]  # -XGET, -fkey=value
         if name in _API_FLAGS and not attached:
             continue
-        kind = _API_VALUES.get(name)
-        if kind is None or kind == "host":
+        if name not in _API_VALUES:
             return None
         if not attached:
             if i >= len(args):
                 return None
-            value = args[i]
-            i += 1
-        if kind == "method":
-            methods.add(value.upper())
-        fields = fields or kind == "field"
-        # --input names a file (or - for what is piped in); -F key=@file reads the value from one.
-        # -f takes its value as written.
-        from_file = from_file or name == "--input" or (
-            name in ("-F", "--field") and value.partition("=")[2].startswith("@"))
-    if len(words) != 1 or len(methods) > 1:
-        return None
-    # gh's own rule: GET, or POST once a field is given, unless a method is named
-    return words[0], (methods.pop() if methods else "POST" if fields else "GET"), from_file
+            i += 1  # its value is the next word
+    return words[0] if len(words) == 1 else None
 
 
 def _api_repo(endpoint: str) -> str | None:
@@ -175,77 +72,15 @@ def _api_repo(endpoint: str) -> str | None:
     return m.group(1) if m else None
 
 
-# What `gh <noun> <verb>` changes something with. gate.py asks about these.
-WRITE_VERBS = {"create", "comment", "edit", "merge", "close", "reopen", "delete", "upload", "set", "run", "fork",
-               "review", "ready", "lock", "unlock", "transfer", "rename", "archive", "unarchive", "sync", "enable",
-               "disable", "rerun", "cancel", "add", "remove", "import", "pin", "unpin", "develop", "revert"}
-_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-# The commands whose whole reply is the address of what they made or changed, or one line saying
-# that it was done. Nothing else is an echo:
-# - `gh issue close` prints the title of the issue, which may be a stranger's;
-# - `gh api` returns the whole object for every write, and what GitHub puts into a new object is
-#   not only what the command sent: a pull request made from an issue (`-F issue=7`) carries
-#   that issue's text, release notes can be generated from the titles of merged pull requests.
-_ECHO = {("pr", "create"), ("pr", "comment"), ("pr", "edit"), ("issue", "create"), ("issue", "comment"),
-         ("issue", "edit"), ("release", "create"), ("release", "edit"), ("label", "create"), ("label", "edit")}
-
-
-def gh_writes(argv: list[str]) -> bool:
-    """The invocation plainly changes something on GitHub. Read strictly, the other way round
-    from the gate: there a doubtful call is asked about, here a doubtful call is not a write.
-    `gh api -X GET ... -f per_page=10` is a read whatever fields it carries."""
-    args = argv[1:]
-    if args[:1] == ["api"]:
-        call = _api(args[1:])
-        return bool(call) and call[1] not in _SAFE_METHODS
-    words = [a for a in args if not a.startswith("-")]
-    return len(words) > 1 and args[0] in _REPO_SCOPED and words[1] in WRITE_VERBS
-
-
-def gh_sends_file(argv: list[str]) -> bool:
-    """A `gh api` call that takes what it sends from a file or from what it is piped."""
-    call = _api(argv[2:]) if argv[1:2] == ["api"] else None
-    return bool(call) and call[2]
-
-
-def gh_echo(argv: list[str]) -> bool:
-    """The reply to this invocation is the address of what it just made or changed, and nothing
-    else. Never for `gh api`, and not for --dry-run, which prints the title and the body the
-    command would have used (with --fill, the text of the commits)."""
-    args = argv[1:]
-    if not gh_writes(argv) or args[0] == "api":
-        return False
-    words = [a for a in args if not a.startswith("-")]
-    return (words[0], words[1]) in _ECHO and not any(a.split("=", 1)[0] == "--dry-run" for a in args)
-
-
-_SOCKET = re.compile(r"(?m)^\s*http_unix_socket\s*:[ \t]*(?!(?:\"\"|'')?[ \t]*(?:#.*)?$)\S")
-
-
-def rerouted() -> bool:
-    """gh is set to send its requests through a socket. What answers there is not known to be
-    GitHub, so nothing gh returns is then treated as coming from the owner's own repositories."""
-    env = os.environ
-    folder = env.get("GH_CONFIG_DIR") or os.path.join(
-        env.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"), "gh")
-    for name in ("config.yml", "hosts.yml"):
-        try:
-            with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
-                if _SOCKET.search(f.read(200_000)):
-                    return True
-        except OSError:
-            pass
-    return False
-
-
-def gh_repos(argv: list[str], dirs: list[str]) -> list[str] | None:
-    """The repositories one `gh` invocation is about, or None when that cannot be told."""
+def gh_repos(argv: list[str]) -> list[str] | None:
+    """The repositories one `gh` invocation names, or None when it names none or more could be
+    meant than it names."""
     args = argv[1:]
     if any(a.split("=", 1)[0] == "--hostname" for a in args):
         return None  # another server: the same owner/name there is someone else's
     if args[:1] == ["api"]:
-        call = _api(args[1:])
-        repo = _api_repo(call[0]) if call else None
+        endpoint = _endpoint(args[1:])
+        repo = _api_repo(endpoint) if endpoint else None
         return [repo] if repo else None
     words, named, skip = [], [], False
     for i, a in enumerate(args):
@@ -268,12 +103,29 @@ def gh_repos(argv: list[str], dirs: list[str]) -> list[str] | None:
         named = named or words[2:3]
     elif words[0] not in _REPO_SCOPED:
         return None
-    if named:
-        repos = [slug(n) for n in named]
-    else:
-        repos = [origin_repo(d) for d in dirs] or [None]
-    return None if any(r is None for r in repos) else repos
+    repos = [slug(n) for n in named]
+    return repos if repos and all(repos) else None
 
 
 def is_own(repo: str, patterns: list) -> bool:
     return any(fnmatch.fnmatchcase(repo.lower(), str(p).lower()) for p in patterns)
+
+
+# ---- gh sent somewhere else ------------------------------------------------------------------------
+_SOCKET = re.compile(r"(?m)^\s*http_unix_socket\s*:[ \t]*(?!(?:\"\"|'')?[ \t]*(?:#.*)?$)\S")
+
+
+def rerouted() -> bool:
+    """gh is set to send its requests through a socket. What answers there is not known to be
+    GitHub, so nothing gh returns is then treated as coming from the owner's own repositories."""
+    env = os.environ
+    folder = env.get("GH_CONFIG_DIR") or os.path.join(
+        env.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"), "gh")
+    for name in ("config.yml", "hosts.yml"):
+        try:
+            with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+                if _SOCKET.search(f.read(200_000)):
+                    return True
+        except OSError:
+            pass
+    return False

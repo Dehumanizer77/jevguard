@@ -133,18 +133,18 @@ def test_trusted_address_is_scanned_and_logged_but_not_withheld(guard, jev):
     assert fetch(guard, "https://news.example.com/a", ATTACK, session="b") is not None
 
 
-def test_trusted_address_through_a_command(guard):
+def test_the_trusted_list_does_not_reach_shell_commands(guard):
+    """It holds for WebFetch, where the address is a field of the call. What a shell command
+    really fetches cannot be read off it, however plain it looks."""
     guard.configure(mode="block", trusted_sources=[PREFIX])
 
     def run(command, session):
         return guard.hook("PostToolUse", "Bash", {"command": command}, dict(BASH, stdout=ATTACK), session=session, cwd="/work")
 
-    assert run(f"curl -s {PREFIX}/hooks | head -50", "a") is None
-    assert guard.log()[-1]["mode"] == "trusted"
-    # one address off the list, or a tool whose address is not in the command, and it is ordinary outside content
-    assert run(f"curl -s {PREFIX}/hooks https://news.example.com/a", "b") is not None
-    assert run(f"curl -s {PREFIX}/hooks; gh issue view 3", "c") is not None
-    assert run("curl -s https://docs.example.com.evil.example/guide/hooks", "d") is not None
+    for n, command in enumerate((f"curl -s {PREFIX}/hooks", f"curl -s {PREFIX}/hooks | head -50",
+                                 f"wget -qO- {PREFIX}/hooks", f"curl -s '{PREFIX}/hooks' 2>/dev/null")):
+        assert run(command, f"s{n}") is not None, command
+        assert guard.log()[-1]["mode"] == "external" and guard.log()[-1]["action"] == "blocked"
 
 
 def test_trust_command_edits_the_list(guard, monkeypatch, capsys):

@@ -57,98 +57,55 @@ def tokens(cmd: str) -> list[str]:
         return re.findall(r"[();|&<>]+|[^\s();|&<>]+", cmd)
 
 
-_OPERATORS = ("&>>", "<<<", "<<-", "&&", "||", ";;", "|&", "&>", ">>", ">&", ">|", "<<", "<&", "<>",
-              ";", "|", "&", "(", ")", "<", ">")
+_BARE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-")
+_STDERR_ONLY = (" 2>&1", " 2>/dev/null")
 
 
-def plain_commands(cmd: str) -> list[tuple[list[str], list[tuple[str, str]]]] | None:
-    """A command line that runs exactly as written, cut into its simple commands the way the
-    shell cuts it: for each, its words and its redirections as (operator, target), `2>` with its
-    number. None for a line that is not of that kind.
+def literal_command(cmd: str) -> list[str] | None:
+    """The words of a command line that is one program with its arguments written out, or None.
 
-    Quotes decide what is an operator: `'>'`, `">"` and `\\>` are arguments like any other, and
-    so is whatever follows them. tokens() does not keep that difference and must not be used
-    where it matters.
+    This is the only reading of a command that anything lenient may rest on, and it is narrow on
+    purpose. The shell does much before it runs a line (it expands variables, globs and braces,
+    it honours operators, redirections and assignments, and bash and zsh do not agree on all of
+    it), and a reader that follows some of that is wrong about the rest. So nothing is followed.
+    A line is accepted only when there is nothing to follow:
 
-    Not of that kind, because the shell would rewrite it before running it: a variable or a
-    command substitution anywhere but in single quotes, a brace list or a glob outside quotes.
-    `$?` is let through, it is a number; so is a `?` inside an address, where it cannot match
-    its way to another host. Also not read: an open quote, an operator with nothing after it,
-    a comment. No wrapper is removed."""
-    commands, words, redirections = [], [], []
-    word, bare, pending, i = None, True, None, 0  # bare: nothing in the word so far was quoted
+    - outside quotes, only letters, digits and _ @ % + = : , . / - . No ? * [ ] { } ~ # ! $ and
+      no backslash: a `?` in an address is a glob to the shell;
+    - in single quotes, anything; in double quotes, anything but $ ` and backslash;
+    - no operator and no redirection at all: no ; | & ( ) < >. The one exception is a line that
+      ends in `2>&1` or `2>/dev/null`, which moves or drops the program's own error output;
+    - no control character, line breaks included.
 
-    def end_word() -> None:
-        nonlocal word, bare, pending
-        if word is not None:
-            if pending is None:
-                words.append("".join(word))
-            else:
-                redirections.append((pending, "".join(word)))
-                pending = None
-        word, bare = None, True
-
-    def end_command() -> None:
-        nonlocal words, redirections
-        if words or redirections:
-            commands.append((words, redirections))
-        words, redirections = [], []
-
+    One program, then, and exactly these arguments. Which program a bare name runs is for the
+    caller to worry about."""
+    cmd = cmd.strip()
+    for ending in _STDERR_ONLY:
+        if cmd.endswith(ending):
+            cmd = cmd[:-len(ending)].rstrip()
+            break
+    if any(ord(c) < 32 or ord(c) == 127 for c in cmd):
+        return None
+    words, word, i = [], None, 0
     while i < len(cmd):
         ch = cmd[i]
-        if ch in " \t":
-            end_word()
-        elif ch == "'":
-            close = cmd.find("'", i + 1)
-            if close < 0:
+        if ch == " ":
+            if word is not None:
+                words.append("".join(word))
+            word = None
+        elif ch in "'\"":
+            close = cmd.find(ch, i + 1)
+            if close < 0 or (ch == '"' and any(c in "$`\\" for c in cmd[i + 1:close])):
                 return None
-            word, bare, i = (word or []) + [cmd[i + 1:close]], False, close
-        elif ch == '"':
-            word, bare, i = word or [], False, i + 1
-            while i < len(cmd) and cmd[i] != '"':
-                if cmd[i] == "\\" and cmd[i + 1:i + 2] in ('"', "\\", "$", "`"):
-                    i += 1
-                elif cmd[i] == "`" or (cmd[i] == "$" and cmd[i + 1:i + 2] != "?"):
-                    return None
-                word.append(cmd[i])
-                i += 1
-            if i >= len(cmd):
-                return None
-        elif ch == "\\":
-            if i + 1 >= len(cmd):
-                return None
-            word, bare, i = (word or []) + [cmd[i + 1]], False, i + 1
-        elif ch == "$" and cmd[i + 1:i + 2] == "?":
-            word, i = (word or []) + ["$?"], i + 1
-        elif ch in "$`{}*[]" or (ch == "#" and word is None):
-            return None
-        elif ch == "?" and "://" not in "".join(word or []):
-            return None
+            word, i = (word or []) + [cmd[i + 1:close]], close
+        elif ch in _BARE and not (ch == "=" and word is None):  # zsh expands a leading = to a path
+            word = (word or []) + [ch]
         else:
-            operator = "\n" if ch == "\n" else next((o for o in _OPERATORS if cmd.startswith(o, i)), None)
-            if operator is None:
-                word = (word or []) + [ch]
-            elif "<" in operator or ">" in operator:
-                number = "".join(word) if word is not None and bare and "".join(word).isdigit() else ""
-                if number:
-                    word = None  # the 2 of 2>/dev/null belongs to the operator
-                end_word()
-                if pending is not None:
-                    return None
-                pending = number + operator
-                i += len(operator) - 1
-            else:
-                end_word()
-                if pending is not None:
-                    return None
-                end_command()
-                i += len(operator) - 1
+            return None
         i += 1
-    end_word()
-    if pending is not None:
-        return None
-    end_command()
-    return commands
+    if word is not None:
+        words.append("".join(word))
+    return words or None
 
 
 class Command:

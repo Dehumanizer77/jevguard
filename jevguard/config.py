@@ -34,16 +34,21 @@ DEFAULTS = {
     "skip_tools": ["mcp__claude_ai_Gmail__.*", "mcp__claude_ai_Google_Drive__.*",
                    "mcp__claude_ai_Google_Calendar__.*", "mcp__claude_ai_Claude_Docs__.*"],
     "warn_tools": [],
+    # Program names whose output is scanned and logged but never withheld, e.g. "make". Your word
+    # for that program: the guard does not check what it prints. It counts only when the whole
+    # command is that one program with literal arguments (no pipe, no second command).
     "trusted_commands": [],
     # Addresses whose content is scanned and logged but never withheld, as URL prefixes
     # ("https://developers.openai.com/codex/"). For sources that keep scoring as an injection
     # without being one: documentation about hooks, articles about prompt injection. Whatever such
     # an address returns later, or redirects to, passes unread by anyone; keep the prefixes narrow.
+    # It holds for WebFetch, where the address is a field of the call, and not for curl or wget:
+    # what a shell command really fetches cannot be read off it.
     "trusted_sources": [],
-    # Your own GitHub repositories, as "owner/name" or "owner/*". What `gh` returns about them is
-    # still scanned, but withheld only from own_repos_block up instead of the policy level: short
-    # status lines and one's own commit titles score in between. Not an exemption: anyone can
-    # write an issue or a comment in a public repository.
+    # Your own GitHub repositories, as "owner/name" or "owner/*". What one `gh` command that names
+    # such a repository returns is still scanned, but withheld only from own_repos_block up
+    # instead of the policy level: short status lines and one's own commit titles score in
+    # between. Not an exemption: anyone can write an issue or a comment in a public repository.
     "own_repos": [],
     "own_repos_block": 0.6,
     # When scanning fails: "open" passes the result, "closed" withholds outside content.

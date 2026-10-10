@@ -147,8 +147,8 @@ def cmd_trust(cfg, a) -> int:
     for s in sources:
         print(" ", s)
     if a.cmd == "trust":
-        print("content from there is still scanned and logged, but no longer withheld, "
-              "whatever the address returns or redirects to")
+        print("what WebFetch gets from there is still scanned and logged, but no longer withheld, "
+              "whatever the address returns or redirects to; curl and wget are not covered")
     return 0
 
 

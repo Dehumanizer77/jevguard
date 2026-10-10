@@ -21,7 +21,7 @@ _CLASSIFIER_NOTE = ("jevguard withheld a tool result in this session as a likely
                     "send data out, publish, or change startup and configuration files need the user's approval.")
 _UNKNOWN = "unknown"  # the origin of a result was not established before something failed
 # Origins that are content from outside, however strictly each is then handled (see provenance.py).
-_OUTSIDE = ("external", "trusted", "own", "echo")
+_OUTSIDE = ("external", "trusted", "own")
 
 
 def _replace(tool: str, resp, text: str) -> dict:
@@ -78,7 +78,7 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     if digest in store.released(cfg):
         store.audit(cfg, **base, action="passed-released")
         return None
-    enforce = cfg.mode == "block" and mode not in ("warn", "trusted", "echo")
+    enforce = cfg.mode == "block" and mode not in ("warn", "trusted")
     # Outside content the scan could not vouch for (the API failed, part of it was unreadable) is
     # withheld when the owner chose on_error = closed.
     withhold_unscanned = enforce and cfg.on_error == "closed" and mode in ("external", "own")
@@ -109,7 +109,11 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
         return unavailable(str(err), verdict, partial_verdict=v, outage=err.outage, ms=ms)
     # Local content and what gh returns about the owner's own repositories are withheld only from
     # a higher score up; between the policy level and that one they are logged as flagged.
-    block_at = {"local": cfg.local_block, "own": cfg.own_repos_block}.get(mode)
+    # What gh prints can carry local content (a request body read from a file comes back in the
+    # reply, --dry-run prints the text of local commits), so where local output is scanned at all,
+    # own-repository output is never given the more lenient of the two levels.
+    own_block = min(cfg.own_repos_block, cfg.local_block) if cfg.scan_local else cfg.own_repos_block
+    block_at = {"local": cfg.local_block, "own": own_block}.get(mode)
     if v == "injection" and block_at is not None and (verdict.get("score") or 0) < block_at:
         verdict, v = dict(verdict, verdict="suspicious"), "suspicious"
     incomplete = sorted(set(verdict.get("flags") or []) & scanner.INCOMPLETE)
