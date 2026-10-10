@@ -63,9 +63,9 @@ def wanted(call, cfg) -> bool:
         return True
     try:
         paths = engine._existing(cfg, store.session(cfg, call.session).get("paths", []))
-    except (ValueError, OSError):
-        return True
-    return bool(paths) or provenance.classify("Bash", call.tool_input, cfg, call.cwd, paths, "") in engine.OUTSIDE
+        return bool(paths) or provenance.classify("Bash", call.tool_input, cfg, call.cwd, paths, "") in engine.OUTSIDE
+    except Exception:
+        return True  # it cannot be told: then it runs through here, where the output can still be withheld
 
 
 def _usage() -> int:
@@ -123,8 +123,14 @@ def _judge(agent: str, session: str, command: str, out: bytes, err: bytes, close
         # Tells the agent's own hook that this output is dealt with. Bookkeeping: if the mark
         # cannot be left, that hook looks at the output a second time and the verdict above stands.
         store.judged(cfg, session, call.tool_input["command"], mark=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        ctx.setdefault("unrecorded", []).append(f"judged: {type(exc).__name__}: {exc}"[:200])
+    if ctx.get("unrecorded"):  # what could not be written down (engine._record); nothing is printed here
+        try:
+            store.audit(cfg, event="error", tool="Bash", session=session, via="run", action="unrecorded",
+                        error="; ".join(ctx["unrecorded"])[:300])
+        except Exception:
+            pass
     return decision.notice if decision and decision.action == "replace" else None
 
 

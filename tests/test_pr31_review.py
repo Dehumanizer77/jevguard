@@ -246,7 +246,7 @@ def test_35_a_verdict_stands_when_the_wrapper_cannot_leave_its_mark(guard, ext, 
     (guard.home / "state" / "judged").write_text("")   # a file where the directory of marks should be
     r = wrapped(guard, f"cat {ext}/note.txt", tmp_path)
     assert ATTACK not in r.stdout and json.loads(r.stdout)["firewall"] == "blocked"
-    assert guard.log()[-1]["action"] == "blocked"
+    assert [x["action"] for x in guard.log()[-2:]] == ["blocked", "unrecorded"] and "judged" in guard.log()[-1]["error"]
 
 
 @pytest.mark.parametrize("on_error", ["closed", "open"])
@@ -265,12 +265,14 @@ def test_35_a_verdict_stands_when_it_cannot_be_recorded(guard, ext, tmp_path, on
 def test_35_a_failure_of_the_wrapper_costs_what_on_error_says(guard, ext, tmp_path):
     """The hook after the call cannot make up for the wrapper where the wrapper is needed: there
     it can replace nothing. So the wrapper applies the owner's on_error itself."""
-    (guard.home / "state").write_text("")   # nothing of the guard's own can be read or written
-    guard.configure(mode="block", external_paths=[str(ext)], on_error="closed")
+    broken = {"skip_tools": ["("]}   # not a pattern: the guard trips over it while working out where the output came from
+    guard.configure(mode="block", external_paths=[str(ext)], on_error="closed", **broken)
     r = wrapped(guard, f"cat {ext}/note.txt", tmp_path, closed=True)
     assert ATTACK not in r.stdout and json.loads(r.stdout)["verdict"] == "unavailable" and r.returncode == 0
-    guard.configure(mode="block", external_paths=[str(ext)], on_error="open")
+    assert guard.log()[-1]["event"] == "error" and guard.log()[-1]["action"] == "blocked-error"
+    guard.configure(mode="block", external_paths=[str(ext)], on_error="open", **broken)
     assert wrapped(guard, f"cat {ext}/ok.txt", tmp_path).stdout == BENIGN + "\n"
+    assert guard.log()[-1]["action"] == "passed-error"
 
 
 def test_35_the_policy_travels_with_the_command_for_when_the_settings_cannot_be_read(guard, ext, tmp_path):
@@ -283,6 +285,111 @@ def test_35_the_policy_travels_with_the_command_for_when_the_settings_cannot_be_
     assert ATTACK not in r.stdout and json.loads(r.stdout)["verdict"] == "unavailable"
     # without it, as the owner chose with on_error = open, the output is passed on
     assert wrapped(guard, f"cat {ext}/ok.txt", tmp_path).stdout == BENIGN + "\n"
+
+
+# The re-review of #35: the fix above protected the three writes that come after an injection
+# verdict and left the usage counter, which is written straight after the scan. So: every write.
+WEB = {"url": "https://news.example.com/a"}
+
+
+def web(text):
+    return {"bytes": len(text), "code": 200, "codeText": "OK", "result": text, "durationMs": 1, "url": WEB["url"]}
+
+
+def _break(guard, what):
+    """Make one part of the guard's state fail, as a full disk, a damaged directory or a sandbox would."""
+    state = guard.home / "state"
+    state.mkdir(exist_ok=True)
+    if what == "usage is unreadable":
+        (state / "usage.json").mkdir()
+    elif what == "usage cannot be locked":
+        (state / "usage.json.lock").mkdir()
+    elif what == "the log cannot be written":
+        (state / "scans.jsonl").mkdir()
+    elif what == "the quarantine cannot be written":
+        (state / "quarantine").write_text("")
+    elif what == "the sessions cannot be read or written":
+        (state / "sessions").write_text("")
+    elif what == "the seal key cannot be read":
+        (state / "seal.key").mkdir()
+    elif what == "nothing can be written":
+        guard.hook("PostToolUse", "WebFetch", WEB, web(BENIGN))   # one ordinary call first, so that the files are there
+        state.chmod(0o500)
+
+
+BROKEN = ["usage is unreadable", "usage cannot be locked", "the log cannot be written", "the quarantine cannot be written",
+          "the sessions cannot be read or written", "the seal key cannot be read", "nothing can be written"]
+
+
+@pytest.mark.parametrize("on_error", ["open", "closed"])
+@pytest.mark.parametrize("what", BROKEN)
+def test_35_no_write_decides_what_the_model_is_given(guard, ext, tmp_path, what, on_error):
+    """A scan that returned a verdict has not failed, whatever happens to the counting and the
+    records around it. An injection is withheld under either error policy, and a result that
+    scanned clean is handed over under either."""
+    guard.configure(mode="block", external_paths=[str(ext)], on_error=on_error)
+    _break(guard, what)
+    try:
+        out = guard.hook("PostToolUse", "WebFetch", WEB, web(ATTACK))
+        assert out and "prompt-injection firewall" in out["hookSpecificOutput"]["updatedToolOutput"]["result"], what
+        assert guard.hook("PostToolUse", "WebFetch", WEB, web(BENIGN + " And the weather stayed fine.")) is None, what
+        r = wrapped(guard, f"cat {ext}/note.txt", tmp_path, closed=on_error == "closed")
+        assert ATTACK not in r.stdout and json.loads(r.stdout)["firewall"] == "blocked", what
+        assert wrapped(guard, f"cat {ext}/ok.txt", tmp_path, closed=on_error == "closed").stdout == BENIGN + "\n", what
+    finally:
+        (guard.home / "state").chmod(0o700)
+    if what.startswith("usage"):   # the log could be written: it says what could not
+        assert any(r.get("action") == "unrecorded" and "usage" in r.get("error", "") for r in guard.log())
+
+
+@pytest.mark.parametrize("on_error", ["open", "closed"])
+@pytest.mark.parametrize("what", BROKEN)
+def test_35_a_scan_that_did_fail_still_costs_what_on_error_says(guard, ext, jev, what, on_error):
+    """The other half: with the scoring API down there is no verdict, and the policy decides."""
+    guard.configure(mode="block", external_paths=[str(ext)], on_error=on_error)
+    _break(guard, what)
+    jev.status = 503
+    try:
+        out = guard.hook("PostToolUse", "WebFetch", WEB, web(BENIGN + " And then it rained."))
+    finally:
+        (guard.home / "state").chmod(0o700)
+    assert bool(out) == (on_error == "closed"), what
+
+
+@pytest.mark.parametrize("what", ["the log cannot be written", "the sessions cannot be read or written", "nothing can be written"])
+def test_35_no_write_decides_whether_the_owner_is_asked(guard, ext, what):
+    guard.configure(mode="block", gate="log", protect_guard=False, external_paths=[str(ext)])
+    _break(guard, what)
+    try:
+        # a Monitor on outside content: asked about for itself, with no gate setting to fall back on
+        out = guard.hook("PreToolUse", "Monitor", {"command": "curl -s https://news.example.com/feed"})
+        assert out and "cannot be scanned" in out["hookSpecificOutput"]["permissionDecisionReason"], what
+        guard.configure(mode="block", gate="ask-flagged", external_paths=[str(ext)])
+        out = guard.hook("PreToolUse", "Bash", {"command": "jevguard gate off"})
+        assert out and "jevguard gate" in out["hookSpecificOutput"]["permissionDecisionReason"], what
+    finally:
+        (guard.home / "state").chmod(0o700)
+
+
+def test_35_nor_does_a_failure_to_work_something_out_let_the_unscannable_through(guard, ext):
+    """Not a write, the same kind of loss: where the guard cannot tell where a Monitor's output or
+    a Cursor shell command's output would come from, it does not conclude that nothing needs doing."""
+    broken = {"skip_tools": ["("]}   # not a pattern; reading the command's origin trips over it
+    guard.configure(mode="block", gate="log", protect_guard=False, external_paths=[str(ext)], **broken)
+    out = guard.hook("PreToolUse", "Monitor", {"command": "tail -f app.log"})
+    assert out and "cannot be scanned" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    pre = cursor("preToolUse", tool_name="Shell", tool_input={"command": "ls"})
+    assert run.unwrap(guard.raw(pre, "--agent", "cursor")["updated_input"]["command"]) == "ls"
+
+
+def test_35_a_result_of_a_shape_never_seen_is_replaced_all_the_same(guard):
+    """Putting the notice in place of the result must not be what fails after the verdict."""
+    guard.configure(mode="block", on_error="open", external_paths=["/work"])
+    for resp in ({"type": "text", "file": ATTACK}, {"type": "text", "file": [ATTACK]}, {"type": "text", "file": {"content": ATTACK, "filePath": 7}},
+                 {"type": "image", "file": {"base64": 5, "note": ATTACK}}):
+        out = guard.hook("PostToolUse", "Read", {"file_path": "/work/a.txt"}, resp)
+        assert out and ATTACK not in json.dumps(out), resp
+        assert "prompt-injection firewall" in out["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
 
 
 # ---- #36: what Cursor is handed in place of an MCP result -------------------------------------------

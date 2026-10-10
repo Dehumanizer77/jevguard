@@ -24,8 +24,22 @@ def _on_alarm(*_):
     raise TimeoutError("jevguard watchdog")
 
 
+def _report(cfg, call, ctx: dict) -> None:
+    """Bookkeeping that could not be done (engine._record). It changed nothing about the decision;
+    it is said here so that the owner can find out that the guard's records have a hole."""
+    missed = ctx.get("unrecorded")
+    if not missed:
+        return
+    try:
+        for note in missed:
+            print(f"jevguard: could not record: {note}", file=sys.stderr)
+        store.audit(cfg, event="error", tool=call.tool, session=call.session, action="unrecorded", error="; ".join(missed)[:300])
+    except Exception:
+        pass  # the log may be the very thing that cannot be written; saying so must not fail the call either
+
+
 def main() -> None:
-    out, d, cfg, ctx, agent, phase, call = None, {}, None, {}, None, "", None
+    out, d, cfg, ctx, agent, phase, call, decided = None, {}, None, {}, None, "", None, None
     try:
         d = json.loads(sys.stdin.read() or "{}")
         cfg = config.load()
@@ -37,9 +51,11 @@ def main() -> None:
             phase, call = read
             # "after": a result to judge; "before": a call to gate; anything else: an event where the
             # agent takes no decision, and its adapter may still rewrite the call
-            decision = engine.before(call, cfg) if phase == "before" or call.gate_first else None
+            decision = engine.before(call, cfg, ctx) if phase == "before" or call.gate_first else None
             if decision is None and phase == "after":
                 decision = engine.after(call, cfg, ctx)
+            decided = decision  # what follows is saying it; a failure there does not undo it
+            _report(cfg, call, ctx)
             out = agent.answer(d, phase, call, decision) if decision else agent.untouched(d, phase, call)
     except BaseException as exc:  # a guard bug must not take the session down
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -51,7 +67,9 @@ def main() -> None:
             if call is None:
                 read = agent.read(d)
                 phase, call = read if read else ("", None)
-            decision = engine.after_error(phase, call, cfg, ctx, exc)
+            # A decision already taken stands. Only where the guard failed before it had one does the
+            # owner's policy for failures decide.
+            decision = decided or engine.after_error(phase, call, cfg, ctx, exc)
             out = agent.answer(d, phase, call, decision) if decision else None
             store.audit(cfg or config.load(), event="error", tool=call.tool if call else None,
                         session=call.session if call else None,

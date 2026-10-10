@@ -145,9 +145,33 @@ def _stream_origin(call: Call, cfg) -> str:
         session = store.session(cfg, call.session)
     except (ValueError, OSError):
         return "external"  # which files this session downloaded is not known: it may print one of them
-    paths = [*session.get("paths", []), *_task_outputs(call.tool_input, call.cwd, list(session.get("tasks", [])))]
-    mode = provenance.classify("Bash", call.tool_input, cfg, call.cwd, _existing(cfg, paths), "")
+    try:
+        paths = [*session.get("paths", []), *_task_outputs(call.tool_input, call.cwd, list(session.get("tasks", [])))]
+        mode = provenance.classify("Bash", call.tool_input, cfg, call.cwd, _existing(cfg, paths), "")
+    except Exception:
+        return "external"  # it could not be worked out, and after the monitor has started nothing can be done
     return mode if mode in ("external", "own") else ""
+
+
+# ---- counting and recording --------------------------------------------------------------------------
+def _record(ctx: dict | None, step, *args, **kwargs):
+    """Run one step of bookkeeping: the session's marks, the day's usage, the quarantine, the log,
+    the seal key. None of these is part of a verdict, or of the policy that follows from one, so
+    none of them may change what the model is given or whether the owner is asked. A step that
+    fails (a full disk, a damaged or read-only state directory, a sandbox) is noted in
+    ctx["unrecorded"] for the caller to report, and the work goes on without it.
+
+    Twice a failure here did decide the outcome: first the quarantine and the log, then the usage
+    counter, each letting a result through that had just scored as an injection (on_error = open
+    is for a scan that failed, and those scans had not). So every write goes through here, not
+    the ones that have failed so far."""
+    try:
+        return step(*args, **kwargs)
+    except Exception as exc:
+        if ctx is not None:
+            ctx.setdefault("unrecorded", []).append(
+                f"{getattr(step, '__name__', 'step')}: {type(exc).__name__}: {exc}"[:200])
+        return None
 
 
 # ---- after a call: the result ------------------------------------------------------------------------
@@ -168,12 +192,15 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
     ctx["mode"] = mode  # what the error path needs to know if anything below fails
     if mode is None:
         return None
+    def record(step, *args, **kwargs):  # see _record: nothing that is only written down decides anything below
+        return _record(ctx, step, *args, **kwargs)
+
     if mode in OUTSIDE:
         if not session:
             store.prune_sessions(cfg)  # first outside content of a session: drop old session files
         paths = _existing(cfg, provenance.saved_paths(str(tool_input.get("command") or ""), cwd, cfg.track_clones)) if tool == "Bash" else []
         # What a background command prints is this command's output, wherever it turns up later.
-        store.session_update(cfg, sid, paths=[*paths, *seen, *call.later_paths], external=True, tasks=call.later_ids)
+        record(store.session_update, cfg, sid, paths=[*paths, *seen, *call.later_paths], external=True, tasks=call.later_ids)
     elif not cfg.scan_local:
         return None
     if toolio.words(text) < cfg.min_words and not images:
@@ -182,24 +209,27 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
     base = {"event": "scan", "tool": tool, "mode": mode, "session": sid, **call.ids, "cwd": cwd, "chars": len(text),
             "images": len(images) or None, "sha256": digest[:16], "guard_mode": cfg.mode}
     if digest in store.released(cfg):
-        store.audit(cfg, **base, action="passed-released")
+        record(store.audit, cfg, **base, action="passed-released")
         return None
     enforce = cfg.mode == "block" and mode not in ("warn", "trusted")
     # Outside content the scan could not vouch for (the API failed, part of it was unreadable) is
     # withheld when the owner chose on_error = closed.
     withhold_unscanned = enforce and cfg.on_error == "closed" and mode in ("external", "own")
-    firstparty.use(cfg)
+    record(firstparty.use, cfg)  # without the seal key a notice goes out unsealed; it is a notice all the same
 
     def keep(verdict: dict) -> str:
-        return store.quarantine(cfg, tool, tool_input, call.raw, verdict, digest, text, images)
+        return record(store.quarantine, cfg, tool, tool_input, call.raw, verdict, digest, text, images) or ""
+
+    def notice(verdict: dict, qid: str = "") -> str:
+        return firstparty.notice(tool, verdict, qid, str(store.released_copy(cfg, qid)) if qid else "")
 
     def unavailable(error: str, verdict: dict | None = None, **extra) -> Decision | None:
-        store.audit(cfg, **base, action="blocked-unavailable" if withhold_unscanned else "passed-unscanned",
-                    verdict="unavailable", error=error[:200], **(_evidence(verdict) if verdict else {}), **extra)
+        record(store.audit, cfg, **base, action="blocked-unavailable" if withhold_unscanned else "passed-unscanned",
+               verdict="unavailable", error=error[:200], **(_evidence(verdict) if verdict else {}), **extra)
         if mode in OUTSIDE:
-            store.session_update(cfg, sid, flagged="unscanned")
+            record(store.session_update, cfg, sid, flagged="unscanned")
         if withhold_unscanned:
-            return Decision("replace", firstparty.notice(tool, {"verdict": "unavailable", "reasons": ["firewall unreachable"]}))
+            return Decision("replace", notice({"verdict": "unavailable", "reasons": ["firewall unreachable"]}))
         return None
 
     key = config.read_key(cfg)
@@ -211,7 +241,9 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
     sc = scanner.Scanner(cfg, key)
     verdict, err = sc.scan(text, images)
     ms = round((time.perf_counter() - t0) * 1000)
-    store.usage_add(cfg, tokens=verdict.get("tokens") or 0, outage=bool(err is not None and err.outage))
+    # The scan has returned. From here on there is the verdict, the owner's policy for it, and
+    # writing down what happened: the first two decide, the third goes through record().
+    record(store.usage_add, cfg, tokens=verdict.get("tokens") or 0, outage=bool(err is not None and err.outage))
     v = verdict.get("verdict")
     if err is not None and v != "injection":  # nothing conclusive found before the failure
         return unavailable(str(err), verdict, partial_verdict=v, outage=err.outage, ms=ms)
@@ -228,49 +260,39 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
     rec = dict(base, verdict=v, **_evidence(verdict), ms=ms, policy=sc.policy_id, complete=not incomplete,
                block_at=block_at, error=f"later part not scanned: {err}"[:200] if err is not None else None)
     if v == "injection":
-        def recorded(step):
-            """The session mark, the quarantine and the log are records of the verdict, not part of
-            it. If one cannot be written (a full disk, a damaged state directory) the result is
-            withheld all the same, whatever on_error says: that setting is for a scan that failed,
-            and this one did not."""
-            try:
-                return step()
-            except Exception:
-                if not enforce:
-                    raise
-                return None
-
-        recorded(lambda: store.session_update(cfg, sid, flagged="injection"))
+        record(store.session_update, cfg, sid, flagged="injection")
         # Kept in log mode too: it is what the owner reads to judge a would-be block.
-        qid = recorded(lambda: keep(verdict)) or ""
-        recorded(lambda: store.audit(cfg, **rec, action="blocked" if enforce else "would-block", quarantine_id=qid or None))
-        if not enforce:
-            return None
-        return Decision("replace", firstparty.notice(tool, verdict, qid, str(store.released_copy(cfg, qid)) if qid else ""))
+        qid = keep(verdict)
+        record(store.audit, cfg, **rec, action="blocked" if enforce else "would-block", quarantine_id=qid or None)
+        return Decision("replace", notice(verdict, qid)) if enforce else None
     if incomplete:  # an image without OCR, undecodable data, more images than the limit
         if mode in OUTSIDE:
-            store.session_update(cfg, sid, flagged="unscanned")
+            record(store.session_update, cfg, sid, flagged="unscanned")
         if withhold_unscanned:
             held = dict(verdict, verdict="incomplete")
             qid = keep(held)
-            store.audit(cfg, **rec, action="blocked-incomplete", quarantine_id=qid)
-            return Decision("replace", firstparty.notice(tool, held, qid, str(store.released_copy(cfg, qid))))
-    store.audit(cfg, **rec, action="flagged" if v == "suspicious" else "passed")
+            record(store.audit, cfg, **rec, action="blocked-incomplete", quarantine_id=qid or None)
+            return Decision("replace", notice(held, qid))
+    record(store.audit, cfg, **rec, action="flagged" if v == "suspicious" else "passed")
     return None
 
 
 # ---- before a call: the gate -------------------------------------------------------------------------
-def before(call: Call, cfg) -> Decision | None:
+def before(call: Call, cfg, ctx: dict | None = None) -> Decision | None:
     from . import gate
     tool, tool_input, sid, cwd = call.tool, call.tool_input, call.session, call.cwd
     detail = str(tool_input.get("command") or tool_input.get("url") or tool_input.get("file_path")
                  or tool_input.get("path") or "")[:160]
     ids = {"event": "gate", "tool": tool, "session": sid, **call.ids, "cwd": cwd, "detail": detail}
     read_as = "Bash" if tool == "Monitor" else tool  # a monitor runs a shell command, whatever becomes of its output
+
+    def record(step, *args, **kwargs):  # see _record: whether the owner is asked does not hang on a line in the log
+        return _record(ctx, step, *args, **kwargs)
+
     if cfg.protect_guard:
         why = gate.guard_change(read_as, tool_input, cfg, cwd)
         if why:
-            store.audit(cfg, **ids, why=why, taint="guard", action="asked")
+            record(store.audit, cfg, **ids, why=why, taint="guard", action="asked")
             return Decision("ask", reason=f"asking because {why}.{_purpose(call)} Approve only if you expect this "
                             "session to be changing the guard or Claude Code's settings right now; you do not "
                             "need to review the rest of the command.", topic="CHANGES THE GUARD", why=why)
@@ -280,17 +302,17 @@ def before(call: Call, cfg) -> Decision | None:
         # asked about. It is what own_repos stands for everywhere else, content he vouches for more
         # than a stranger's; here it also goes unscanned, and the log says so. Only the one form
         # counts that counts elsewhere: a single gh command naming the repository, nothing around it.
-        store.audit(cfg, **ids, taint="unscanned", action="logged",
-                    why="its output goes to the model as notifications, unscanned; the command is one gh command on an own repository")
-        store.session_update(cfg, sid, external=True)
+        record(store.audit, cfg, **ids, taint="unscanned", action="logged",
+               why="its output goes to the model as notifications, unscanned; the command is one gh command on an own repository")
+        record(store.session_update, cfg, sid, external=True)
     elif origin:
         # What it prints goes to the model as notifications. No hook sees those, so nothing of it
         # can be scanned or withheld afterwards; the one place to stop it is here. This is not
         # the gate (a risky action) and not on_error (a scan that failed): it is outside content
         # on a road with no check on it, and in block mode the owner is asked before it starts.
         why = "its output would go to the model as notifications, which cannot be scanned, and the command reads from outside"
-        store.audit(cfg, **ids, why=why, taint="unscanned", action="asked" if cfg.mode == "block" else "would-ask")
-        store.session_update(cfg, sid, external=True, flagged="unscanned")
+        record(store.audit, cfg, **ids, why=why, taint="unscanned", action="asked" if cfg.mode == "block" else "would-ask")
+        record(store.session_update, cfg, sid, external=True, flagged="unscanned")
         if cfg.mode == "block":
             return Decision("ask", reason=f"asking because {why}.{_purpose(call)} Run it as an ordinary command, or in "
                             "the background and read its output file, and the guard scans what it prints.",
@@ -308,8 +330,8 @@ def before(call: Call, cfg) -> Decision | None:
     if not taint:
         return None
     ask = cfg.gate == "ask-external" or (cfg.gate == "ask-flagged" and taint == "flagged")
-    store.audit(cfg, **ids, why=why, taint=taint, taint_reason=s.get("flagged_reason"),
-                action="asked" if ask else "would-ask")
+    record(store.audit, cfg, **ids, why=why, taint=taint, taint_reason=s.get("flagged_reason"),
+           action="asked" if ask else "would-ask")
     if not ask:
         return None
     seen = ("a tool result scored as a prompt injection or passed without a full scan" if taint == "flagged"

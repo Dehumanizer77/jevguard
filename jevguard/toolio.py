@@ -23,7 +23,8 @@ import unicodedata
 # sentence under "type" or "mimeType" is read like any other text.
 _PLUMBING = {
     "type": re.compile(r"text|image|audio|video|resource|resource_link|document|file|json|tool_use|tool_result|"
-                       r"web_search_result|web_search_tool_result|search_result"),
+                       r"web_search_result|web_search_tool_result|search_result|"
+                       r"(?:text|image|audio|video|application)/[A-Za-z0-9.+-]{1,60}"),  # Read: {file: {type: "image/png"}}
     "mimeType": re.compile(r"(?:text|image|audio|video|application|font|model|multipart|message)/[A-Za-z0-9.+-]{1,60}"),
     "tool_use_id": re.compile(r"(?=[A-Za-z_]*\d)(?:srv)?toolu_[A-Za-z0-9]{8,48}"),
 }
@@ -80,12 +81,17 @@ def text_of(tool: str, resp) -> tuple[str, list[bytes]]:
     b64: list = []
     if isinstance(resp, dict) and tool == "Bash":
         texts = [str(resp.get(k) or "") for k in ("stdout", "stderr")]
-    elif isinstance(resp, dict) and tool == "Read":
-        f = resp.get("file") or {}
+    elif isinstance(resp, dict) and tool == "Read" and isinstance(resp.get("file"), dict):
+        f = resp["file"]
         if resp.get("type") == "image" and isinstance(f.get("base64"), str):
             b64.append(f["base64"])
+            _leaves({k: v for k, v in f.items() if k != "base64"}, texts, b64)  # whatever else stands beside the picture
+        elif resp.get("type") in (None, "text") and isinstance(f.get("content"), str):
+            texts = [f["content"]]  # the one shape recorded above; the path beside it is the call's own
         else:
-            texts = [str(f.get("content") or "")]
+            # Another kind of file (a notebook, a PDF) or a shape not seen before. It used to be
+            # read as a text file with no content, that is, not at all. Everything in it is read.
+            _leaves(resp, texts, b64)
     elif isinstance(resp, dict) and tool == "Grep":
         texts = [str(resp.get("content") or ""), *map(str, resp.get("filenames") or [])]
     elif isinstance(resp, dict) and tool == "WebFetch":
@@ -161,7 +167,7 @@ def replaced(tool: str, resp, note: str):
     if isinstance(resp, dict) and tool == "Bash":
         return {**resp, "stdout": note, "stderr": "", "isImage": False}
     if isinstance(resp, dict) and tool == "Read":
-        f = resp.get("file") or {}
+        f = resp.get("file") if isinstance(resp.get("file"), dict) else {}  # whatever came: this must not fail
         return {"type": "text", "file": {"filePath": f.get("filePath", ""), "content": note,
                                          "numLines": 1, "startLine": 1, "totalLines": 1}}
     if isinstance(resp, dict) and tool == "Grep":

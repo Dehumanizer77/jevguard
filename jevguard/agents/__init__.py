@@ -26,6 +26,11 @@ Three things an adapter must not get wrong, each of which the first version did 
   its value shows it is not content (a tag, a media type, something the call itself said),
   never because of what the field is called.
 - A replacement holds the notice and nothing else of the original.
+
+And one for the engine and everything around it: once there is a verdict, or a reason to ask,
+nothing that is only written down afterwards (the usage counter, the session's marks, the
+quarantine, the log, a wrapper's mark) may change it. Every such write goes through
+engine._record. on_error is the policy for a scan that failed, not for a record that did.
 """
 
 from __future__ import annotations
