@@ -57,6 +57,18 @@ another agent its adapter translates them.
    going to a terminal (each line ends in a `#jg:` tag): it talks about injections, and
    without the seal the guard blocked its own log on the first day it ran.
 
+   In Claude Code a shell command that exits with an error status does not come back this
+   way at all. Claude Code starts another hook for it (`PostToolUseFailure`), and a hook
+   there can add a remark for the model but replace nothing. So in `block` mode Claude Code
+   is set to run its shell commands through `bin/jevguard-shell` (`CLAUDE_CODE_SHELL_PREFIX`).
+   For a command whose output would be scanned, that program holds the output until the
+   command has finished, has it scored whole, and prints it or the notice, with the
+   command's own exit status. It covers what the hook cannot: a command that fails, one that
+   is killed for running too long, and everything after the first 30,000 characters. The
+   hook on `PostToolUseFailure` is there for the errors of other tools (an MCP tool's error
+   text): it scans and logs them and, when one scores as an injection, says so beside it
+   (`not-withheld` in the log), since nothing can be put in its place.
+
    A command sent to the background returns nothing at once; what it prints reaches the model
    later and is still that command's output. In Claude Code it goes to a file the model is told
    to read: if the command is outside content, that file is tracked like a download, however
@@ -139,7 +151,9 @@ Both read what a command says in plain sight: programs and their options, `bash 
 `find -exec`, `$(...)`, paths after `cd`. That is an approval step, not a wall; see the limits
 below.
 
-The check before a call takes about 35 ms on the machine this was developed on.
+The check before a call takes about 35 ms on the machine this was developed on. In `block`
+mode in Claude Code, deciding whether a shell command's output is to be held adds about 45 ms
+to each shell command; a hook's own command passes through the shell prefix in about one.
 
 ## Install
 
@@ -216,7 +230,7 @@ Then one command for each agent the guard is to run in:
 
 | Agent | Command | What it changes | Before it takes effect |
 |---|---|---|---|
-| Claude Code | `jevguard install` | adds two hooks and two rules to `~/.claude/settings.json`; backup beside it | nothing more, see below |
+| Claude Code | `jevguard install` | adds three hooks, two rules and, in `block` mode, a shell prefix to `~/.claude/settings.json`; backup beside it | start a new session for the shell prefix; see below |
 | Grok Build | `jevguard install --agent grok` | writes `~/.grok/hooks/jevguard.json` | start a new session, or `/hooks` and `r` in a running one |
 | Codex CLI | `jevguard install --agent codex` | adds its entries to `~/.codex/hooks.json`; backup `hooks.json.jevguard.bak` | start `codex` and accept the new hooks when it shows them (`/hooks`): Codex runs no hook you have not reviewed |
 | Copilot CLI | `jevguard install --agent copilot` | writes `~/.copilot/hooks/jevguard.json` | start a new session |
@@ -239,6 +253,7 @@ updated /home/you/.claude/settings.json (backup: settings.json.jevguard-20261009
 $ jevguard status
 mode: log   gate: log   on_error: open   protect_guard: True   model: jev-1.13.0
 hooks installed: yes (/home/you/.claude/settings.json)
+shell commands run through the guard: no (log mode)
 installed for other agents: grok, codex
 API key: present (/home/you/.config/jevguard/typesafe.key)
 ...
@@ -247,12 +262,30 @@ API key: present (/home/you/.config/jevguard/typesafe.key)
 `status` says where the hooks are in place. Whether an agent has loaded them it cannot tell;
 step 5 shows that.
 
-For Claude Code, `install` changes the user's `~/.claude/settings.json`: it adds the two hooks next to any that
+For Claude Code, `install` changes the user's `~/.claude/settings.json`: it adds its hooks next to any that
 are already there and two `permissions.deny` rules, `Read(~/.config/jevguard/**)` and
 `Read(~/.local/state/jevguard/**)` (the API key and the seal key are in those directories, and
 no hook runs before Claude Code's own file tools read a file; the rules were checked to hold
 on the first installation). Running `install` again prints `no change`.
 `jevguard --settings <file> install` writes to another settings file.
+
+In `block` mode it also sets `env.CLAUDE_CODE_SHELL_PREFIX` to `bin/jevguard-shell`. Claude
+Code then runs every shell command through that program, and takes what it prints for the
+command's output. The command you see and approve is not changed. Why it is needed, and
+what it does, is under [How it works](#how-it-works). Three things to know about it:
+
+- Every shell command, and every hook, now depends on that small file. It runs the line as
+  it is whenever anything is not as expected, but if it should ever stand in the way: take
+  the `CLAUDE_CODE_SHELL_PREFIX` line out of `~/.claude/settings.json` and start Claude Code
+  again. Nothing else of the guard depends on it.
+- The output of a command that reads from outside is held until the command has finished,
+  so you do not see it come line by line. Local commands are run directly, as before.
+- With Claude Code's own sandbox switched on, the prefix runs inside it, without the network
+  and without a file of its own, and cannot scan. Allow `api.typesafe.ai` and writing to
+  `~/.local/state/jevguard` in the sandbox settings, or it does nothing there and the hooks
+  work as they did before it.
+
+If you already use `CLAUDE_CODE_SHELL_PREFIX` yourself, `install` leaves yours and says so.
 
 The other agents have no such rules. There the hook before a call does that work: when the
 agent's own file tool is pointed at one of those two directories, or searches from a directory
@@ -474,6 +507,11 @@ Things to know:
 - **Grok** also runs the hooks in `~/.claude/settings.json`, so with the guard installed for
   Claude Code it is started by Grok too and recognises it. Installing for Grok as well gives it
   hooks without Claude Code's tool-name filter, which Grok's MCP tools do not fit.
+  Grok can also search and fetch pages with tools that run on xAI's side ("backend tools",
+  on by default). No hook on your machine is started for those, so the guard never sees what
+  they return. `features.backend_tools = false` in `~/.grok/config.toml` turns them off, and
+  Grok then fetches with its own `web_fetch`, which is scanned; `install --agent grok` says
+  so and leaves the choice to you.
 - **Codex** has no field for a replacement and no "ask". But when a hook after a call answers
   `decision: "block"`, Codex puts the hook's words in place of the tool's result, so the guard
   hands it the notice that way. The hook runs outside Codex's sandbox, so this holds whatever
@@ -546,16 +584,21 @@ fetches and the private connectors out of that; each switch above widens it.
   (`logged`) and not asked about: unscanned all the same. That holds for one `gh` command
   that names the repository and nothing else (`gh run watch --repo you/project 4242`); a
   loop or a pipe around it is asked about like any other.
-- **In Claude Code, the output of a tool call that fails.** A shell command that exits with
-  an error status does not come back through the hook the guard is installed on. Claude Code
-  starts another one (`PostToolUseFailure`), and that one can add a remark for the model but
-  cannot replace the result: tried against 2.1.295 with every field there is. So what
-  `curl ... ; false`, a failing `gh` command or an MCP tool's error returns reaches the model
-  as it is, and is not scanned either. The same is to be expected in Copilot CLI (its
-  reference says as much) and perhaps in Cursor. Codex and Grok report a failed command
-  through the ordinary hook, and there it is scanned and withheld like any other (both tried).
+- **The error of a tool call that fails, other than a shell command in Claude Code.** In
+  Claude Code a failed call comes back through a hook that can add a remark and replace
+  nothing (tried against 2.1.295 with every field there is). Shell commands are covered by
+  the shell prefix, in `block` mode. What an MCP tool or `WebFetch` returns as an error is
+  scanned and logged, and the model is told when it scores as an injection, but it has read
+  it by then. The same goes for a shell command where the prefix is not in place: `log`
+  mode, a prefix of your own, Claude Code's sandbox without the network, or a line of a
+  shape a later version builds differently (`tests/e2e_claude.py` has a step that fails
+  then). In Copilot CLI a failed call is not looked at at all (its reference says a hook can
+  only add context there), and what Cursor does is not known. Codex and Grok report a failed
+  command through the ordinary hook, where it is scanned and withheld like any other (both
+  tried).
 - The result of a built-in tool whose name the adapter does not know (MCP tools always are
-  scanned; in Copilot CLI an unknown tool is too).
+  scanned; in Copilot CLI an unknown tool is too), and of any tool that does not run on your
+  machine: Grok's backend tools, see [Other agents](#other-agents).
 - A result too large to hand over, outside Claude Code, Grok and Hermes. Codex cuts it down
   to its beginning and end and gives the hook exactly what it gives the model, with no file
   (tried). Copilot CLI writes a result over 51,200 bytes to a file in the temp directory and

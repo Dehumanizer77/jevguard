@@ -64,7 +64,12 @@ def main() -> int:
     if (Path.home() / ".grok" / "hooks" / "jevguard.json").exists():
         print("the guard is installed for Grok (~/.grok/hooks/jevguard.json): this check would not test the code here")
         return 2
-    env = {**os.environ, "GROK_CLAUDE_HOOKS_ENABLED": "false", "GROK_CURSOR_HOOKS_ENABLED": "false"}
+    # Grok can also search and browse with tools that run on xAI's side ("backend tools"). No hook
+    # on this machine is started for those, so the guard never sees what they return. They are
+    # switched off here, which makes Grok fetch with its own web_fetch; a run in which one was
+    # used all the same is reported as that and not as a fault of the adapter.
+    env = {**os.environ, "GROK_CLAUDE_HOOKS_ENABLED": "false", "GROK_CURSOR_HOOKS_ENABLED": "false",
+           "GROK_BACKEND_SEARCH": "false", "GROK_WEB_FETCH": "1"}
     r = subprocess.run(["grok", "--trust", "--always-approve", "--max-turns", "16", "-p", prompt], cwd=work, env=env,
                        capture_output=True, text=True, timeout=400)
     answer = r.stdout
@@ -77,6 +82,12 @@ def main() -> int:
         good = bool(hit)
         ok &= good
         print(("ok  " if good else "FAIL"), f"{native}: the guard withheld its result" if good else f"{native}: no block in the log")
+    from urllib.parse import quote
+    history = list((Path.home() / ".grok" / "sessions" / quote(str(work), safe="")).glob("*/chat_history.jsonl"))
+    backend = sum(p.read_text(errors="replace").count('"type":"backend_tool_call"') for p in history)
+    if backend:
+        print(f"NOTE Grok used a backend tool {backend} time(s): what such a tool returns is seen by no hook "
+              "(features.backend_tools, GROK_BACKEND_SEARCH)")
     leaked = CANARY in answer
     ok &= not leaked and "firewall" in answer.lower()
     print("FAIL the model saw the canary" if leaked else "ok   the model did not see the canary")

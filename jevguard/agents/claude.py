@@ -12,6 +12,14 @@ names the file and holds none of the output. Monitor is different: its PostToolU
 as a notification, which no hook is called for. (Both seen in 2.1.295; that version has no tool
 that returns a background command's output directly.)
 
+A call that fails does not come back through PostToolUse. Claude Code starts PostToolUseFailure,
+with {error: "Exit code 3\n<output>"} for a shell command, and a hook there can add context but
+not replace anything (tried with updatedToolOutput and with decision "block"). So in block mode
+the shell commands themselves run through bin/jevguard-shell, set as CLAUDE_CODE_SHELL_PREFIX,
+which holds a command's output and judges it before Claude Code has it (shellwrap.py). The hook
+on PostToolUseFailure is what is left for the errors of other tools: it scans, logs, and tells
+the model what it has been given.
+
 A result too large to hand over is saved to a file under <transcript>/tool-results and the model
 is told to read it: for Bash the hook gets the first 30,000 characters and the path, for an MCP
 tool from about 100 KB only a message with the path (toolio.py has both). The file is tracked as
@@ -33,7 +41,7 @@ class ClaudeCode(Agent):
 
     def read(self, d: dict) -> tuple[str, Call] | None:
         event = d.get("hook_event_name")
-        if event not in ("PreToolUse", "PostToolUse"):
+        if event not in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
             return None
         tool_input = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
         if isinstance(tool_input.get("command"), str):
@@ -41,8 +49,22 @@ class ClaudeCode(Agent):
         call = Call(tool=str(d.get("tool_name") or ""), tool_input=tool_input, session=str(d.get("session_id") or ""),
                     cwd=str(d.get("cwd") or ""), ids={"tool_use_id": d.get("tool_use_id"), "agent": d.get("agent_type")},
                     who=self.title)
+        command = tool_input.get("command") if isinstance(tool_input.get("command"), str) else None
         if event == "PreToolUse":
+            if call.tool == "Monitor" and command is not None:
+                _mark("streamed", call.session, command, True)  # jevguard-shell must let its lines out as they come
             return "before", call
+        if call.tool == "Bash" and command is not None and _mark("judged", call.session, command, False):
+            return None  # jevguard-shell held this output and judged it before Claude Code was given it
+        if event == "PostToolUseFailure":
+            # A call that failed: {error: "Exit code 3\n<what it printed>"}. A hook here can add a
+            # remark and no more. A shell command does not get this far unjudged where jevguard-shell
+            # is in place; this is for where it is not, and for the errors of every other tool.
+            call.raw = d.get("error")
+            call.text = call.raw if isinstance(call.raw, str) else toolio.text_of("", call.raw)[0]
+            call.replaceable = False
+            call.ids["failed"] = True
+            return "after", call
         call.raw = d.get("tool_response")
         call.text, call.images = toolio.text_of(call.tool, call.raw)
         if call.tool == "WebFetch" and isinstance(call.raw, dict):
@@ -67,6 +89,10 @@ class ClaudeCode(Agent):
         return "after", call
 
     def answer(self, d: dict, phase: str, call: Call, decision: Decision) -> dict | None:
+        if decision.action == "warn":
+            return {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure", "additionalContext": decision.notice}}
+        if decision.action == "replace" and not call.replaceable:
+            return None
         if decision.action == "replace":
             return {"hookSpecificOutput": {"hookEventName": "PostToolUse",
                                            "updatedToolOutput": toolio.replaced(call.tool, call.raw, decision.notice),
@@ -78,6 +104,16 @@ class ClaudeCode(Agent):
                                            call.tool_input.get("description") or "", self.title)
             out["updatedInput"] = {**call.tool_input, "command": command}
         return {"hookSpecificOutput": out}
+
+
+def _mark(kind: str, session: str, command: str, leave: bool) -> bool:
+    """A note between this hook and jevguard-shell about one command (store.judged, store.streamed).
+    Bookkeeping: if it cannot be read or written, the hook goes on as if there were none."""
+    try:
+        from .. import config, store
+        return getattr(store, kind)(config.load(), session, command, mark=leave)
+    except Exception:
+        return False
 
 
 def _task_files(d: dict, task: str) -> list[str]:

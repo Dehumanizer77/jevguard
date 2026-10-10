@@ -81,7 +81,12 @@ def grok(remove: bool) -> str:
     def entry(timeout: int) -> list:
         return [{"hooks": [{"type": "command", "command": f"{HOOK} --agent grok", "timeout": timeout}]}]
     content = None if remove else {"hooks": {"PreToolUse": entry(15), "PostToolUse": entry(60)}}
-    return _write(Path.home() / ".grok" / "hooks" / "jevguard.json", content)
+    done = _write(Path.home() / ".grok" / "hooks" / "jevguard.json", content)
+    # Search and browsing that Grok does with tools on xAI's side start no hook here, so the guard
+    # never sees what they return (seen in 1.0.30). Whether to give those up is the owner's call.
+    return done if remove else done + ("; Grok's backend tools (search and browsing on xAI's side) are seen by no hook: "
+                                       "set features.backend_tools = false in ~/.grok/config.toml to have it fetch "
+                                       "with its own web_fetch, which is scanned")
 
 
 def copilot(remove: bool) -> str:

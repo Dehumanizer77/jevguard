@@ -17,6 +17,8 @@ from . import config, firstparty, scanner, store
 from .agents import setup as agent_setup
 
 HOOK = str(Path(__file__).resolve().parent.parent / "bin" / "jevguard-hook")
+SHELL_PREFIX = str(Path(__file__).resolve().parent.parent / "bin" / "jevguard-shell")
+PREFIX_KEY = "CLAUDE_CODE_SHELL_PREFIX"  # Claude Code runs every shell command through the program named there
 SETTINGS = Path.home() / ".claude" / "settings.json"
 _POST = ["WebFetch|WebSearch|Bash|Read|Grep", "mcp__.*"]
 _PRE = ["Bash|Monitor|WebFetch|Write|Edit|NotebookEdit", "mcp__.*"]  # Monitor: its output is never a result
@@ -70,6 +72,20 @@ def installed(settings_path: Path) -> bool:
     return any(_ours(g) for ev in ("PostToolUse", "PreToolUse") for g in hooks.get(ev, []))
 
 
+def _prefix_state(settings_path: Path, cfg) -> str:
+    """Whether Claude Code is set to run its shell commands through bin/jevguard-shell."""
+    try:
+        env = json.loads(settings_path.read_text()).get("env") or {}
+    except (OSError, ValueError):
+        env = {}
+    value = env.get(PREFIX_KEY) if isinstance(env, dict) else None
+    if value == SHELL_PREFIX:
+        return "yes"
+    if value:
+        return f"no ({PREFIX_KEY} is set to {value}); the output of a command that fails is not scanned"
+    return "no (set in block mode by `jevguard install`)" if cfg.mode == "block" else "no (log mode)"
+
+
 def _read_deny_rules(cfg) -> list[str]:
     """Permission rules that keep Claude Code's file tools out of the guard's directories: the
     API key and the seal key are there, and no hook runs before a Read."""
@@ -96,9 +112,25 @@ def install(cfg, settings_path: Path, remove: bool = False) -> str:
         del permissions["deny"]
         if not permissions:
             settings.pop("permissions", None)
+    # In block mode Claude Code runs its shell commands through bin/jevguard-shell, which judges
+    # what a command printed before Claude Code has it (shellwrap.py): the hook after a call is not
+    # started for a command that fails. A prefix the owner set himself is left as it is.
+    env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    note = ""
+    if not remove and cfg.mode == "block":
+        if env.get(PREFIX_KEY) in (None, "", SHELL_PREFIX):
+            settings.setdefault("env", env)[PREFIX_KEY] = SHELL_PREFIX
+        else:
+            note = (f"; {PREFIX_KEY} is already set to {env[PREFIX_KEY]} and was left as it is, so the output of a "
+                    "shell command that fails is not scanned")
+    elif env.get(PREFIX_KEY) == SHELL_PREFIX:
+        del env[PREFIX_KEY]
+        if not env:
+            settings.pop("env", None)
     hooks = settings.setdefault("hooks", {})
     # A hook that may answer (replace a result, ask for approval) has to be waited for.
     plan = {"PostToolUse": (_POST, cfg.mode == "block", True),
+            "PostToolUseFailure": (_POST, cfg.mode == "block", True),  # a failed call: scanned and logged; see agents/claude.py
             "PreToolUse": (_PRE, cfg.gate.startswith("ask") or cfg.protect_guard,
                            cfg.gate != "off" or cfg.protect_guard)}
     for event, (matchers, sync, wanted) in plan.items():
@@ -114,7 +146,7 @@ def install(cfg, settings_path: Path, remove: bool = False) -> str:
     if not hooks:
         settings.pop("hooks", None)
     if json.dumps(settings, sort_keys=True) == before:
-        return "no change"
+        return "no change" + note
     if settings_path.exists():
         stamp, n = time.strftime("%Y%m%d-%H%M%S"), 0
         backup = settings_path.with_name(f"{settings_path.name}.jevguard-{stamp}.bak")
@@ -127,7 +159,7 @@ def install(cfg, settings_path: Path, remove: bool = False) -> str:
     tmp = settings_path.with_name(settings_path.name + ".jevguard-tmp")
     tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
     tmp.replace(settings_path)
-    return f"updated {settings_path}" + (f" (backup: {backup.name})" if backup else "")
+    return f"updated {settings_path}" + (f" (backup: {backup.name})" if backup else "") + note
 
 
 def cmd_own(cfg, a) -> int:
@@ -196,6 +228,7 @@ def cmd_status(cfg, a) -> int:
     print(f"mode: {cfg.mode}   gate: {cfg.gate}   on_error: {cfg.on_error}   "
           f"protect_guard: {cfg.protect_guard}   model: {cfg.model}")
     print(f"hooks installed: {'yes' if installed(a.settings) else 'no'} ({a.settings})")
+    print(f"shell commands run through the guard: {_prefix_state(a.settings, cfg)}")
     others = [name for name in agent_setup.AGENTS if name != "claude" and agent_setup.installed(name)]
     print("installed for other agents: " + (", ".join(others) or "none"))
     print(f"API key: {'present' if key else 'MISSING'} ({cfg.key_file})")

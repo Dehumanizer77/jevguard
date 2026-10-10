@@ -14,6 +14,12 @@ shapes:
     web_fetch             {url}                     -> {"type": "WebFetch", "Content": {url, content, content_type, ...}}
     <server>__<tool>      an MCP tool               -> whatever the server returned
 
+Not every tool of Grok's runs here. With features.backend_tools on (the default) it may search
+or fetch a page with a tool on xAI's side: the session's history then holds a
+"backend_tool_call", no hook is started, and what came back is never seen by the guard (found
+when tests/e2e_grok.py failed on a run where Grok did not use web_fetch). GROK_BACKEND_SEARCH=false
+or features.backend_tools = false turns those off.
+
 A PostToolUse hook replaces the model's copy of any result (updatedToolOutput). For a built-in
 tool the replacement has to be the tool's own tagged object, or Grok ignores it and the original
 stands; so the result is handed back with its text swapped, not rebuilt. A PreToolUse hook can

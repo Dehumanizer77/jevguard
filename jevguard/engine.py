@@ -54,11 +54,13 @@ class Call:  # plain classes: the hook starts for every tool call, and dataclass
         self.later_ids: list = []     # the call sent a command to the background: the tasks it started
         self.later_paths: list = []   # ... and the files their output is written to
         self.task_ids: list = []      # the result is the output of these background tasks
+        self.replaceable = True       # False: the agent lets nothing be put in place of this result (a failed call)
 
 
 class Decision:
     def __init__(self, action: str, notice: str = "", reason: str = "", topic: str = "", why: str = ""):
-        self.action = action          # "replace": put notice in place of the result; "ask": hold the call for approval
+        self.action = action          # "replace": put notice in place of the result; "ask": hold the call for approval;
+        #                               "warn": the result cannot be replaced, notice is all that can be said beside it
         self.notice = notice
         self.reason = reason          # ask: the whole explanation, for a front end that shows it
         self.topic = topic            # ask: in two or three words what is at stake
@@ -214,7 +216,7 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
     enforce = cfg.mode == "block" and mode not in ("warn", "trusted")
     # Outside content the scan could not vouch for (the API failed, part of it was unreadable) is
     # withheld when the owner chose on_error = closed.
-    withhold_unscanned = enforce and cfg.on_error == "closed" and mode in ("external", "own")
+    withhold_unscanned = enforce and cfg.on_error == "closed" and mode in ("external", "own") and call.replaceable
     record(firstparty.use, cfg)  # without the seal key a notice goes out unsealed; it is a notice all the same
 
     def keep(verdict: dict) -> str:
@@ -224,6 +226,7 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
         return firstparty.notice(tool, verdict, qid, str(store.released_copy(cfg, qid)) if qid else "")
 
     def unavailable(error: str, verdict: dict | None = None, **extra) -> Decision | None:
+        ctx["scan"] = "failed"  # for a wrapper: this output was not judged, the hook after the call is still to look at it
         record(store.audit, cfg, **base, action="blocked-unavailable" if withhold_unscanned else "passed-unscanned",
                verdict="unavailable", error=error[:200], **(_evidence(verdict) if verdict else {}), **extra)
         if mode in OUTSIDE:
@@ -263,9 +266,15 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
         record(store.session_update, cfg, sid, flagged="injection")
         # Kept in log mode too: it is what the owner reads to judge a would-be block.
         qid = keep(verdict)
+        if enforce and not call.replaceable:
+            # The output of a failed call, in an agent whose hook for that can add a remark and
+            # nothing else. The model has it; the log says so, and the model is told what it is.
+            record(store.audit, cfg, **rec, action="not-withheld", quarantine_id=qid or None)
+            return Decision("warn", firstparty.warning(tool, verdict, qid))
         record(store.audit, cfg, **rec, action="blocked" if enforce else "would-block", quarantine_id=qid or None)
         return Decision("replace", notice(verdict, qid)) if enforce else None
     if incomplete:  # an image without OCR, undecodable data, more images than the limit
+        ctx["scan"] = "failed"
         if mode in OUTSIDE:
             record(store.session_update, cfg, sid, flagged="unscanned")
         if withhold_unscanned:
@@ -354,6 +363,8 @@ def after_error(phase: str, call: Call | None, cfg, ctx: dict, exc: BaseExceptio
         return None
     if cfg is None or cfg.mode != "block" or cfg.on_error != "closed" or phase != "after" or call is None:
         return None
+    if not call.replaceable:
+        return None  # nothing can be put in its place, so nothing is claimed to have been
     from . import firstparty, provenance
     mode = ctx.get("mode", UNKNOWN)
     if mode == UNKNOWN:

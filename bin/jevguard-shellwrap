@@ -1,0 +1,20 @@
+#!/usr/bin/python3 -IS
+# Started by bin/jevguard-shell for a tool's command: jevguard-shellwrap <shell> <line>.
+# Whatever goes wrong before the command has been started, the line is run as it is.
+import os
+import sys
+
+shell, line = sys.argv[1], sys.argv[2]
+plan = None
+try:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    from jevguard import shellwrap
+    plan = shellwrap.capture(line)
+except BaseException:
+    plan = None
+if plan is None:
+    os.execv(shell, [shell, "-c", line])
+code = shellwrap.run(shell, line, plan)
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(code)  # do not wait for scoring threads that are past the deadline

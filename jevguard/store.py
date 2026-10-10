@@ -102,22 +102,41 @@ def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str
     return qid
 
 
-def judged(cfg, session: str, command: str, mark: bool = False) -> bool:
-    """Whether `jevguard-run` has judged what this command printed. The wrapper leaves a mark when
-    it has (mark=True); the agent's hook after the call asks, and the asking takes the mark away.
-    No mark means the wrapper could not do its work, as inside a sandbox that allows it neither
-    the network nor a file of its own, and the hook then judges the output itself."""
+_MARK_SECONDS = 900  # longer than the longest a command may run before the agent gives up on it
+
+
+def _mark(cfg, kind: str, session: str, command: str, mark: bool) -> bool:
+    """A note from one of the guard's processes to another about one command of one session:
+    left with mark=True, and taken away by the one that asks. One left behind (the process that
+    would have asked never ran) is not believed after a quarter of an hour."""
     import hashlib
-    p = cfg.state_dir / "judged" / hashlib.sha256(f"{session}\0{command}".encode("utf-8", "replace")).hexdigest()[:32]
+    p = cfg.state_dir / kind / hashlib.sha256(f"{session}\0{command}".encode("utf-8", "replace")).hexdigest()[:32]
     if mark:
         _private_dir(p.parent)
         p.touch(mode=0o600)
+        os.utime(p)
         return True
     try:
+        fresh = time.time() - p.stat().st_mtime < _MARK_SECONDS
         p.unlink()
-        return True
+        return fresh
     except OSError:
         return False
+
+
+def judged(cfg, session: str, command: str, mark: bool = False) -> bool:
+    """Whether a wrapper (`jevguard-run`, `jevguard-shell`) has judged what this command printed.
+    The wrapper leaves a mark when it has (mark=True); the agent's hook after the call asks, and
+    the asking takes the mark away. No mark means the wrapper could not do its work, as inside a
+    sandbox that allows it neither the network nor a file of its own, and the hook then judges
+    the output itself."""
+    return _mark(cfg, "judged", session, command, mark)
+
+
+def streamed(cfg, session: str, command: str, mark: bool = False) -> bool:
+    """Whether this command is a Monitor's: its lines have to go out as they come, so the shell
+    wrapper must not hold them. The hook before the call leaves the mark; the wrapper asks."""
+    return _mark(cfg, "streamed", session, command, mark)
 
 
 def released(cfg) -> frozenset:

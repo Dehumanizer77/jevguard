@@ -100,14 +100,15 @@ def main(argv: list[str] | None = None) -> int:
     return child.returncode if child.returncode >= 0 else 128 - child.returncode
 
 
-def _judge(agent: str, session: str, command: str, out: bytes, err: bytes, closed: bool = False) -> str | None:
-    """The notice to print in place of the output, or None to print the output."""
+def _judge(agent: str, session: str, command: str, out: bytes, err: bytes, closed: bool = False, via: str = "run") -> str | None:
+    """The notice to print in place of the output, or None to print the output. via: which wrapper
+    is asking ("run": jevguard-run for Cursor; "shell": jevguard-shell for Claude Code)."""
     from . import config, engine, store
     cfg, ctx, call = None, {}, None
     try:
         text = "\n".join(t for t in (out.decode("utf-8", "replace"), err.decode("utf-8", "replace")) if t)
         call = engine.Call("Bash", {"command": engine.without_own_lines(command)}, session, os.getcwd(),
-                           {"client": agent, "via": "run"}, agent.capitalize())
+                           {"client": agent, "via": via}, agent.capitalize())
         call.text, call.raw = text, {"stdout": out.decode("utf-8", "replace"), "stderr": err.decode("utf-8", "replace")}
         cfg = config.load()
         signal.signal(signal.SIGALRM, _on_alarm)
@@ -118,23 +119,26 @@ def _judge(agent: str, session: str, command: str, out: bytes, err: bytes, close
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         signal.alarm(0)
-        return _failed(call, cfg, ctx, exc, closed)
+        return _failed(call, cfg, ctx, exc, closed, via)
     try:
-        # Tells the agent's own hook that this output is dealt with. Bookkeeping: if the mark
-        # cannot be left, that hook looks at the output a second time and the verdict above stands.
-        store.judged(cfg, session, call.tool_input["command"], mark=True)
+        # Tells the agent's own hook that this output is dealt with. Not where the scan did not get
+        # to a verdict (the API down, a deadline on a very long output): then that hook is still
+        # to do what it can. Bookkeeping: if the mark cannot be left, the hook looks at the output
+        # a second time and the verdict above stands.
+        if ctx.get("scan") != "failed":
+            store.judged(cfg, session, call.tool_input["command"], mark=True)
     except Exception as exc:
         ctx.setdefault("unrecorded", []).append(f"judged: {type(exc).__name__}: {exc}"[:200])
     if ctx.get("unrecorded"):  # what could not be written down (engine._record); nothing is printed here
         try:
-            store.audit(cfg, event="error", tool="Bash", session=session, via="run", action="unrecorded",
+            store.audit(cfg, event="error", tool="Bash", session=session, via=via, action="unrecorded",
                         error="; ".join(ctx["unrecorded"])[:300])
         except Exception:
             pass
     return decision.notice if decision and decision.action == "replace" else None
 
 
-def _failed(call, cfg, ctx: dict, exc: BaseException, closed: bool) -> str | None:
+def _failed(call, cfg, ctx: dict, exc: BaseException, closed: bool, via: str = "run") -> str | None:
     """The guard could not judge the output: a bug in it, a scan that did not come back in time,
     or a sandbox around the command that lets it read or write nothing of its own. What that
     costs is the owner's on_error, as in the hook. Where even the settings cannot be read, the
@@ -146,7 +150,7 @@ def _failed(call, cfg, ctx: dict, exc: BaseException, closed: bool) -> str | Non
     try:
         if cfg is not None and call is not None:
             decision = engine.after_error("after", call, cfg, ctx, exc)
-            store.audit(cfg, event="error", tool="Bash", session=call.session, via="run",
+            store.audit(cfg, event="error", tool="Bash", session=call.session, via=via,
                         action="blocked-error" if decision else "passed-error", error=f"{type(exc).__name__}: {exc}"[:300])
     except Exception:
         pass  # the record of the failure failed too; the decision does not depend on it
