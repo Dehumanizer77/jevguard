@@ -306,14 +306,30 @@ counts only where `gh` is certain to read an option whatever the others are: str
 the subcommand, after an argument or a value (`gh pr view 14 --repo ...`,
 `--json title --repo ...`) or after `--option=value`. Put it right after the subcommand and it
 always counts: `gh pr view --repo acme/widget 14 --comments`. It also has to be the only
-thing in the command that looks like one, and the subcommand has to be one of `pr`, `issue`,
-`run`, `workflow`, `release`, `label`, or `repo view owner/name`, or `api`.
+thing in the command that looks like one, and the command has to start `gh pr ...`,
+`gh issue ...`, `gh run ...`, `gh workflow ...`, `gh release ...` or `gh label ...` with the
+subcommand as the next word, or be `gh repo view owner/name` or `gh api`.
 
-No higher level either for a `gh api` call with an option the guard does not know,
-`--hostname` or `..` in its path, for an address among the arguments, for a search that names
-another repository (`--search 'repo:...'`), or while `GH_HOST` or `GH_REPO` is set, gh's own
-settings send its requests through a socket (`http_unix_socket`), or `PATH` has an empty or
-relative entry.
+`gh pr list` and `gh issue list` are narrower still. Most of their options end up in one
+GitHub search (`--search` as it is, `--author`, `--label`, `--assignee`, `--milestone` as terms
+of it), and a search is addressed by what its query says, in GitHub's own syntax:
+`repo:"stranger/widget"` in a query adds that repository to the results. The guard does not
+read that syntax. For these two commands only the options that cannot put a word into a query
+count, `--repo`, `--state`, `--limit`, `--json`, `--jq` and `--template`:
+
+```bash
+gh issue list --repo acme/widget --state open --json number,title --jq '.[].title'   # the higher level
+gh issue list --repo acme/widget --label bug                                         # ordinary outside content
+gh issue list --repo acme/widget --search 'is:open'                                  # ordinary outside content
+```
+
+Filter with `--jq` instead, which works on what came back. Any other command with `--search`
+gets no higher level either.
+
+Nor does a `gh api` call with an option the guard does not know, `--hostname` or `..` in its
+path, a command with an address among its arguments, or any `gh` command while `GH_HOST` or
+`GH_REPO` is set, gh's own settings send its requests through a socket (`http_unix_socket`), or
+`PATH` has an empty or relative entry.
 
 What the level says is where the command is addressed, not who wrote what comes back. An
 issue, a comment, a pull request from a fork: your repository returns other people's text

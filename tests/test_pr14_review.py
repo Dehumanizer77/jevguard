@@ -726,13 +726,12 @@ def test_issue28_a_value_that_looks_like_the_repository_option_names_nothing(gua
 
 
 @pytest.mark.parametrize("command", [
-    "gh issue list --repo acme/widget --label bug --search 'is:open sort:updated'",
-    "gh issue list --label bug --repo acme/widget",        # after a value: read as an option
-    "gh issue list --label=bug --repo=acme/widget",
-    "gh pr list --json=number,title --repo acme/widget",   # after --option=value: read as an option
+    "gh run list --repo acme/widget --workflow ci.yml --branch main",
+    "gh run list --workflow ci.yml --repo acme/widget",    # after a value: read as an option
+    "gh run list --workflow=ci.yml --repo=acme/widget",    # after --option=value: read as an option
     "gh pr view 14 -R acme/widget --json title",
     "gh pr view 14 -Racme/widget",
-    "gh pr -R acme/widget view 14",
+    "gh pr view --repo acme/widget 14 --comments",         # straight after the subcommand: always
     "gh pr view 14 --json title,state --repo acme/widget",
     "gh repo view acme/widget --json name",
 ])
@@ -743,17 +742,59 @@ def test_issue28_the_repository_option_where_gh_reads_one(guard, command):
     assert guard.log()[-1]["mode"] == "own" and guard.log()[-1]["action"] == "flagged"
 
 
+# ---- #29 a search is addressed by its query, and the query is not read ----------------------------
 @pytest.mark.parametrize("command", [
-    "gh issue list --repo acme/widget --search 'repo:stranger/widget injection'",   # the search reaches further
-    "gh pr list --repo acme/widget --search 'is:open org:stranger'",
-    "gh issue list --repo acme/widget --search user:stranger",
+    "gh issue list --repo acme/widget --search 'repo:\"stranger/widget\"'",         # the finding: a quoted value
+    "gh issue list --repo acme/widget --search 'repo:stranger/widget injection'",
     "gh issue list --repo acme/widget --search=repo:stranger/widget",
-    "gh issue list --repo acme/widget --search '-repo:acme/widget x'",
+    "gh issue list --repo acme/widget --search='repo:\"stranger/widget\"'",
+    "gh pr list --repo acme/widget --search 'is:open org:\"stranger\"'",
+    "gh pr list --repo acme/widget --search 'user:\"stranger\" owner:\"stranger\"'",
+    "gh issue list --repo acme/widget -S 'repo:\"stranger/widget\"'",
+    "gh issue list --repo acme/widget -S'repo:\"stranger/widget\"'",
+    "gh issue list --repo acme/widget --search 'is:open label:bug'",                # any search at all
+    "gh label list --repo acme/widget --search bug",
+    # the other filters of a list go into the same query, quoted by gh in a way GitHub may not honour
+    "gh pr list --repo acme/widget --author 'x\" repo:stranger/widget \"y'",
+    "gh pr list --repo acme/widget --label 'x\" repo:stranger/widget \"y'",
+    "gh pr list --repo acme/widget --assignee stranger",
+    "gh issue list --repo acme/widget --label bug",
+    "gh issue list --repo acme/widget --milestone 'v1 repo:stranger/widget'",
+    "gh issue list --repo acme/widget --mention stranger",
+    "gh pr list --repo acme/widget --head 'fix repo:stranger/widget'",
+    "gh pr list --repo acme/widget --draft",
+    "gh pr list --repo acme/widget --state 'open repo:stranger/widget'",
+    "gh pr list --repo acme/widget --limit 5x",
+    "gh pr list --repo acme/widget --json 'title repo:x'",
+    "gh pr list --repo acme/widget stranger/widget",                                # nothing but options
+    "gh pr list --repo acme/widget --repo acme/widget",
+    "gh pr list --state open",                                                      # no repository named
+    "gh pr list -Racme/widget",
+    "gh pr -R acme/widget list",
 ])
-def test_issue28_a_search_that_names_someone_else_is_not_about_the_own_repository(guard, command):
+def test_issue29_a_list_that_searches_gets_no_higher_level(guard, command):
     guard.configure(mode="block", on_error="closed", own_repos=OWN)
+    assert github.gh_repos(shell.literal_command(command)) is None, command
     assert run(guard, command, "borderline-sample 12 Fix the widget OPEN") is not None, command
-    assert guard.log()[-1]["mode"] == "external"
+    assert guard.log()[-1]["mode"] == "external" and guard.log()[-1]["action"] == "blocked"
+
+
+@pytest.mark.parametrize("command", [
+    "gh issue list --repo acme/widget",
+    "gh issue list --repo acme/widget --state open --limit 50 --json number,title --jq '.[] | \"#\\(.number) \\(.title)\"'",
+    "gh pr list -R acme/widget -s merged -L 5",
+    "gh pr list --state=all --repo=acme/widget --json=number,title",
+    "gh issue list --jq '.[] | select(.title | test(\"repo:x\"))' --json title --repo acme/widget",   # text for jq, not for GitHub
+    "gh pr list --repo acme/widget --template '{{range .}}{{.title}}{{end}}' --json title",
+    "gh run list --repo acme/widget --workflow ci.yml --branch main --limit 3",      # no search behind these
+    "gh release list --repo acme/widget --limit 5",
+    "gh pr status --repo acme/widget",
+])
+def test_issue29_a_list_with_nothing_for_the_query_still_does(guard, command):
+    guard.configure(mode="block", on_error="closed", own_repos=OWN)
+    assert github.gh_repos(shell.literal_command(command)) == ["acme/widget"], command
+    assert run(guard, command, "borderline-sample 12 Fix the widget OPEN") is None, command
+    assert guard.log()[-1]["mode"] == "own"
 
 
 def test_curl_and_wget_startup_files_count_as_startup_files(guard):

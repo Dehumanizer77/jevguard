@@ -42,7 +42,8 @@ def checkout(tmp_path):
     ("gh pr view 14 --repo acme/widget --json state", ["acme/widget"]),
     ("gh pr view 14 -R acme/widget", ["acme/widget"]),
     ("gh pr view 14 -Racme/widget", ["acme/widget"]),
-    ("gh pr -R acme/widget view 14", ["acme/widget"]),
+    ("gh pr view --repo acme/widget 14 --comments", ["acme/widget"]),
+    ("gh pr -R acme/widget view 14", None),                # the subcommand comes first: it decides how the rest is read
     ("gh -R acme/widget issue list", None),                # not a place gh reads the option from
     ("gh issue list --repo=github.com/acme/widget", ["acme/widget"]),
     ("gh secret list --repo acme/widget", None),           # --org and --env address these elsewhere; not read
@@ -123,7 +124,7 @@ def test_the_reply_to_a_write_is_scored_like_everything_else(guard, command):
     VIEW + " --json title,state 2>/dev/null",
     "rtk " + VIEW,
     "gh api repos/acme/widget/pulls/14 --jq '.title + \" \" + .state'",
-    "gh issue list --repo acme/widget --search 'is:open label:bug' --json number,title",
+    "gh issue list --repo acme/widget --state open --json number,title",
     'gh pr comment 14 --repo acme/widget --body "Done, thanks!"',
 ])
 def test_one_gh_command_written_out_gets_the_higher_level(guard, command):

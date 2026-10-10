@@ -102,10 +102,18 @@ def gh_repos(argv: list[str]) -> list[str] | None:
     if args[:2] == ["repo", "view"]:  # takes the repository as its first argument, and no option for it
         repo = slug(args[2]) if len(args) > 2 and not found else None
         return [repo] if repo else None
-    if not args or args[0] not in _REPO_SCOPED or len(found) != 1:
+    # the subcommand first, as two plain words: it decides how the rest is read
+    if len(args) < 2 or args[0] not in _REPO_SCOPED or args[1].startswith("-"):
+        return None
+    if any(_SEARCH_OPTION.fullmatch(a) for a in args):
+        return None  # a search is addressed by its query, and the query is not read here
+    if args[0] in ("pr", "issue") and args[1] == "list":
+        repo = _list_repo(args[2:])
+        return [repo] if repo else None
+    if len(found) != 1:
         return None
     i = found[0]
-    option, before = args[i], args[i - 1] if i else "-"
+    option, before = args[i], args[i - 1]
     if not _REPO_OPTION.fullmatch(option) or (before.startswith("-") and not (before.startswith("--") and "=" in before)):
         return None
     if option in ("-R", "--repo"):
@@ -114,6 +122,40 @@ def gh_repos(argv: list[str]) -> list[str] | None:
         value = option[7:] if option.startswith("--repo=") else option[2:]
     repo = slug(value)
     return [repo] if repo else None
+
+
+# `gh pr list` and `gh issue list` turn most of their options into one GitHub search: --search
+# as it is, --author, --label, --assignee, --milestone and others as terms of the query. A search
+# is addressed by what the query says, in a syntax of GitHub's own (`repo:"owner/name"` names
+# another repository, and several are alternatives), and that syntax is not read here. So for
+# these two the options are spelt out: only those that cannot put a word into a query, each with
+# the kind of value it takes. Anything else, and the list is ordinary outside content.
+_SEARCH_OPTION = re.compile(r"--search(?:=.*)?|-[A-Za-z]*S.*", re.S)
+_ANY = re.compile(r".*", re.S)
+_STATE, _NUMBER, _FIELDS = re.compile(r"open|closed|merged|all"), re.compile(r"\d+"), re.compile(r"[A-Za-z,]+")
+_LIST_OPTIONS = {"--repo": None, "-R": None, "--state": _STATE, "-s": _STATE, "--limit": _NUMBER, "-L": _NUMBER,
+                 "--json": _FIELDS, "--jq": _ANY, "-q": _ANY, "--template": _ANY, "-t": _ANY}
+
+
+def _list_repo(args: list[str]) -> str | None:
+    """owner/name from the arguments after `gh pr list` or `gh issue list`, when they are
+    nothing but the options above with fitting values and name one repository."""
+    repos, i = [], 0
+    while i < len(args):
+        name, attached, value = args[i].partition("=") if args[i].startswith("--") else (args[i], "", "")
+        i += 1
+        if name not in _LIST_OPTIONS:
+            return None
+        if not attached:
+            if i >= len(args):
+                return None
+            value = args[i]
+            i += 1
+        if _LIST_OPTIONS[name] is None:
+            repos.append(value)
+        elif not _LIST_OPTIONS[name].fullmatch(value):
+            return None
+    return slug(repos[0]) if len(repos) == 1 else None
 
 
 def is_own(repo: str, patterns: list) -> bool:
