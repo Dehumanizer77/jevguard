@@ -59,7 +59,7 @@ size, timing, a hash. Never the content.
 Two checks that read the call itself, no model:
 
 - *Changes to the guard.* A call that would change the guard's settings, state, release list
-  or code, run `jevguard mode|gate|install|uninstall|release|show|trust|untrust`, or touch a Claude Code
+  or code, run `jevguard mode|gate|install|uninstall|release|show|trust|untrust|own|disown`, or touch a Claude Code
   `settings*.json` (the hooks live there) is held for your approval. That holds whether the
   file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`),
   through a directory above it (`rm -rf ~/.claude`), or as the place a command writes to in
@@ -75,6 +75,22 @@ Two checks that read the call itself, no model:
   set to `ask-flagged` / `ask-external`, held for approval. A session counts as flagged once
   a result scored as an injection or passed without a full scan, and also when its recorded
   state cannot be read.
+
+When the guard holds a shell command for approval, it says why in the command itself, as
+comment lines put on top of it:
+
+```
+# jevguard: CHANGES THE GUARD
+# jevguard: why: the command runs `jevguard gate`
+# jevguard: Claude says: Switch the gate off for this session
+jevguard gate off
+```
+
+The same reason goes out with the question, and a terminal shows it. Other front ends do not:
+the approval card of the mobile app shows the command, cut to one line, and nothing else. The
+first line is short enough for that card. The third is what the agent itself said the call is
+for, in its own words and unchecked. The lines are comments, the command under them runs as
+it was written.
 
 If the guard itself fails before a call (an error, unreadable settings), the call is held for
 approval rather than let through unchecked.
@@ -230,6 +246,7 @@ jevguard log                    # recent scans that were not a plain pass (--all
 jevguard show fw-20261009-ab12cd      # read a quarantined result (your own terminal only)
 jevguard release fw-20261009-ab12cd   # hand the original to Claude and let that content pass from now on
 jevguard trust https://docs.example.com/guide/   # never withhold what WebFetch gets from this address
+jevguard own 'acme/*' solo/tool                  # your own GitHub repositories (`disown` takes them off)
 jevguard mode block             # start withholding; `jevguard mode log` to go back
 jevguard gate ask-flagged       # ask before risky actions once something was flagged
 ```
@@ -280,7 +297,8 @@ variable, `$(...)`, a glob, `~`, a backslash), no line break.
 
 `gh` about your own repositories. Everything `gh` prints counts as outside content, and short
 status lines and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false`
-scored 0.38. List your own repositories in `own_repos` (`"acme/*"`, `"solo/tool"`) and what one
+scored 0.38. List your own repositories with `jevguard own 'acme/*' solo/tool` (the `own_repos`
+setting) and what one
 `gh` command about them returns is withheld only from 0.6 up; between 0.38 and 0.6 it is logged
 as flagged. This is a higher level, not an exemption: anyone can open an issue or write a
 comment in a public repository, a clear injection scores near 1 either way, and the reply to

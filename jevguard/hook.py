@@ -44,7 +44,32 @@ def _existing(cfg, paths: list[str]) -> list[str]:
 
 def _fields(d: dict) -> tuple[str, dict, str, str]:
     tool_input = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
+    if isinstance(tool_input.get("command"), str):
+        tool_input = {**tool_input, "command": _without_own_lines(tool_input["command"])}
     return str(d.get("tool_name") or ""), tool_input, str(d.get("session_id") or ""), str(d.get("cwd") or "")
+
+
+# ---- the question, written into the command ---------------------------------------------------------
+# The reason the guard gives with "ask" is shown by the terminal. The approval card of the mobile
+# app shows the command and nothing else, cut to one line. So for a shell command the explanation
+# is also put where every front end shows it: as comment lines at the top of the command. They
+# do nothing in a shell; the first is kept short enough to be read on that card.
+_OWN_LINE = "# jevguard: "
+
+
+def _one_line(text, limit: int) -> str:
+    """Fit for one comment line: a line break in it would end the comment and start a command."""
+    return " ".join("".join(c if c.isprintable() else " " for c in str(text)).split())[:limit]
+
+
+def _without_own_lines(command: str) -> str:
+    """The command without the comment lines on top of it. Once approved it runs with them, and
+    the hook sees it again with its result; what a comment says is no part of what ran. Whoever
+    wrote such a line, it is a comment to the shell, so leaving it out changes nothing."""
+    lines = command.split("\n")
+    while len(lines) > 1 and lines[0].startswith(_OWN_LINE.rstrip()):
+        lines.pop(0)
+    return "\n".join(lines)
 
 
 def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
@@ -137,9 +162,16 @@ def post_tool_use(d: dict, cfg, ctx: dict) -> dict | None:
     return None
 
 
-def _ask(reason: str) -> dict:
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
-                                   "permissionDecisionReason": f"jevguard: {reason}"}}
+def _ask(reason: str, tool: str = "", tool_input: dict | None = None, topic: str = "", why: str = "") -> dict:
+    """topic: in two or three words what is at stake; why: what in this call set the question off."""
+    out = {"hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": f"jevguard: {reason}"}
+    if tool == "Bash" and topic and isinstance((tool_input or {}).get("command"), str):
+        said = _one_line(tool_input.get("description") or "", 140)
+        lines = [_OWN_LINE + topic, _OWN_LINE + "why: " + _one_line(why, 300)]
+        if said:
+            lines.append(_OWN_LINE + "Claude says: " + said)  # its own words, not checked
+        out["updatedInput"] = {**tool_input, "command": "\n".join([*lines, tool_input["command"]])}
+    return {"hookSpecificOutput": out}
 
 
 def _purpose(tool_input: dict) -> str:
@@ -161,7 +193,7 @@ def pre_tool_use(d: dict, cfg) -> dict | None:
             store.audit(cfg, **ids, why=why, taint="guard", action="asked")
             return _ask(f"asking because {why}.{_purpose(tool_input)} Approve only if you expect this "
                         "session to be changing the guard or Claude Code's settings right now; you do not "
-                        "need to review the rest of the command.")
+                        "need to review the rest of the command.", tool, tool_input, "CHANGES THE GUARD", why)
     if cfg.gate == "off":
         return None
     why = gate.risky(tool, tool_input, cwd)
@@ -181,7 +213,8 @@ def pre_tool_use(d: dict, cfg) -> dict | None:
         return None
     seen = ("a tool result scored as a prompt injection or passed without a full scan" if taint == "flagged"
             else "content from outside was read")
-    return _ask(f"asking because earlier in this session {seen}, and this call {why}.{_purpose(tool_input)}")
+    return _ask(f"asking because earlier in this session {seen}, and this call {why}.{_purpose(tool_input)}",
+                tool, tool_input, "RISKY AFTER OUTSIDE CONTENT", f"{why}, and earlier in this session {seen}")
 
 
 def _on_alarm(*_):
@@ -196,7 +229,9 @@ def _after_error(d: dict, cfg, ctx: dict, exc: BaseException) -> dict | None:
     rather than assumed to be local."""
     if d.get("hook_event_name") == "PreToolUse":
         if cfg is None or cfg.protect_guard or cfg.gate.startswith("ask"):
-            return _ask(f"the guard hit an error and could not check this call ({type(exc).__name__}).")
+            tool, tool_input = _fields(d)[:2]
+            return _ask(f"the guard hit an error and could not check this call ({type(exc).__name__}).",
+                        tool, tool_input, "GUARD ERROR, CALL NOT CHECKED", f"the guard failed with {type(exc).__name__}")
         return None
     if cfg is None or cfg.mode != "block" or cfg.on_error != "closed" or d.get("hook_event_name") != "PostToolUse":
         return None
