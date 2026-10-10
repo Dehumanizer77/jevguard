@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from conftest import ATTACK, BENIGN
-from jevguard import config, github, provenance, store
+from jevguard import config, github, provenance, shell, store
 
 BASH = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
 PREFIX = "https://docs.example.com/guide"
@@ -690,6 +690,70 @@ def test_issues_24_25_26_checked_against_bash_and_curl(guard, tmp_path):
         docs.shutdown()
     # #24 and #26 work with any bash; #25 needs a curl that knows %output (8.3 and later)
     assert strayed[24] and strayed[26], strayed
+
+
+# ---- #28 the repository is named only where gh itself reads a repository option --------------------
+@pytest.mark.parametrize("command", [
+    "gh issue list --label '--repo=acme/widget'",          # the value of --label, not a repository
+    "gh issue list --search '-Racme/widget'",
+    "gh pr list --search '-Racme/widget'",
+    "gh issue list --label --repo acme/widget",            # --label takes --repo for its value
+    "gh pr view --json --repo acme/widget",                # ... and acme/widget is then a branch name
+    "gh pr list --search -R acme/widget",
+    "gh issue list -l --repo=acme/widget",
+    "gh pr list -L -Racme/widget",
+    "gh pr list -wL --repo acme/widget",                   # the last letter of the run may take a value
+    "gh pr view 14 --comments --repo acme/widget",         # after an option without =: could be its value
+    "gh pr view -- 14 --repo acme/widget",                 # after --, everything is an argument
+    "gh pr view 14 --repo acme/widget -- x",
+    "gh pr view 14 -cR acme/widget",
+    "gh pr view 14 -R=acme/widget",
+    "gh pr view 14 --repo acme/widget --repo acme/widget",
+    "gh pr view 14 --repo acme/widget --search -Rstranger/widget",
+    "gh --repo acme/widget pr view 14",                    # not a place gh reads it from
+    "gh repo view --json name acme/widget",
+    "gh repo view acme/widget --repo stranger/widget",
+])
+def test_issue28_a_value_that_looks_like_the_repository_option_names_nothing(guard, command, tmp_path):
+    assert github.gh_repos(shell.literal_command(command)) is None, command
+    # no repository is named, so gh would use the checkout: here a stranger's
+    repo = tmp_path / "widget"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "config").write_text('[remote "origin"]\n\turl = https://github.com/stranger/widget.git\n')
+    guard.configure(mode="block", on_error="closed", own_repos=OWN)
+    assert run_in(guard, command, "borderline-sample 12 Fix the widget OPEN", str(repo)) is not None, command
+    assert guard.log()[-1]["mode"] == "external" and guard.log()[-1]["action"] == "blocked"
+
+
+@pytest.mark.parametrize("command", [
+    "gh issue list --repo acme/widget --label bug --search 'is:open sort:updated'",
+    "gh issue list --label bug --repo acme/widget",        # after a value: read as an option
+    "gh issue list --label=bug --repo=acme/widget",
+    "gh pr list --json=number,title --repo acme/widget",   # after --option=value: read as an option
+    "gh pr view 14 -R acme/widget --json title",
+    "gh pr view 14 -Racme/widget",
+    "gh pr -R acme/widget view 14",
+    "gh pr view 14 --json title,state --repo acme/widget",
+    "gh repo view acme/widget --json name",
+])
+def test_issue28_the_repository_option_where_gh_reads_one(guard, command):
+    assert github.gh_repos(shell.literal_command(command)) == ["acme/widget"], command
+    guard.configure(mode="block", on_error="closed", own_repos=OWN)
+    assert run(guard, command, "borderline-sample 12 Fix the widget OPEN") is None, command
+    assert guard.log()[-1]["mode"] == "own" and guard.log()[-1]["action"] == "flagged"
+
+
+@pytest.mark.parametrize("command", [
+    "gh issue list --repo acme/widget --search 'repo:stranger/widget injection'",   # the search reaches further
+    "gh pr list --repo acme/widget --search 'is:open org:stranger'",
+    "gh issue list --repo acme/widget --search user:stranger",
+    "gh issue list --repo acme/widget --search=repo:stranger/widget",
+    "gh issue list --repo acme/widget --search '-repo:acme/widget x'",
+])
+def test_issue28_a_search_that_names_someone_else_is_not_about_the_own_repository(guard, command):
+    guard.configure(mode="block", on_error="closed", own_repos=OWN)
+    assert run(guard, command, "borderline-sample 12 Fix the widget OPEN") is not None, command
+    assert guard.log()[-1]["mode"] == "external"
 
 
 def test_curl_and_wget_startup_files_count_as_startup_files(guard):

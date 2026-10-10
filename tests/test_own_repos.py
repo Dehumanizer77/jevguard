@@ -42,8 +42,11 @@ def checkout(tmp_path):
     ("gh pr view 14 --repo acme/widget --json state", ["acme/widget"]),
     ("gh pr view 14 -R acme/widget", ["acme/widget"]),
     ("gh pr view 14 -Racme/widget", ["acme/widget"]),
-    ("gh -R acme/widget issue list", ["acme/widget"]),
+    ("gh pr -R acme/widget view 14", ["acme/widget"]),
+    ("gh -R acme/widget issue list", None),                # not a place gh reads the option from
     ("gh issue list --repo=github.com/acme/widget", ["acme/widget"]),
+    ("gh secret list --repo acme/widget", None),           # --org and --env address these elsewhere; not read
+    ("gh ruleset list --repo acme/widget --org stranger", None),
     ("gh api repos/acme/widget/pulls/14 --jq .state", ["acme/widget"]),
     ("gh api -X PATCH /repos/acme/widget/pulls/14 -f title=x", ["acme/widget"]),
     ("gh repo view acme/widget", ["acme/widget"]),

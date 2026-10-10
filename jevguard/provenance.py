@@ -208,6 +208,10 @@ def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: lis
 # - one program the owner listed in trusted_commands is scanned and not withheld ("warn"): the
 #   owner's own word for that program, not the guard's reading of it.
 
+# --search 'repo:stranger/widget ...': GitHub's search takes the repository from the query as well
+_SEARCHES_ELSEWHERE = re.compile(r"(?i)(?<![a-z0-9_])(?:repo|org|user|owner):[\w.-]")
+
+
 def _search_path_fixed() -> bool:
     """Every entry of PATH is absolute, so a bare name means the same program whatever the
     directory. Which program that is, is the owner's setup and not judged here."""
@@ -231,8 +235,10 @@ def _own_repo(cmd: str, cfg) -> bool:
     argv = shell.literal_command(cmd)
     if argv and argv[:2] == ["rtk", "gh"]:
         argv = argv[1:]  # gh run through the output filter of this setup
-    if not argv or argv[0] != "gh" or any("://" in a for a in argv) or not _search_path_fixed():
+    if not argv or argv[0] != "gh" or not _search_path_fixed():
         return False
+    if any("://" in a or _SEARCHES_ELSEWHERE.search(a) for a in argv):
+        return False  # a pull request given by its address, or a search that names someone else's repository
     if os.environ.get("GH_HOST") or os.environ.get("GH_REPO") or github.rerouted():
         return False
     repos = github.gh_repos(argv)

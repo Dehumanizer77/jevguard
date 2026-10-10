@@ -294,13 +294,30 @@ gh pr view 14 --repo acme/widget --json title,state      # your repository: the 
 gh pr view 14 --repo acme/widget | head -20              # a pipe: ordinary outside content
 git push && gh pr create --repo acme/widget --fill       # two programs: ordinary outside content
 gh pr list                                               # no repository named: ordinary outside content
+gh pr view 14 --comments --repo acme/widget              # may be the value of --comments: ordinary outside content
 ```
 
-Use `--jq` or `--json` instead of a pipe, and run `git push` as a command of its own. No
-higher level either for a `gh api` call with an option the guard does not know, `--hostname`
-or `..` in its path, for an address among the arguments, or while `GH_HOST` or `GH_REPO` is set,
-gh's own settings send its requests through a socket (`http_unix_socket`), or `PATH` has an
-empty or relative entry.
+Use `--jq` or `--json` instead of a pipe, and run `git push` as a command of its own.
+
+The last line is about where `--repo` stands. `gh` has hundreds of options and the guard does
+not know which of them take a value, so `--label --repo=acme/widget` (a label, and no
+repository named) cannot be told from a repository option by its looks. The option therefore
+counts only where `gh` is certain to read an option whatever the others are: straight after
+the subcommand, after an argument or a value (`gh pr view 14 --repo ...`,
+`--json title --repo ...`) or after `--option=value`. Put it right after the subcommand and it
+always counts: `gh pr view --repo acme/widget 14 --comments`. It also has to be the only
+thing in the command that looks like one, and the subcommand has to be one of `pr`, `issue`,
+`run`, `workflow`, `release`, `label`, or `repo view owner/name`, or `api`.
+
+No higher level either for a `gh api` call with an option the guard does not know,
+`--hostname` or `..` in its path, for an address among the arguments, for a search that names
+another repository (`--search 'repo:...'`), or while `GH_HOST` or `GH_REPO` is set, gh's own
+settings send its requests through a socket (`http_unix_socket`), or `PATH` has an empty or
+relative entry.
+
+What the level says is where the command is addressed, not who wrote what comes back. An
+issue, a comment, a pull request from a fork: your repository returns other people's text
+too, and that is why this is a level and the result is still scanned.
 
 A program you vouch for. `trusted_commands` takes program names (`"make"`); the output of such
 a program is scanned and logged, never withheld. That is your word for the program, not

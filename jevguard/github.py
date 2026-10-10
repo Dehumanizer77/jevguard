@@ -15,9 +15,10 @@ import re
 
 _NAME = r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+"
 _API_PATH = re.compile(r"/?repos/(" + _NAME + r")(?:/.*)?")
-# Subcommands that act on one repository. `search`, `status`, `gist` and `api` paths outside
-# repos/ range over GitHub.
-_REPO_SCOPED = {"pr", "issue", "run", "workflow", "release", "label", "cache", "secret", "variable", "ruleset"}
+# Subcommands that act on the one repository their --repo option names. `search`, `status`,
+# `gist` and `api` paths outside repos/ range over GitHub; `secret`, `variable` and `ruleset`
+# can be pointed at an organisation instead (--org), so they are not read either.
+_REPO_SCOPED = {"pr", "issue", "run", "workflow", "release", "label"}
 # What `gh <noun> <verb>` changes something with. gate.py asks about these.
 WRITE_VERBS = {"create", "comment", "edit", "merge", "close", "reopen", "delete", "upload", "set", "run", "fork",
                "review", "ready", "lock", "unlock", "transfer", "rename", "archive", "unarchive", "sync", "enable",
@@ -72,39 +73,47 @@ def _api_repo(endpoint: str) -> str | None:
     return m.group(1) if m else None
 
 
+# The repository option as gh takes it, and anything that could be one: -R also at the end of a
+# run of short options (-cR).
+_REPO_OPTION = re.compile(r"-R.*|--repo(?:=.*)?")
+_COULD_BE_ONE = re.compile(r"-[A-Za-z]*R.*|--repo(?:=.*)?")
+
+
 def gh_repos(argv: list[str]) -> list[str] | None:
-    """The repositories one `gh` invocation names, or None when it names none or more could be
-    meant than it names."""
+    """The repository one `gh` invocation is addressed to, as a list of one, or None when it
+    names none or it is not certain which.
+
+    For `gh api` the options are few and known, and the endpoint is found by going through
+    them. The other subcommands have hundreds of options between them, and which of those take
+    a value is not known here; without that, `--label --repo=acme/widget` cannot be told from a
+    repository option by looking at it. So the option counts only where gh itself is certain to
+    read an option, whatever the others are: straight after a word that is not an option (the
+    subcommand, a value, an argument) or after `--option=value`. After a bare option it may be
+    that option's value; after `--` everything is an argument. And there has to be exactly one
+    thing in the command that could be it."""
     args = argv[1:]
-    if any(a.split("=", 1)[0] == "--hostname" for a in args):
-        return None  # another server: the same owner/name there is someone else's
+    if "--" in args or any(a.split("=", 1)[0] == "--hostname" for a in args):
+        return None  # --hostname is another server: the same owner/name there is someone else's
     if args[:1] == ["api"]:
         endpoint = _endpoint(args[1:])
         repo = _api_repo(endpoint) if endpoint else None
         return [repo] if repo else None
-    words, named, skip = [], [], False
-    for i, a in enumerate(args):
-        if skip:
-            skip = False
-        elif re.fullmatch(r"-[A-Za-z]+R.*", a) and not a.startswith("-R"):
-            return None  # -cR owner/name: the repository is named, in a run of short options
-        elif a in ("-R", "--repo"):
-            named.append(args[i + 1] if i + 1 < len(args) else "")
-            skip = True
-        elif a.startswith("--repo="):
-            named.append(a.split("=", 1)[1])
-        elif a.startswith("-R") and len(a) > 2:
-            named.append(a[2:])
-        elif not a.startswith("-"):
-            words.append(a)
-    if not words:
+    found = [i for i, a in enumerate(args) if _COULD_BE_ONE.fullmatch(a)]
+    if args[:2] == ["repo", "view"]:  # takes the repository as its first argument, and no option for it
+        repo = slug(args[2]) if len(args) > 2 and not found else None
+        return [repo] if repo else None
+    if not args or args[0] not in _REPO_SCOPED or len(found) != 1:
         return None
-    if words[0] == "repo" and words[1:2] == ["view"]:
-        named = named or words[2:3]
-    elif words[0] not in _REPO_SCOPED:
+    i = found[0]
+    option, before = args[i], args[i - 1] if i else "-"
+    if not _REPO_OPTION.fullmatch(option) or (before.startswith("-") and not (before.startswith("--") and "=" in before)):
         return None
-    repos = [slug(n) for n in named]
-    return repos if repos and all(repos) else None
+    if option in ("-R", "--repo"):
+        value = args[i + 1] if i + 1 < len(args) else ""
+    else:
+        value = option[7:] if option.startswith("--repo=") else option[2:]
+    repo = slug(value)
+    return [repo] if repo else None
 
 
 def is_own(repo: str, patterns: list) -> bool:
