@@ -502,7 +502,7 @@ Things to know:
 | `skip_tools` | claude.ai Gmail, Drive, Calendar, Docs connectors | tool-name patterns never scanned |
 | `warn_tools` | `[]` | tool-name patterns that are scanned and logged, never withheld |
 | `trusted_sources` | `[]` | URL prefixes; what `WebFetch` gets from them is scanned and logged, never withheld (`jevguard trust`). Not for `curl` or `wget` |
-| `own_repos` | `[]` | your own GitHub repositories, as `owner/name` or `owner/*`; what one `gh` command naming such a repository returns is withheld only from `own_repos_block` up |
+| `own_repos` | `[]` | your own GitHub repositories, as `owner/name` or `owner/*`; what one `gh` command naming such a repository returns is withheld only from `own_repos_block` up, and a `Monitor` running such a command is not asked about |
 | `own_repos_block` | `0.6` | that level |
 | `on_error` | `open` | `closed` withholds outside content that could not be fully scanned: the API failed, the guard hit an error, or part of the result was unreadable (block mode). Without `tesseract` that includes every image from outside |
 | `protect_guard` | `true` | ask before any call that would change the guard or the agent settings that run it |
@@ -533,7 +533,10 @@ fetches and the private connectors out of that; each switch above widens it.
   notification, and no hook is called for those, so it can be neither scanned nor withheld.
   When the command reads from outside, the guard asks before the monitor starts (in `block`
   mode; in `log` mode it records it) and counts the session as flagged. If you approve, that
-  output reaches the model unscanned.
+  output reaches the model unscanned. A monitor on one of your `own_repos` is recorded
+  (`logged`) and not asked about: unscanned all the same. That holds for one `gh` command
+  that names the repository and nothing else (`gh run watch --repo you/project 4242`); a
+  loop or a pipe around it is asked about like any other.
 - The result of a built-in tool whose name the adapter does not know (MCP tools always are
   scanned; in Copilot CLI an unknown tool is too). A background command's output is followed
   in Claude Code, Grok and Hermes as described above; whether Codex has a tool of that kind

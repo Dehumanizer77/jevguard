@@ -136,15 +136,18 @@ def _task_outputs(tool_input: dict, cwd: str, tasks: list) -> list[str]:
     return found
 
 
-def _streams_outside(call: Call, cfg) -> bool:
-    """A Monitor whose command brings in content from outside. Read like a shell command."""
+def _stream_origin(call: Call, cfg) -> str:
+    """Where what a Monitor prints would come from, its command read like any shell command:
+    "external", "own" (one gh command that names one of the owner's repositories), or "" for a
+    command that brings nothing in from outside."""
     from . import provenance
     try:
         session = store.session(cfg, call.session)
     except (ValueError, OSError):
-        return True  # which files this session downloaded is not known: it may print one of them
+        return "external"  # which files this session downloaded is not known: it may print one of them
     paths = [*session.get("paths", []), *_task_outputs(call.tool_input, call.cwd, list(session.get("tasks", [])))]
-    return provenance.classify("Bash", call.tool_input, cfg, call.cwd, _existing(cfg, paths), "") in ("external", "own")
+    mode = provenance.classify("Bash", call.tool_input, cfg, call.cwd, _existing(cfg, paths), "")
+    return mode if mode in ("external", "own") else ""
 
 
 # ---- after a call: the result ------------------------------------------------------------------------
@@ -271,7 +274,16 @@ def before(call: Call, cfg) -> Decision | None:
             return Decision("ask", reason=f"asking because {why}.{_purpose(call)} Approve only if you expect this "
                             "session to be changing the guard or Claude Code's settings right now; you do not "
                             "need to review the rest of the command.", topic="CHANGES THE GUARD", why=why)
-    if tool == "Monitor" and _streams_outside(call, cfg):
+    origin = _stream_origin(call, cfg) if tool == "Monitor" else ""
+    if origin == "own":
+        # The owner's choice (2026-10-10): watching one of his own repositories is recorded and not
+        # asked about. It is what own_repos stands for everywhere else, content he vouches for more
+        # than a stranger's; here it also goes unscanned, and the log says so. Only the one form
+        # counts that counts elsewhere: a single gh command naming the repository, nothing around it.
+        store.audit(cfg, **ids, taint="unscanned", action="logged",
+                    why="its output goes to the model as notifications, unscanned; the command is one gh command on an own repository")
+        store.session_update(cfg, sid, external=True)
+    elif origin:
         # What it prints goes to the model as notifications. No hook sees those, so nothing of it
         # can be scanned or withheld afterwards; the one place to stop it is here. This is not
         # the gate (a risky action) and not on_error (a scan that failed): it is outside content

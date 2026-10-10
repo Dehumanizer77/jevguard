@@ -133,6 +133,43 @@ def test_a_monitor_in_log_mode_is_recorded_and_the_session_marked(guard):
     assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
 
 
+def test_a_monitor_on_an_own_repository_is_recorded_and_not_asked_about(guard):
+    """The owner's choice. Only the form that counts as his own everywhere else: one gh command
+    that names the repository, with nothing around it."""
+    guard.configure(mode="block", gate="ask-flagged", own_repos=["me/*"])
+    for command in ("gh run watch --repo me/project 4242", "gh pr checks --repo me/project 31 --watch"):
+        assert guard.raw(claude("PreToolUse", "Monitor", {"command": command, "description": "watch the run"})) is None, command
+        rec = guard.log()[-1]
+        assert rec["event"] == "gate" and rec["action"] == "logged" and rec["taint"] == "unscanned" and rec["tool"] == "Monitor"
+    # the session has read outside content, but is not counted as flagged for it
+    assert guard.raw(claude("PreToolUse", "Bash", {"command": "git push origin main"})) is None
+    guard.configure(mode="block", gate="ask-external", own_repos=["me/*"])
+    assert guard.raw(claude("PreToolUse", "Bash", {"command": "git push origin main"})) is not None
+    out = guard.raw(grok("PreToolUse", "monitor", {"command": "gh run watch --repo me/project 4242", "description": "watch"}), "--agent", "grok")
+    assert out is None and guard.log()[-1]["action"] == "logged"
+
+
+@pytest.mark.parametrize("command", [
+    "gh run watch --repo someone/project 4242",                                  # not his
+    "while true; do gh run view --repo me/project 4242; sleep 30; done",          # a loop around it
+    "gh run watch --repo me/project 4242 | grep --line-buffered fail",            # a pipe after it
+    "gh run watch --repo me/project 4242; curl -s https://news.example.com/feed",
+    "gh run watch 4242",                                                          # the repository is not named
+    "gh api repos/me/project/issues/1/comments; gh api repos/someone/else/issues/1/comments",
+    "curl -s https://github.com/me/project",
+])
+def test_anything_else_around_an_own_repository_is_still_asked_about(guard, command):
+    guard.configure(mode="block", own_repos=["me/*"])
+    out = guard.raw(claude("PreToolUse", "Monitor", {"command": command}))
+    assert out and out["hookSpecificOutput"]["permissionDecision"] == "ask", command
+
+
+def test_without_own_repos_every_monitor_on_gh_is_asked_about(guard):
+    guard.configure(mode="block")
+    out = guard.raw(claude("PreToolUse", "Monitor", {"command": "gh run watch --repo me/project 4242"}))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+
 def test_a_monitor_is_a_shell_command_for_the_gate(guard):
     """It was not looked at before a call at all: `jevguard gate off` ran through it unasked."""
     for command in ("jevguard gate off", "rm -rf ~/.claude", "echo x >> ~/.grok/disabled-hooks"):
