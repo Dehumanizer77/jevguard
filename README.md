@@ -305,9 +305,11 @@ methods or `..` in its path gets no leniency at all, and neither does any `gh` c
 `GH_HOST` or `GH_REPO` is set or gh's own settings send its requests through a socket
 (`http_unix_socket`).
 
-Plain `git` beside `gh` means two things. `git status`, `add`, `commit`, `checkout`, `switch`,
-`branch`, `stash`, `restore`, `tag` and `rev-parse` fetch nothing and change nothing about how
-the result is handled. `git push` brings back what the server says, so with it the result is
+Plain `git` beside `gh` means two things. `git status`, `add`, `commit -m`, `checkout -b`,
+`switch`, `branch`, `restore`, `tag` and `rev-parse` fetch nothing and change nothing about how
+the result is handled, as long as they are in a form that prints neither file content nor the
+text of someone's commit (not `status -v`, `commit -F file`, `branch -vv`, `tag -n`, `stash`, a
+`checkout` of anything but a new branch). `git push` brings back what the server says, so with it the result is
 never "only logged", and it counts as about your own repository only when the push plainly
 goes to one: `git push`, `git push origin <branch>` with everyday options (`-u`, `--tags`,
 `--force-with-lease`, ...), in a checkout that talks to one repository only. That is a
@@ -336,7 +338,8 @@ longer recognises them as its own.
 |---|---|---|
 | `mode` | `log` | `log` or `block` |
 | `gate` | `log` | `off`, `log`, `ask-flagged`, `ask-external` |
-| `scan_local` | `false` | also scan local files and local command output (they block at `local_block`, 0.6) |
+| `scan_local` | `false` | also scan local files and local command output (they block at `local_block`, 0.6). Commands that only report on the agent's own work (`git status`, `git commit -m`, `cp`, `mkdir`, `echo`, `date`, ...) are then scanned and logged, never withheld, as long as they stand in a form that prints nothing else: `cp notes.txt /dev/stdout`, `date -f notes.txt`, `git status -v` or `./date` are ordinary local output |
+| `trusted_commands` | `[]` | further program names to treat that way, e.g. `make`; by bare name, in a command that runs as written |
 | `scan_private_hosts` | `false` | treat fetches from localhost and private addresses as outside content |
 | `external_paths` | `["~/Downloads"]` | directories whose files are outside content |
 | `track_clones` | `false` | treat directories created by `git clone` as outside content |

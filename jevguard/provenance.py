@@ -28,13 +28,29 @@ _REMOTE_TOOL = re.compile(r"(?:^|[\s;|&(])(?:rtk\s+)?(?:gh|himalaya|yt-dlp|lynx|
 _URL = re.compile(r"\b(?:https?|wss?|ftp)://([^\s/'\"<>|;&)\\]+)", re.I)
 _PRIVATE_SUFFIX = (".local", ".lan", ".home", ".internal", ".localdomain", ".home.arpa")
 
-# Commands whose output only reports on the agent's own work. Every segment of a compound
-# command must be one of these; command substitution never is. ls is not here: file names can
-# come from outside.
+# Commands whose output only reports on the agent's own work; it is scanned and never withheld.
+# Every program in the command has to be one of these, by its bare name, in a form that prints
+# nothing else (see trusted_command). ls is not here: file names can come from outside.
 _TRUSTED_CMDS = {"cd", "pwd", "echo", "printf", "which", "whoami", "id", "hostname", "date", "uptime",
                  "df", "du", "wc", "mkdir", "touch", "cp", "mv", "rm", "ln", "chmod", "true", "sleep"}
-_TRUSTED_GIT = {"status", "add", "commit", "checkout", "switch", "branch", "stash", "rev-parse", "init",
-                "restore", "tag"}
+# Three of them can be handed a file of names or dates and then complain about every line of it:
+# (letters of such options, their long names).
+_LIST_OPTIONS = {"date": ("f", ("--file",)), "wc": ("", ("--files0-from",)), "du": ("", ("--files0-from",))}
+# git subcommands of the same kind, each with the options that make it print something else: a
+# patch, the staged changes, the text of a commit someone else wrote. None: any arguments.
+# stash and a plain checkout are not here: both print the title of a commit, whoever wrote it.
+_GIT_ALWAYS = ("piev", ("--patch", "--interactive", "--edit", "--verbose", "--format", "--pretty"))
+_GIT_REPORTS = {
+    "status": ("", ()), "add": ("", ()), "restore": ("", ()), "rev-parse": None, "init": None,
+    # a message that is not written in the command comes back in the summary line
+    "commit": ("FCct", ("--file", "--fixup", "--squash", "--reuse-message", "--reedit-message", "--template",
+                        "--amend", "--dry-run")),
+    "switch": ("d", ("--detach",)),
+    "checkout": ("", ()),  # as `checkout -b` only
+    "branch": ("ra", ("--remotes", "--all", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at")),
+    "tag": ("n", ()),
+}
+
 
 def private_host(host: str) -> bool:
     host = host.rsplit("@", 1)[-1].lower()
@@ -116,25 +132,79 @@ def fetches_outside(cmd: str, scan_private_hosts: bool = False) -> bool:
     return bool(_REMOTE_TOOL.search(cmd))
 
 
-def trusted_command(cmd: str, extra: set) -> bool:
-    if not cmd.strip() or re.search(r"\$\(|`|<\(", cmd):
+def _uses(args: list[str], letters: str, longs: tuple) -> bool:
+    """One of the arguments is one of these options: a short one alone or in a run (-av), a long
+    one in full or cut short the way these programs accept it (--verb). An option's value that
+    happens to look like one counts too; that costs the exemption and nothing else."""
+    for a in args:
+        if a.startswith("--"):
+            name = a.split("=", 1)[0]
+            if len(name) > 2 and any(full.startswith(name) or name.startswith(full) for full in longs):
+                return True
+        elif a.startswith("-") and any(c in letters for c in a[1:]):
+            return True
+    return False
+
+
+def _git_reports(words: list[str]) -> bool:
+    """`git status`, `git add`, `git commit -m ...` and the like, in a form that only reports on
+    the agent's own work. Only with the subcommand as the first argument: `git -c name=value` can
+    make git run a program, and `git -C elsewhere` works in another checkout."""
+    args = words[2:] if words[1:2] == ["--no-pager"] else words[1:]
+    if words[0] != "git" or not args or args[0] not in _GIT_REPORTS:
         return False
-    cmd = re.sub(r"\d*>&\d+", " ", cmd)  # 2>&1 is a redirect, not a background job
-    for seg in re.split(r"&&|\|\||[;|&\n]", cmd):
-        words = seg.split()
-        while words and re.fullmatch(r"\w+=\S*", words[0]):  # FOO=bar cmd
-            words.pop(0)
-        if words and words[0] == "rtk":
-            words.pop(0)
-        if not words:
-            continue
-        name = os.path.basename(words[0])
+    rule = _GIT_REPORTS[args[0]]
+    if rule is None:
+        return True
+    if args[0] == "checkout" and args[1:2] not in (["-b"], ["-B"]):
+        return False  # any other form may leave a branch: "HEAD is now at <title of that commit>"
+    return not _uses(args[1:], _GIT_ALWAYS[0] + rule[0], _GIT_ALWAYS[1] + rule[1])
+
+
+def _names_a_device(arg: str, dirs: list[str]) -> bool:
+    """The argument is, holds or leads to something under /dev or /proc. A file copied or moved
+    there is printed: /dev/stdout, /proc/self/fd/1, or a link to one of them under any name."""
+    forms = {arg, arg.partition("=")[2], arg[2:] if arg.startswith("-") and not arg.startswith("--") else ""}
+    for form in filter(None, forms):
+        for base in dirs or [""]:
+            path = os.path.join(base, os.path.expanduser(form))
+            for _ in range(16):
+                head, tail = os.path.split(path.rstrip("/") or "/")
+                dotted = tail in ("", ".", "..")
+                path = os.path.realpath(path) if dotted else os.path.join(os.path.realpath(head or "."), tail)
+                if path != "/dev/null" and (under(path, "/dev") or under(path, "/proc")):
+                    return True
+                try:
+                    path = os.path.join(os.path.dirname(path), os.readlink(path))
+                except OSError:
+                    break
+            else:
+                return True  # a chain of links this long is not followed to its end
+    return False
+
+
+def trusted_command(cmd: str, extra: set, cwd: str = "") -> bool:
+    """Every program in the command only reports on the agent's own work, and stands in a form
+    that prints nothing else. The command has to run as written (see _plain_commands):
+    `echo $(cat notes.txt)`, `echo *` and `wc -l < notes.txt` print other things. Programs count
+    by their bare name: ./date and /tmp/tools/cp are other programs, and `PATH=... date` may be."""
+    commands = _plain_commands(cmd)
+    if not commands:
+        return False
+    dirs = [canonical(cwd)] if cwd else []
+    for words in commands:
+        name, args = words[0], words[1:]
         if name == "git":
-            sub = next((w for w in words[1:] if not w.startswith("-")), "")
-            if sub not in _TRUSTED_GIT:
+            if not _git_reports(words):
                 return False
         elif name not in _TRUSTED_CMDS and name not in extra:
             return False
+        elif name in _LIST_OPTIONS and _uses(args, *_LIST_OPTIONS[name]):
+            return False
+        if any(_names_a_device(a, dirs) for a in args):
+            return False
+        if name == "cd":
+            dirs = dirs + [canonical(a, d) for a in args[:1] if not a.startswith("-") for d in dirs[:8]]
     return True
 
 
@@ -359,14 +429,6 @@ def _own_repo_mode(cmd: str, cwd: str, cfg) -> str | None:
     return "echo" if echo else "own"
 
 
-def _git_reports(words: list[str]) -> bool:
-    """`git status`, `git add`, `git commit` and the like beside `gh`: the same subcommands whose
-    output on their own counts as a report on the agent's own work, and that fetch nothing. Only
-    with the subcommand as the first argument: `git -c alias.x='!program' x` runs that program,
-    and `git -C elsewhere` works in another checkout."""
-    return words[0] == "git" and len(words) > 1 and words[1] in _TRUSTED_GIT
-
-
 # ---- a fetch that is plainly from a trusted address -------------------------------------------------
 # The options a plain download uses: (short flags, short options with a value, long flags, long
 # options with a value). Anything else (a proxy, --resolve, --connect-to, a config file, -k) can
@@ -550,7 +612,7 @@ def classify(tool: str, tool_input: dict, cfg, cwd: str, session_paths: list[str
             if not public and cfg.own_repos:
                 return _own_repo_mode(cmd, cwd, cfg) or "external"
             return "external"
-        return "warn" if trusted_command(cmd, set(cfg.trusted_commands)) else "local"
+        return "warn" if trusted_command(cmd, set(cfg.trusted_commands), cwd) else "local"
     if tool in ("Read", "Grep"):
         base = canonical(cwd) if cwd else ""
         path = canonical(str(tool_input.get("file_path") or tool_input.get("path") or cwd or "/"), cwd)
