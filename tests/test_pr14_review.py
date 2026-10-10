@@ -1,8 +1,9 @@
-"""Regression tests for the review of pull request 14 (issues 15 to 20)."""
+"""Regression tests for the review of pull request 14 (issues 15 to 21)."""
 
 import base64
 import os
 import shutil
+import socketserver
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -410,6 +411,161 @@ def test_issue20_what_the_reader_calls_plain_is_what_curl_sends(guard, tmp_path)
             assert run(guard, command, ATTACK) is None and guard.log()[-1]["mode"] == "trusted", command
     finally:
         server.shutdown()
+
+
+# ---- #21 a redirection can bring content in, and a quoted operator is an argument -----------------
+SOCKET = "/dev/tcp/untrusted.example/9000"
+
+
+@pytest.mark.parametrize("tail", [
+    f"; cat < {SOCKET}",
+    f"; cat 0<{SOCKET}",
+    f"; head -5 < {SOCKET}",
+    f"; grep -c x < {SOCKET}",
+    f"; jq . < {SOCKET}",
+    "; cat < notes.txt",                           # a local file is not the download either
+    "; head -5 < notes.txt",
+    "| cat <&3",
+    f"; exec 3<{SOCKET}; cat <&3",
+    f"; cat 3<>{SOCKET} <&3",
+    "; cat <<< 'text from elsewhere'",
+    f"> {SOCKET}",                                 # writing to a socket is no plain download either
+    "; cat <(curl -s https://news.example.com/b)",
+])
+def test_issue21_input_from_a_redirection_ends_both_exemptions(guard, tail):
+    guard.configure(mode="block", on_error="closed", scan_local=True, trusted_sources=[PREFIX], own_repos=OWN)
+    for n, command in enumerate((f"curl -s {PREFIX}/a{tail}", f"{COMMENT}{tail}")):
+        assert run(guard, command, f"{REPLY}{n} {ATTACK}") is not None, command
+        assert guard.log()[-1]["mode"] == "external" and guard.log()[-1]["action"] == "blocked", command
+
+
+@pytest.mark.parametrize("command", [
+    f"curl -s {PREFIX}/a '>' untrusted.example:9000/outside",        # '>' is an argument, and so is what follows
+    f'curl -s {PREFIX}/a ">" untrusted.example:9000/outside',
+    f"curl -s {PREFIX}/a \\> untrusted.example:9000/outside",
+    f"curl -s {PREFIX}/a '2>' untrusted.example:9000/outside",
+    f"curl -s {PREFIX}/a '>&' untrusted.example:9000/outside",
+    f"curl -s {PREFIX}/a ';' echo untrusted.example:9000/outside",   # not a second command: three more addresses
+    f"curl -s {PREFIX}/a '|' tr untrusted.example:9000/outside y",
+    f"curl -s {PREFIX}/a '&&' true untrusted.example:9000/outside",
+    f"curl -s {PREFIX}/a '(' untrusted.example:9000/outside ')'",
+])
+def test_issue21_a_quoted_operator_is_an_argument(guard, command):
+    guard.configure(mode="block", on_error="closed", trusted_sources=[PREFIX])
+    assert run(guard, command, ATTACK) is not None, command
+    assert guard.log()[-1]["mode"] == "external" and guard.log()[-1]["action"] == "blocked"
+
+
+@pytest.mark.parametrize("command", [
+    f"curl -s -w @notes.txt {PREFIX}/a",                              # prints that file
+    f"curl -s --write-out @notes.txt {PREFIX}/a",
+    f"curl -s {PREFIX}/a | jq 'import \"notes\" as $n {{search: \"./\"}}; $n'",   # jq loads a file of its own
+    f"curl -s {PREFIX}/a | jq -n 'include \"notes\"; .'",
+    f"curl -s {PREFIX}/a | rtk grep -c x",                            # not known to be grep
+    f"curl -s -A ? {PREFIX}/a",                                       # ? becomes the names of files here
+    f"curl -s {PREFIX}/a ?????.???",
+    f"curl -s {PREFIX}/a | grep -c x # < {SOCKET}",
+])
+def test_issue21_other_side_doors_of_the_same_kind(guard, command):
+    guard.configure(mode="block", on_error="closed", trusted_sources=[PREFIX])
+    assert run(guard, command, ATTACK) is not None, command
+    assert guard.log()[-1]["mode"] == "external" and guard.log()[-1]["action"] == "blocked"
+
+
+def test_issue21_a_failed_scan_withholds_these_too(guard, jev):
+    guard.configure(mode="block", on_error="closed", trusted_sources=[PREFIX], own_repos=OWN)
+    jev.status = 503
+    for n, command in enumerate((f"curl -s {PREFIX}/a; cat < {SOCKET}", f"{COMMENT}; cat < {SOCKET}",
+                                 f"curl -s {PREFIX}/a '>' untrusted.example:9000/outside")):
+        assert run(guard, command, f"{REPLY}{n} {BENIGN}") is not None, command
+
+
+@pytest.mark.parametrize("command, mode", [
+    (f"curl -s {PREFIX}/a > out.html 2>&1", "trusted"),               # output redirections bring nothing in
+    (f"curl -sS {PREFIX}/a 2>/dev/null | head -5 >> log.txt", "trusted"),
+    (f"curl -s {PREFIX}/a &> out.txt; echo $?", "trusted"),
+    (f"curl -s -H 'Accept: a > b' -A '< x >' '{PREFIX}/a?x=1&y=2'", "trusted"),   # quoted: just text
+    (f"{COMMENT} 2>&1 | grep -c 'a|b' > n.txt", "echo"),
+    (f"{COMMENT} --body-file notes.md", "echo"),                       # the reply is an address, not the file
+])
+def test_issue21_output_redirections_and_quoted_text_change_nothing(guard, command, mode):
+    guard.configure(mode="block", trusted_sources=[PREFIX], own_repos=OWN)
+    assert run(guard, command, REPLY + ATTACK) is None, command
+    assert guard.log()[-1]["mode"] == mode
+
+
+@pytest.mark.parametrize("command", [
+    "gh api repos/acme/widget/issues --input payload.json",           # the reply holds what was in that file
+    "gh api repos/acme/widget/issues -f title=x -F body=@notes.md",
+    "gh api repos/acme/widget/issues -f title=x --field body=@-",
+    "gh api repos/acme/widget/issues/7/comments -Fbody=@notes.md",
+])
+def test_issue21_an_echo_is_what_the_command_itself_says(guard, command):
+    guard.configure(mode="block", on_error="closed", own_repos=OWN)
+    assert run(guard, command, REPLY + ATTACK) is not None, command
+    assert guard.log()[-1]["mode"] == "own"
+    # -f takes its value as written, @ and all
+    assert run(guard, "gh api repos/acme/widget/issues -f title=x -f body=@notes", REPLY + ATTACK + " again") is None
+    # and where local content is withheld from a lower score than own-repository output, a reply
+    # that carries a file back gets the stricter treatment, not the more lenient one
+    guard.configure(mode="block", on_error="closed", own_repos=OWN, scan_local=True, local_block=0.4)
+    assert run(guard, command, "borderline-sample " + REPLY) is not None and guard.log()[-1]["mode"] == "external"
+
+
+@pytest.mark.skipif(not (shutil.which("curl") and shutil.which("bash")), reason="needs bash and curl")
+def test_issue21_checked_against_bash_and_curl(guard, tmp_path):
+    """Each command is run for real, with a documentation server and, beside it, a socket and a
+    path that are not on the trusted list. Whatever reached those two must not be called a
+    plain download."""
+    asked, connected = [], []
+
+    class Docs(BaseHTTPRequestHandler):
+        def do_GET(self):
+            asked.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    class Outside(socketserver.BaseRequestHandler):
+        def handle(self):
+            connected.append(1)
+            self.request.sendall(ATTACK.encode() + b"\n")
+
+    docs = ThreadingHTTPServer(("127.0.0.1", 0), Docs)
+    outside = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Outside)
+    for server in (docs, outside):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    host, port = f"127.0.0.1:{docs.server_address[1]}", outside.server_address[1]
+    base, sock = f"http://{host}/guide", f"/dev/tcp/127.0.0.1/{port}"
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+    guard.configure(mode="block", on_error="closed", scan_private_hosts=True, trusted_sources=[base])
+    guard.env = {"HOME": str(tmp_path)}
+    try:
+        for command, reaches_outside in (
+                (f"curl -s {base}/a; cat < {sock}", True),
+                (f"curl -s {base}/a; head -5 < {sock}", True),
+                (f"curl -s {base}/a; grep -c x 0<{sock}", True),
+                (f"exec 3<{sock}; curl -s {base}/a; cat <&3", True),
+                (f"curl -s {base}/a '>' {host}/outside", True),
+                (f"curl -s {base}/a ';' echo {host}/outside", True),
+                (f"curl -s {base}/a '|' tr {host}/outside y", True),
+                (f"curl -s {base}/a > out.html 2>&1; echo $?", False),
+                (f"curl -sS '{base}/b?x=1&y=2' 2>/dev/null | head -5", False)):
+            asked.clear()
+            connected.clear()
+            subprocess.run(["bash", "-c", command], cwd=tmp_path, env=env, capture_output=True, timeout=30)
+            reached = bool(connected) or any(not path.startswith("/guide/") for path in asked)
+            assert reached == reaches_outside, command  # the test itself is right about what bash does
+            out = run(guard, command, ATTACK)
+            assert (out is not None) == reaches_outside, command
+            assert guard.log()[-1]["mode"] == ("external" if reaches_outside else "trusted"), command
+    finally:
+        docs.shutdown()
+        outside.shutdown()
 
 
 def test_curl_and_wget_startup_files_count_as_startup_files(guard):

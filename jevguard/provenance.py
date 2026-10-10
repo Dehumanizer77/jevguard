@@ -234,8 +234,9 @@ def _bash_reads_outside(cmd: str, cwd: str, roots: list[str], session_paths: lis
 # when everything that can add to its output is accounted for. That is decided on the command as
 # written, so it has to be written out in full, and every program in it has to be known.
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_FD = re.compile(r"(?<= )\d(?=>)")         # the 2 of 2>/dev/null
+_SOCKET = re.compile(r"/dev/+(?:tcp|udp)(?:/|$)")  # bash opens a connection for such a redirection
 _SED_PRINT = re.compile(r"\d+(?:,\d+)?p")  # sed -n '1,80p', and nothing else of sed
+_JQ_READS = re.compile(r"\b(?:import|include|modulemeta)\b")
 _DIGITS = "0123456789"
 # Filters as they stand at the end of a pipe: (flag letters, letters of options that take a
 # value, how many other arguments). Only forms that read nothing but their input: a file operand
@@ -251,20 +252,35 @@ _NO_CONTENT = {"cd", "echo", "printf", "true", "tee"}
 
 
 def _plain_commands(cmd: str) -> list[list[str]] | None:
-    """The simple commands of a command line, each as its words without redirections and without
-    a leading `rtk`. None when the line is not written out in full: a here-document, anything
-    the shell still expands, or a control character. A line break inside a quoted argument
-    reaches the program as part of that argument, and in a header it starts a second header; a
-    line break outside quotes starts another command. Neither is taken apart here."""
+    """The simple commands of a command line, each as its words, without a leading `rtk`. None
+    when the line is not written out in full, or takes something in by a side door:
+
+    - anything the shell still expands, a comment, an open quote;
+    - a control character. A line break inside a quoted argument reaches the program as part of
+      that argument, and in a header it starts a second header;
+    - a redirection that supplies input. `cat < /dev/tcp/host/port` reads from the network and
+      `head < notes.txt` from a file, whatever the program is taken for; a here-document, `<&3`
+      and `<>` likewise;
+    - a redirection to a /dev/tcp or /dev/udp address, in either direction.
+
+    Output redirections bring nothing in and are left out. What is an operator and what is an
+    argument is decided by quoting (shell.plain_commands): `'>'` is an argument, and so is the
+    word after it."""
     cmd = cmd.strip()
-    if "<<" in cmd or _CONTROL.search(cmd) or shell.expands(cmd):
+    commands = None if _CONTROL.search(cmd) else shell.plain_commands(cmd)
+    if commands is None:
         return None
-    commands = []
-    for words in shell.simple_commands(_FD.sub("", cmd)):
-        words = shell.without_redirections(words[1:] if words[0] == "rtk" else words)
+    plain = []
+    for words, redirections in commands:
+        if any("<" in operator or _SOCKET.search(target) for operator, target in redirections):
+            return None
+        # `rtk curl` is curl run through the output filter of this setup. Only before the programs
+        # that fetch: what rtk makes of `grep` or `head` is not known here.
+        if words[:1] == ["rtk"] and words[1:2] and words[1] in ("curl", "wget", "gh", "git"):
+            words = words[1:]
         if words:
-            commands.append(words)
-    return commands
+            plain.append(words)
+    return plain
 
 
 def _adds_nothing(name: str, args: list[str]) -> bool:
@@ -283,6 +299,8 @@ def _adds_nothing(name: str, args: list[str]) -> bool:
         i += 1
         if not a.startswith("-"):
             operands -= 1
+            if name == "jq" and _JQ_READS.search(a):
+                return False  # import "notes" as $n: a jq program can load a file of its own
         elif len(a) < 2 or a.startswith("--"):
             return False  # `-`, and long options: --files0-from and the like read files
         else:
@@ -308,26 +326,30 @@ def _own_repo_mode(cmd: str, cwd: str, cfg) -> str | None:
     commands = _plain_commands(cmd)
     if commands is None or os.environ.get("GH_HOST") or os.environ.get("GH_REPO") or github.rerouted():
         return None
-    remote = []  # the commands that bring something back from a server: gh, and git push
+    remote = []  # the commands that bring something back from a server (gh, git push), and where they run
+    dirs = [canonical(cwd)] if cwd else []
     for words in commands:
-        if words[0] == "gh" or (words[0] == "git" and words[1:2] == ["push"]):
-            remote.append(words)
-        elif not _adds_nothing(words[0], words[1:]) and not _git_reports(words):
+        name, args = words[0], words[1:]
+        if name == "cd":
+            if len(args) > 1 or any(a.startswith("-") for a in args):
+                return None  # `cd -`: where that leads is not in the command
+            # the old directories stay on the list: a `cd` that fails, or sits in a pipe, moves nothing
+            dirs = dirs + [canonical(args[0] if args else "~", d) for d in dirs[:8]]
+        elif name == "gh" or words[:2] == ["git", "push"]:
+            remote.append((words, list(dirs)))
+        elif not _adds_nothing(name, args) and not _git_reports(words):
             return None
-    try:
-        c = shell.read(cmd, cwd)
-    except Exception:
-        return None
-    # the directories each of them may be running in, after any `cd`
-    places = [dirs for argv, dirs in zip(c.programs, c.program_dirs)
-              if argv[0] == "gh" or argv[:2] == ["git", "push"]]
-    if not any(words[0] == "gh" for words in remote) or len(places) != len(remote):
+    if not any(words[0] == "gh" for words, _ in remote):
         return None
     echo = True
-    for words, dirs in zip(remote, places):
+    for words, dirs in remote:
         if words[0] == "gh":
             repos = github.gh_repos(words, dirs)
             echo = echo and github.gh_echo(words)
+            # A reply that carries a local file back is local content as much as own-repository
+            # output; it is never given the more lenient of the two levels.
+            if github.gh_sends_file(words) and cfg.scan_local and cfg.local_block < cfg.own_repos_block:
+                return None
         else:
             # What the server says to a push is not something the command sent: no echo. It counts
             # as about an own repository only when the push plainly goes to one.
@@ -396,7 +418,7 @@ def _plain_download(args: list[str], spec: tuple) -> list[str] | None:
                 i += 1
             if name == "url":
                 urls.append(value)
-            elif name == "header" and not _plain_header(value):
+            elif not _plain_value(name, value):
                 return None
         elif a == "-nv" and spec is _WGET:
             continue
@@ -412,10 +434,18 @@ def _plain_download(args: list[str], spec: tuple) -> list[str] | None:
                         return None
                     value = args[i]
                     i += 1
-                if c == "H" and not _plain_header(value):
+                if not _plain_value(c, value):
                     return None
                 break
     return urls
+
+
+def _plain_value(option: str, value: str) -> bool:
+    if option in ("H", "header"):
+        return _plain_header(value)
+    if option in ("w", "write-out"):
+        return not value.startswith("@")  # curl -w @notes.txt prints that file
+    return True
 
 
 def _own_settings(program: str) -> bool:

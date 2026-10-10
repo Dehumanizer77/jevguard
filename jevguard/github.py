@@ -126,10 +126,10 @@ _API_VALUES = {"-X": "method", "--method": "method", "-f": "field", "--raw-field
 
 
 def _api(args: list[str]) -> tuple[str, str, bool] | None:
-    """(endpoint, method, sends fields) of the arguments after `gh api`. None when they hold an
-    option this reader does not know, another host, two different methods, or anything but one
-    endpoint: the caller then assumes nothing about the call."""
-    methods, fields, words, i = set(), False, [], 0
+    """(endpoint, method, takes what it sends from a file) of the arguments after `gh api`. None
+    when they hold an option this reader does not know, another host, two different methods, or
+    anything but one endpoint: the caller then assumes nothing about the call."""
+    methods, fields, from_file, words, i = set(), False, False, [], 0
     while i < len(args):
         a = args[i]
         i += 1
@@ -154,10 +154,14 @@ def _api(args: list[str]) -> tuple[str, str, bool] | None:
         if kind == "method":
             methods.add(value.upper())
         fields = fields or kind == "field"
+        # --input names a file (or - for what is piped in); -F key=@file reads the value from one.
+        # -f takes its value as written.
+        from_file = from_file or name == "--input" or (
+            name in ("-F", "--field") and value.partition("=")[2].startswith("@"))
     if len(words) != 1 or len(methods) > 1:
         return None
     # gh's own rule: GET, or POST once a field is given, unless a method is named
-    return words[0], (methods.pop() if methods else "POST" if fields else "GET"), fields
+    return words[0], (methods.pop() if methods else "POST" if fields else "GET"), from_file
 
 
 def _api_repo(endpoint: str) -> str | None:
@@ -196,14 +200,22 @@ def gh_writes(argv: list[str]) -> bool:
     return len(words) > 1 and args[0] in _REPO_SCOPED and words[1] in WRITE_VERBS
 
 
+def gh_sends_file(argv: list[str]) -> bool:
+    """A `gh api` call that takes what it sends from a file or from what it is piped."""
+    call = _api(argv[2:]) if argv[1:2] == ["api"] else None
+    return bool(call) and call[2]
+
+
 def gh_echo(argv: list[str]) -> bool:
-    """The reply to this invocation is what it just created and nothing else."""
+    """The reply to this invocation is what it just created and nothing else: what the command
+    itself says. A new issue whose body came from a file comes back with that file in it, and
+    that is no more the command's own text than `cat file` would be."""
     if not gh_writes(argv):
         return False
     args = argv[1:]
     if args[0] == "api":
-        endpoint, method, _ = _api(args[1:])
-        return method == "POST" and bool(_ECHO_API.fullmatch(endpoint.split("?", 1)[0]))
+        endpoint, method, from_file = _api(args[1:])
+        return method == "POST" and not from_file and bool(_ECHO_API.fullmatch(endpoint.split("?", 1)[0]))
     return [a for a in args if not a.startswith("-")][1] in _ECHO_VERBS
 
 
@@ -239,6 +251,8 @@ def gh_repos(argv: list[str], dirs: list[str]) -> list[str] | None:
     for i, a in enumerate(args):
         if skip:
             skip = False
+        elif re.fullmatch(r"-[A-Za-z]+R.*", a) and not a.startswith("-R"):
+            return None  # -cR owner/name: the repository is named, in a run of short options
         elif a in ("-R", "--repo"):
             named.append(args[i + 1] if i + 1 < len(args) else "")
             skip = True

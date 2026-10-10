@@ -57,56 +57,98 @@ def tokens(cmd: str) -> list[str]:
         return re.findall(r"[();|&<>]+|[^\s();|&<>]+", cmd)
 
 
-def simple_commands(cmd: str) -> list[list[str]]:
-    """The command cut at ; | & and parentheses, each piece as its words. Nothing is expanded and
-    no wrapper is removed: this is what was written, for callers that accept only plain forms."""
-    out, current = [], []
-    for token in tokens(cmd):
-        if token and set(token) <= _SEPARATORS:
-            out.append(current)
-            current = []
-        else:
-            current.append(token)
-    return [words for words in [*out, current] if words]
+_OPERATORS = ("&>>", "<<<", "<<-", "&&", "||", ";;", "|&", "&>", ">>", ">&", ">|", "<<", "<&", "<>",
+              ";", "|", "&", "(", ")", "<", ">")
 
 
-def without_redirections(words: list[str]) -> list[str]:
-    """The words a program is given, without `> file`, `>&1`, `< file` and the like."""
-    out, skip = [], False
-    for w in words:
-        if skip:
-            skip = False
-        elif w and set(w) <= _REDIRECT_CHARS:
-            skip = True
-        else:
-            out.append(w)
-    return out
+def plain_commands(cmd: str) -> list[tuple[list[str], list[tuple[str, str]]]] | None:
+    """A command line that runs exactly as written, cut into its simple commands the way the
+    shell cuts it: for each, its words and its redirections as (operator, target), `2>` with its
+    number. None for a line that is not of that kind.
 
+    Quotes decide what is an operator: `'>'`, `">"` and `\\>` are arguments like any other, and
+    so is whatever follows them. tokens() does not keep that difference and must not be used
+    where it matters.
 
-def expands(cmd: str) -> bool:
-    """The shell would rewrite part of this command before running it: a variable or a command
-    substitution anywhere but in single quotes, a brace list or a glob outside quotes. What then
-    runs is not what is written. A lone `?` is let through: addresses are full of them. So is
-    `$?`, which is a number."""
-    quote, i = "", 0
+    Not of that kind, because the shell would rewrite it before running it: a variable or a
+    command substitution anywhere but in single quotes, a brace list or a glob outside quotes.
+    `$?` is let through, it is a number; so is a `?` inside an address, where it cannot match
+    its way to another host. Also not read: an open quote, an operator with nothing after it,
+    a comment. No wrapper is removed."""
+    commands, words, redirections = [], [], []
+    word, bare, pending, i = None, True, None, 0  # bare: nothing in the word so far was quoted
+
+    def end_word() -> None:
+        nonlocal word, bare, pending
+        if word is not None:
+            if pending is None:
+                words.append("".join(word))
+            else:
+                redirections.append((pending, "".join(word)))
+                pending = None
+        word, bare = None, True
+
+    def end_command() -> None:
+        nonlocal words, redirections
+        if words or redirections:
+            commands.append((words, redirections))
+        words, redirections = [], []
+
     while i < len(cmd):
         ch = cmd[i]
-        if quote == "'":
-            quote = "" if ch == "'" else quote
+        if ch in " \t":
+            end_word()
+        elif ch == "'":
+            close = cmd.find("'", i + 1)
+            if close < 0:
+                return None
+            word, bare, i = (word or []) + [cmd[i + 1:close]], False, close
+        elif ch == '"':
+            word, bare, i = word or [], False, i + 1
+            while i < len(cmd) and cmd[i] != '"':
+                if cmd[i] == "\\" and cmd[i + 1:i + 2] in ('"', "\\", "$", "`"):
+                    i += 1
+                elif cmd[i] == "`" or (cmd[i] == "$" and cmd[i + 1:i + 2] != "?"):
+                    return None
+                word.append(cmd[i])
+                i += 1
+            if i >= len(cmd):
+                return None
         elif ch == "\\":
-            i += 1
-        elif cmd[i:i + 2] == "$?":
-            i += 1
-        elif ch in "$`":
-            return True
-        elif quote:
-            quote = "" if ch == '"' else quote
-        elif ch in "'\"":
-            quote = ch
-        elif ch in "{}*[]":
-            return True
+            if i + 1 >= len(cmd):
+                return None
+            word, bare, i = (word or []) + [cmd[i + 1]], False, i + 1
+        elif ch == "$" and cmd[i + 1:i + 2] == "?":
+            word, i = (word or []) + ["$?"], i + 1
+        elif ch in "$`{}*[]" or (ch == "#" and word is None):
+            return None
+        elif ch == "?" and "://" not in "".join(word or []):
+            return None
+        else:
+            operator = "\n" if ch == "\n" else next((o for o in _OPERATORS if cmd.startswith(o, i)), None)
+            if operator is None:
+                word = (word or []) + [ch]
+            elif "<" in operator or ">" in operator:
+                number = "".join(word) if word is not None and bare and "".join(word).isdigit() else ""
+                if number:
+                    word = None  # the 2 of 2>/dev/null belongs to the operator
+                end_word()
+                if pending is not None:
+                    return None
+                pending = number + operator
+                i += len(operator) - 1
+            else:
+                end_word()
+                if pending is not None:
+                    return None
+                end_command()
+                i += len(operator) - 1
         i += 1
-    return bool(quote)  # an open quote: not readable either
+    end_word()
+    if pending is not None:
+        return None
+    end_command()
+    return commands
 
 
 class Command:

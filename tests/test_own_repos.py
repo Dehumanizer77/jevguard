@@ -53,6 +53,7 @@ def checkout(tmp_path):
     ("gh gist view abc", None),
     ("gh issue list --repo ghe.example.com/acme/widget", None),   # another host
     ("gh api repos/acme/widget/issues -R acme/widget", None),     # gh api takes no --repo
+    ("gh pr view 14 -cR stranger/widget", None),                  # the repository named in a run of short options
     ("gh extension exec something", None),
 ])
 def test_which_repository(checkout, command, repos):

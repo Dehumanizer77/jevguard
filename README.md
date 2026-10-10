@@ -279,13 +279,19 @@ like one:
   `sed -n '1,80p'` or `tee`, with short options and reading only what it is piped. Given a
   file to read (`head notes.txt`, `grep -r`, `jq -f`) it is a program that adds content of its
   own, and the exemption ends.
+- Nothing may come in by a redirection either: `cat < /dev/tcp/host/port` is a network read
+  and `head < notes.txt` a file read, so any `<`, a here-document or a `/dev/tcp` address ends
+  the exemption. Redirecting output (`> out.html`, `2>&1`, `2>/dev/null`) is fine. The command
+  is read the way the shell reads it: a quoted `'>'` or `';'` is an argument, not an operator.
 
 `gh` is a special case. Everything it prints counts as outside content, and short status lines
 and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false` scored 0.38. List
 your own repositories in `own_repos` (`"acme/*"`, `"solo/tool"`) and what `gh` returns about
 them is withheld only from 0.6 up; between 0.38 and 0.6 it is logged as flagged. The reply to
 something the command itself just created there (`gh pr create`, `gh issue comment`, a comment
-or an issue posted through `gh api`) is only logged: it holds what the command sent. A change
+or an issue posted through `gh api` with its text written in the command) is only logged: it
+holds what the command says. With `--input file` or `-F body=@file` the reply carries that
+file back, and is handled like any other output about your repository. A change
 to something that already exists is not treated that way, because the reply carries the thing
 itself: `gh api -X PATCH .../issues/7 -f state=closed` returns the whole issue and
 `gh issue close 7` prints its title, and either may be a stranger's text. This is deliberately
