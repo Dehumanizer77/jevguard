@@ -98,11 +98,11 @@ another agent its adapter translates them.
    with a word added, another prompt or a second address is scored whole, as before.
 
 Every scan is one line in `~/.local/state/jevguard/scans.jsonl`: tool, origin, verdict, score,
-size, timing, a hash. Never the content.
+size, timing, a hash. The log never holds the content.
 
 **PreToolUse** (before a tool runs)
 
-Two checks that read the call itself, no model:
+Two checks read the call itself and use no model:
 
 - *Changes to the guard.* A call that would change the guard's settings, state, release list
   or code, run `jevguard mode|gate|install|uninstall|release|show|trust|untrust|own|disown`, or touch a file
@@ -116,8 +116,8 @@ Two checks that read the call itself, no model:
   any spelling (`curl -o/path`, `--output-dir` with `-O`, `cd` there and download,
   `cp -t`, `dd of=`), and for commands run from inside the guard's directories. Reading a
   settings file (`cat`, `jq`, `grep`) is not held; reading the guard's own directory is,
-  because the API key is there. In every session, whatever `gate` says. Switch off with
-  `protect_guard: false`.
+  because the API key is there. This applies in every session, whatever `gate` says. Switch
+  off with `protect_guard: false`.
 
   The same goes for the file tools, by every file the call changes: a patch (Codex's
   `apply_patch`, Hermes' `patch`) is read for the files named in it, and one that cannot be
@@ -167,9 +167,9 @@ Python 3.11). macOS should work and has not been tried; Windows needs WSL.
 Steps 1 to 3 are done once, whichever agents the guard is for. Step 4 puts the hooks into an
 agent, one command per agent. Settings, log and quarantine are shared by all of them.
 
-Know before you install: once the hooks are in, the text of every tool result that counts as
-outside content is sent to TypeSafe's API (`https://api.typesafe.ai/v1/systemone`) for scoring.
-See [Settings](#settings) for what that includes and how to widen or narrow it.
+Once the hooks are in, the text of every tool result that counts as outside content is sent to
+TypeSafe's API (`https://api.typesafe.ai/v1/systemone`) for scoring. See [Settings](#settings)
+for what that includes and how to widen or narrow it.
 
 ### 1. Check what is needed
 
@@ -270,16 +270,16 @@ For Claude Code, `install` changes the user's `~/.claude/settings.json`: it adds
 are already there and two `permissions.deny` rules, `Read(~/.config/jevguard/**)` and
 `Read(~/.local/state/jevguard/**)` (the API key and the seal key are in those directories, and
 no hook runs before Claude Code's own file tools read a file; the rules were checked to hold
-on the first installation). Running `install` again prints `no change`.
-`jevguard --settings <file> install` writes to another settings file.
+on the first installation). `jevguard --settings <file> install` writes to another settings
+file.
 
 In `block` mode it also sets `env.CLAUDE_CODE_SHELL_PREFIX` to `bin/jevguard-shell`. Claude
 Code then runs every shell command through that program, and takes what it prints for the
 command's output. The command you see and approve is not changed. Why it is needed, and
-what it does, is under [How it works](#how-it-works). Three things to know about it:
+what it does, is under [How it works](#how-it-works).
 
 - Every shell command, and every hook, now depends on that small file. It runs the line as
-  it is whenever anything is not as expected, but if it should ever stand in the way: take
+  it is whenever anything is not as expected, but if it should ever stand in the way, take
   the `CLAUDE_CODE_SHELL_PREFIX` line out of `~/.claude/settings.json` and start Claude Code
   again. Nothing else of the guard depends on it.
 - The output of a command that reads from outside is held until the command has finished,
@@ -408,11 +408,11 @@ was got around through a printed address, a header with a line break in it, a re
 scores as an injection. If that happens to a page you trust, fetch it with `WebFetch`, or
 release the blocked result.
 
-**No shell command is exempt from blocking because of what it looks like.** That is the rule
-the rest follows from. Two things are still read off a command, and both only when the whole
-command is one program with its arguments written out: no pipe, no second command, no
-redirection except `2>&1` or `2>/dev/null` at the end, nothing for the shell to expand (a
-variable, `$(...)`, a glob, `~`, a backslash), no line break.
+**No shell command is exempt from blocking because of what it looks like.** Two things are
+still read off a command, and both only when the whole command is one program with its
+arguments written out: no pipe, no second command, no redirection except `2>&1` or
+`2>/dev/null` at the end, nothing for the shell to expand (a variable, `$(...)`, a glob, `~`,
+a backslash), no line break.
 
 `gh` about your own repositories. Everything `gh` prints counts as outside content, and short
 status lines and the titles of your own commits score oddly: live, `OPEN MERGEABLE 2 false`
@@ -507,8 +507,6 @@ depends on what that agent lets a hook do:
 How to put the guard into each of them is in [Install](#install), step 4. Settings, log,
 quarantine and release are the same for all of them: one `jevguard status`, one `jevguard log`.
 
-Things to know:
-
 - **Grok** also runs the hooks in `~/.claude/settings.json`, so with the guard installed for
   Claude Code it is started by Grok too and recognises it. Installing for Grok as well gives it
   hooks without Claude Code's tool-name filter, which Grok's MCP tools do not fit.
@@ -590,7 +588,7 @@ fetches and the private connectors out of that; each switch above widens it.
   (`logged`) and not asked about: unscanned all the same. That holds for one `gh` command
   that names the repository and nothing else (`gh run watch --repo you/project 4242`); a
   loop or a pipe around it is asked about like any other.
-- **The error of a tool call that fails, other than a shell command in Claude Code.** In
+- The error of a tool call that fails, other than a shell command in Claude Code. In
   Claude Code a failed call comes back through a hook that can add a remark and replace
   nothing (tried against 2.1.295 with every field there is). Shell commands are covered by
   the shell prefix, in `block` mode. What an MCP tool or `WebFetch` returns as an error is
