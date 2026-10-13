@@ -264,6 +264,19 @@ def test_42_status_says_when_a_setting_is_no_pattern(guard, monkeypatch, capsys)
     assert "skip_tools" in said and "'('" in said and "mcp__ok__" not in said.split("skip_tools")[1].split("\n")[0]
 
 
+def test_status_says_when_there_is_no_key(guard, monkeypatch, capsys):
+    """The loop over the pattern settings used the name the key was held in, so status said
+    "present" whatever was there. With no key nothing is scanned: status has to say so."""
+    from jevguard import cli
+    monkeypatch.setenv("JEVGUARD_HOME", str(guard.home))
+    key = guard.home / "config" / "typesafe.key"
+    assert cli.main(["status"]) == 0 and f"API key: present ({key})" in capsys.readouterr().out
+    key.write_text("\n")
+    assert cli.main(["status"]) == 0 and f"API key: MISSING ({key})" in capsys.readouterr().out
+    key.unlink()
+    assert cli.main(["status"]) == 0 and f"API key: MISSING ({key})" in capsys.readouterr().out
+
+
 # ---- a failed call that did not come through the wrapper -------------------------------------------
 def test_the_hook_for_a_failed_call_scans_logs_and_says_what_was_given(guard, ext):
     """An MCP tool's error, or a shell command where the prefix is not in place. Nothing can be
