@@ -1,7 +1,9 @@
 """Releasing a result that will never come back the same, and the list of trusted addresses."""
 
+import fcntl
 import json
 import os
+import threading
 import time
 
 import pytest
@@ -254,6 +256,70 @@ def test_a_discard_that_stops_part_way_has_taken_the_release_back_first(guard, m
     assert qid not in store.released_ids(cfg) and (elsewhere / f"{qid}.txt").exists()
     assert (cfg.quarantine_dir / f"{qid}.json").exists()  # kept: the owner can try again
     assert fetch(guard, "https://news.example.com/a", ATTACK) is not None
+
+
+def at_once(monkeypatch, first, second) -> dict:
+    """Run first until it writes its first file, then second until it has finished or found a lock
+    held, then let both run to the end. Events, not sleeps, so the order is the same every time.
+    Returns what each raised, by name."""
+    paused, go, moved, errors = threading.Event(), threading.Event(), threading.Event(), {}
+    write, flock = store._write_private, fcntl.flock
+
+    def write_private(path, data):
+        if threading.current_thread().name == "first" and not paused.is_set():
+            paused.set()
+            go.wait(10)
+        write(path, data)
+
+    def lock(fd, op):
+        if threading.current_thread().name == "second":
+            try:
+                return flock(fd, op | fcntl.LOCK_NB)
+            except BlockingIOError:
+                moved.set()
+        return flock(fd, op)
+
+    def run(name, op):
+        try:
+            op()
+        except Exception as exc:
+            errors[name] = exc
+        finally:
+            if name == "second":
+                moved.set()
+
+    monkeypatch.setattr(store, "_write_private", write_private)
+    monkeypatch.setattr(fcntl, "flock", lock)
+    threads = [threading.Thread(target=run, args=(name, op), name=name) for name, op in (("first", first), ("second", second))]
+    threads[0].start()
+    assert paused.wait(10)
+    threads[1].start()
+    assert moved.wait(10)
+    go.set()
+    for t in threads:
+        t.join(10)
+    return errors
+
+
+@pytest.mark.parametrize("first", ["release", "discard"])
+def test_a_release_and_a_discard_at_once_leave_nothing_released(guard, monkeypatch, first):
+    """Whichever is under way when the other begins, nothing of the release is left after the
+    discard (#48). A release that had written its files must not put the content back on the list
+    once the discard has taken it off; one that waited for a discard finds the entry gone."""
+    guard.configure(mode="block")
+    qid = quarantined(guard, "https://news.example.com/a")
+    cfg = load(guard, monkeypatch)
+    digest, _ = store.release(cfg, qid)
+    ops = {"release": lambda: store.release(cfg, qid), "discard": lambda: store.discard(cfg, qid)}
+    errors = at_once(monkeypatch, ops[first], ops["discard" if first == "release" else "release"])
+    assert qid not in store.released_ids(cfg) and digest not in store.released(cfg)
+    assert not (cfg.quarantine_dir / f"{qid}.json").exists() and not any(cfg.released_dir.iterdir())
+    assert json.loads(cfg.released_manifest.read_text()) == {}
+    assert fetch(guard, "https://news.example.com/a", ATTACK) is not None
+    assert guard.log()[-1]["action"] != "passed-released"
+    if first == "discard":
+        assert str(errors.pop("second")) == "no longer in quarantine"
+    assert errors == {}
 
 
 # ---- trusted addresses ---------------------------------------------------------------------------
