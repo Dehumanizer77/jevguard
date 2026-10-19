@@ -54,7 +54,8 @@ _HOOK_FILES = ((".claude", "settings.json"), (".claude", "settings.local.json"),
                (".copilot", "hooks", "jevguard.json"), (".copilot", "config.json"), (".cursor", "hooks.json"),
                (".codex", "hooks.json"), (".codex", "config.toml"),
                (".hermes", "plugins", "jevguard"), (".hermes", "config.yaml"))
-_ADMIN = {"mode", "gate", "install", "uninstall", "release", "show", "quarantine", "trust", "untrust", "own", "disown"}
+_ADMIN = {"mode", "gate", "install", "uninstall", "release", "discard", "show", "quarantine", "trust", "untrust",
+          "own", "disown"}
 # The same commands named inside code the reader cannot take apart: os.system("jevguard uninstall"),
 # ['.../jevguard', 'release', id], python3 -m jevguard.cli mode block. Only where the word stands
 # as the program and the subcommand is its next argument. The first version matched any of those

@@ -400,6 +400,70 @@ def cmd_quarantine(cfg, a) -> int:
     return 0
 
 
+_AGE_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def _age(text: str) -> tuple[float, str]:
+    """--older-than: 30d, 12h, 2w, 90m; a bare number is days. Seconds, and the text as given."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([mhdw]?)", text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an age; write it like 30d, 12h, 2w or 90m")
+    return float(m.group(1)) * _AGE_UNITS[m.group(2) or "d"], text.strip()
+
+
+def cmd_discard(cfg, a) -> int:
+    """The opposite of release: quarantined results thrown away, and a release they had taken
+    back. Throwing away what the agent may yet be shown was blocked would let it cover its tracks,
+    so this is for the owner's terminal only, like show and release."""
+    if not _owner_only():
+        return 2
+    if bool(a.ids) == (a.older_than is not None):
+        print("name the entries to discard, or give --older-than; not both", file=sys.stderr)
+        return 1
+    released = store.released_ids(cfg)
+    if a.ids:
+        for qid in a.ids:
+            if not store.QID.fullmatch(qid) or not ((cfg.quarantine_dir / f"{qid}.json").is_file() or qid in released):
+                print(f"{qid}: no such quarantine entry", file=sys.stderr)
+                return 1
+        ids = list(dict.fromkeys(a.ids))
+    else:
+        seconds, said = a.older_than
+        cutoff, ids = time.time() - seconds, []
+        for p in sorted(cfg.quarantine_dir.glob("fw-*.json")):
+            try:
+                if store.QID.fullmatch(p.stem) and p.stat().st_mtime < cutoff:
+                    ids.append(p.stem)
+            except OSError:
+                continue
+        if not ids:
+            print(f"nothing in quarantine is older than {said}")
+            return 0
+        taken_back = sum(qid in released for qid in ids)
+        question = (f"discard {len(ids)} quarantined result{'s' if len(ids) != 1 else ''} older than {said}"
+                    + (f", and take back the release of {taken_back} of them" if taken_back else "") + "? [y/N] ")
+        if not a.yes and input(question).strip().lower() not in ("y", "yes"):
+            print("nothing discarded")
+            return 1
+    for qid in ids:
+        try:
+            did = store.discard(cfg, qid)
+        except OSError as exc:
+            print(f"{qid}: stopped: {exc}", file=sys.stderr)
+            return 1
+        done = ["discarded" if did["entry"] else "was no longer in quarantine"]
+        if did["unreleased"]:
+            done.append("its release taken back")
+        if did["files"]:
+            done.append("deleted " + ", ".join(str(f) for f in did["files"]))
+        print(f"{qid}: " + "; ".join(done))
+        if did["digest"] and did["digest"] in store.released(cfg):
+            others = [q for q, d in store.released_ids(cfg).items() if d == did["digest"]]
+            print("  the same content is still released" + (f" as {', '.join(others)}" if others else "")
+                  + "; it passes until that is discarded too")
+    return 0
+
+
 def cmd_release(cfg, a) -> int:
     if not _owner_only():
         return 2
@@ -499,6 +563,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("id")
     p = sub.add_parser("release", help="let exactly this content pass from now on (owner's terminal only)")
     p.add_argument("ids", nargs="+")
+    p = sub.add_parser("discard", help="throw quarantined results away and take back their release, if any "
+                                       "(owner's terminal only)")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--older-than", type=_age, metavar="AGE", help="every entry quarantined longer ago than this: 30d, 12h, 2w")
+    p.add_argument("-y", "--yes", action="store_true", help="with --older-than: do not ask first")
     p = sub.add_parser("scan", help="score a text file (or - for stdin)")
     p.add_argument("file")
     sub.add_parser("selftest", help="score one benign and one attack sample through the API")
@@ -533,12 +602,12 @@ def main(argv: list[str] | None = None) -> int:
         print(install(cfg, a.settings, remove=remove) if a.agent == "claude" else agent_setup.install(a.agent, remove))
         return 0
     run = {"status": cmd_status, "log": cmd_log, "quarantine": cmd_quarantine, "show": cmd_show,
-           "release": cmd_release, "scan": cmd_scan, "selftest": cmd_selftest}[a.cmd]
+           "release": cmd_release, "discard": cmd_discard, "scan": cmd_scan, "selftest": cmd_selftest}[a.cmd]
     if sys.stdout.isatty():
         import contextlib
         with contextlib.redirect_stdout(_Terminal(sys.stdout)):
             return run(cfg, a)
-    if a.cmd in ("quarantine", "show", "release", "scan"):
+    if a.cmd in ("quarantine", "show", "release", "discard", "scan"):
         return run(cfg, a)
     # Not a terminal: the output is most likely going to the agent, where it will be scanned like
     # any other text. It talks about injections and blocked results, so each line is tagged with a
