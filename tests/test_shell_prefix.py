@@ -277,6 +277,35 @@ def test_status_says_when_there_is_no_key(guard, monkeypatch, capsys):
     assert cli.main(["status"]) == 0 and f"API key: MISSING ({key})" in capsys.readouterr().out
 
 
+def test_version_names_the_commit_of_a_clone(guard, monkeypatch, tmp_path, capsys):
+    """Every update from main between two releases has the same version; the commit tells them
+    apart. It is read from .git, from a branch, packed or not, or a detached head, and left out
+    when there is none to read."""
+    from jevguard import __version__, cli
+    sha = "635a4d063f3d26989a3d7e2830ae333c26c520f5"
+    git = tmp_path / ".git"
+    assert cli.version(git) == __version__
+    (git / "refs" / "heads").mkdir(parents=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    assert cli.version(git) == __version__  # a branch with no commit yet
+    (git / "packed-refs").write_text(f"# pack-refs with: peeled fully-peeled sorted\n{sha} refs/heads/main\n")
+    assert cli.version(git) == f"{__version__} (commit 635a4d0)"
+    (git / "refs" / "heads" / "main").write_text("1" * 40 + "\n")
+    assert cli.version(git) == f"{__version__} (commit 1111111)"
+    (git / "HEAD").write_text(sha + "\n")
+    assert cli.version(git) == f"{__version__} (commit 635a4d0)"
+    (git / "HEAD").write_text("nonsense\n")
+    assert cli.version(git) == __version__
+    real = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    if real:  # this checkout: the default is the clone the code runs from
+        assert cli.version() == f"{__version__} (commit {real[:7]})"
+    with pytest.raises(SystemExit) as end:
+        cli.main(["--version"])
+    assert end.value.code == 0 and capsys.readouterr().out == f"jevguard {cli.version()}\n"
+    monkeypatch.setenv("JEVGUARD_HOME", str(guard.home))
+    assert cli.main(["status"]) == 0 and f"jevguard {cli.version()}" in capsys.readouterr().out.splitlines()[0]
+
+
 # ---- a failed call that did not come through the wrapper -------------------------------------------
 def test_the_hook_for_a_failed_call_scans_logs_and_says_what_was_given(guard, ext):
     """An MCP tool's error, or a shell command where the prefix is not in place. Nothing can be

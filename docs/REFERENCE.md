@@ -86,7 +86,7 @@ size, timing, a hash. The log never holds the content.
 Two checks read the call itself and use no model:
 
 - *Changes to the guard.* A call that would change the guard's settings, state, release list
-  or code, run `jevguard mode|gate|install|uninstall|release|show|trust|untrust|own|disown`, or touch a file
+  or code, run `jevguard mode|gate|install|uninstall|quarantine|show|release|discard|trust|untrust|own|disown`, or touch a file
   that decides whether an agent runs the hooks is held for your approval. Those files are a
   Claude Code `settings*.json`, the hook files the guard installs into for the other agents,
   and each agent's own switches for hooks (`~/.grok/disabled-hooks` and Grok's `*.toml`,
@@ -213,7 +213,8 @@ the owner for approval.
 ## Everyday use
 
 ```bash
-jevguard status                 # settings, key, token use, counts from the log
+jevguard --version              # the version, and the commit the clone is at
+jevguard status                 # the same, then settings, key, token use, counts from the log
 jevguard log                    # recent scans that were not a plain pass (--all for every scan)
 jevguard quarantine             # every quarantined result, newest first, and how it begins (your own terminal only)
 jevguard show fw-20261009-ab12cd      # read a quarantined result (your own terminal only)
@@ -231,8 +232,8 @@ When a result is withheld, Claude says the source was blocked and names a quaran
 `jevguard release <id>`. `jevguard quarantine` lists them all with the tool, the score, what
 the call was given and the first words of the text; `-n 20` shows only the newest twenty.
 Control characters in what these commands print (an escape sequence, a carriage return, a
-right-to-left override, a zero-width space) are written out as `\x1b`, `\r`, `‮`,
-`​`, so a result cannot work on your terminal or hide words from you. `release` does two
+right-to-left override, a zero-width space) are written out as `\x1b`, `\r`, `\u202e`,
+`\u200b`, so a result cannot work on your terminal or hide words from you. `release` does two
 things:
 
 - The original is written to `~/.local/state/jevguard-released/<id>.txt`. Tell Claude it is
