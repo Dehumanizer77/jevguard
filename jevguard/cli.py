@@ -14,7 +14,7 @@ import unicodedata
 from collections import Counter
 from pathlib import Path
 
-from . import config, firstparty, scanner, store
+from . import __version__, config, firstparty, scanner, store
 from .agents import setup as agent_setup
 
 HOOK = str(Path(__file__).resolve().parent.parent / "bin" / "jevguard-hook")
@@ -222,10 +222,28 @@ def _set(cfg, settings_path: Path, key: str, value: str) -> None:
         print("hooks are not installed (run: jevguard install)")
 
 
+def version(git: Path = Path(HOOK).parents[1] / ".git") -> str:
+    """The version, and the commit when the code is a git clone: every update from main between
+    two releases has the same version, and only the commit tells them apart. Read from .git
+    without running git, which would take its settings from that directory."""
+    try:
+        head = (git / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            ref = head[5:]
+            try:
+                head = (git / ref).read_text().strip()
+            except FileNotFoundError:  # packed by git gc
+                head = next(l.split()[0] for l in (git / "packed-refs").read_text().splitlines() if l.endswith(" " + ref))
+    except (OSError, StopIteration):
+        head = ""
+    return f"{__version__} (commit {head[:7]})" if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head) else __version__
+
+
 def cmd_status(cfg, a) -> int:
     key = config.read_key(cfg)
     u = store.usage(cfg)
     today = u.get("tokens", 0) if u.get("day") == time.strftime("%Y-%m-%d") else 0
+    print(f"jevguard {version()}")
     print(f"mode: {cfg.mode}   gate: {cfg.gate}   on_error: {cfg.on_error}   "
           f"protect_guard: {cfg.protect_guard}   model: {cfg.model}")
     print(f"hooks installed: {'yes' if installed(a.settings) else 'no'} ({a.settings})")
@@ -564,6 +582,7 @@ class _Terminal:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="jevguard", description="Prompt-injection guard for coding agents.")
     ap.add_argument("--settings", type=Path, default=SETTINGS, help="Claude Code settings file")
+    ap.add_argument("--version", action="version", version=f"jevguard {version()}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("status", help="settings, key, usage and counts from the scan log")
     p.add_argument("--days", type=float, default=7)
