@@ -10,6 +10,7 @@ import shutil
 import statistics
 import sys
 import time
+import unicodedata
 from collections import Counter
 from pathlib import Path
 
@@ -334,6 +335,71 @@ def cmd_show(cfg, a) -> int:
     return 0
 
 
+def _text_kept(rec: dict) -> str:
+    """What the model would have read of a quarantined result."""
+    if isinstance(rec.get("text"), str):
+        return rec["text"]
+    from . import toolio  # an entry written before the text was kept: a Claude Code result
+    try:
+        return toolio.text_of(rec.get("tool", ""), rec.get("raw"))[0]
+    except Exception:
+        raw = rec.get("raw")
+        return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+
+
+def _called(tool_input) -> str:
+    """What the call was given, in a few words: its address, command, file or query."""
+    if isinstance(tool_input, dict):
+        for k in ("url", "command", "file_path", "path", "pattern", "query"):
+            if isinstance(tool_input.get(k), str):
+                return tool_input[k]
+    return json.dumps(tool_input, ensure_ascii=False) if tool_input else ""
+
+
+def _one_line(text, width: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def cmd_quarantine(cfg, a) -> int:
+    """Every quarantined result, newest first: id, time, tool, score, whether it was released,
+    what the call was given and how the text begins. The beginning is quarantined content too, so
+    this is for the owner's terminal only, like show."""
+    if not _owner_only():
+        return 2
+    found = []
+    for p in cfg.quarantine_dir.glob("fw-*.json"):
+        try:
+            if store.QID.fullmatch(p.stem):
+                found.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    if not found:
+        print(f"the quarantine is empty ({cfg.quarantine_dir})")
+        return 0
+    found.sort(reverse=True)
+    released = store.released(cfg)
+    width = shutil.get_terminal_size().columns
+    for mtime, p in found[:a.n] if a.n > 0 else found:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+        try:
+            rec = json.loads(p.read_text())
+            text = _text_kept(rec)
+        except (OSError, ValueError, AttributeError) as exc:
+            print(f"{p.stem}  {when}  could not be read: {exc}")
+            continue
+        score = rec.get("verdict", {}).get("score") if isinstance(rec.get("verdict"), dict) else None
+        head = (f"{p.stem}  {when}  {_one_line(rec.get('tool', '?'), 16):<16} "
+                f"{format(score, '.2f') if isinstance(score, (int, float)) else '-':>5}  "
+                f"{'released' if rec.get('content_sha256') in released else '':<8}  ")
+        source = _one_line(_called(rec.get("tool_input")), 40)
+        print(f"{head}{source}  | {_one_line(text, max(30, width - len(head) - len(source) - 4))}")
+    shown = min(a.n, len(found)) if a.n > 0 else len(found)
+    print(f"\n{len(found)} in quarantine" + (f", the newest {shown} shown" if shown < len(found) else "")
+          + "; `jevguard show <id>` prints one in full")
+    return 0
+
+
 def cmd_release(cfg, a) -> int:
     if not _owner_only():
         return 2
@@ -388,6 +454,36 @@ def cmd_selftest(cfg, a) -> int:
     return 0 if ok else 1
 
 
+def _printable(text: str) -> str:
+    """Text made safe for a terminal. What the commands print holds text from outside (a
+    quarantined result, a command an agent wrote, an address), and a terminal obeys control
+    characters in it: an escape sequence can rewrite the screen or the window title, a carriage
+    return can print over what came before, a right-to-left override or a zero-width character
+    can hide words. Those are written out as escapes (\\x1b, \\u202e); line breaks and tabs stay."""
+    return "".join(c if c in "\n\t" or unicodedata.category(c) not in ("Cc", "Cf", "Cs")
+                   else c.encode("unicode_escape").decode("ascii") for c in text)
+
+
+class _Terminal:
+    """stdout while it is a terminal: everything printed goes through _printable."""
+
+    def __init__(self, out):
+        self._out = out
+
+    def write(self, s: str) -> int:
+        self._out.write(_printable(s))
+        return len(s)
+
+    def flush(self) -> None:
+        self._out.flush()
+
+    def isatty(self) -> bool:
+        return self._out.isatty()
+
+    def fileno(self) -> int:
+        return self._out.fileno()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="jevguard", description="Prompt-injection guard for coding agents.")
     ap.add_argument("--settings", type=Path, default=SETTINGS, help="Claude Code settings file")
@@ -397,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("log", help="recent scans that were not a plain pass")
     p.add_argument("-n", type=int, default=40)
     p.add_argument("--all", action="store_true", help="include passed scans")
+    p = sub.add_parser("quarantine", help="list quarantined results, newest first, with how each begins (owner's terminal only)")
+    p.add_argument("-n", type=int, default=0, help="only the newest N")
     p = sub.add_parser("show", help="print quarantined content (owner's terminal only)")
     p.add_argument("id")
     p = sub.add_parser("release", help="let exactly this content pass from now on (owner's terminal only)")
@@ -434,9 +532,13 @@ def main(argv: list[str] | None = None) -> int:
         remove = a.cmd == "uninstall"
         print(install(cfg, a.settings, remove=remove) if a.agent == "claude" else agent_setup.install(a.agent, remove))
         return 0
-    run = {"status": cmd_status, "log": cmd_log, "show": cmd_show, "release": cmd_release,
-           "scan": cmd_scan, "selftest": cmd_selftest}[a.cmd]
-    if sys.stdout.isatty() or a.cmd in ("show", "release", "scan"):
+    run = {"status": cmd_status, "log": cmd_log, "quarantine": cmd_quarantine, "show": cmd_show,
+           "release": cmd_release, "scan": cmd_scan, "selftest": cmd_selftest}[a.cmd]
+    if sys.stdout.isatty():
+        import contextlib
+        with contextlib.redirect_stdout(_Terminal(sys.stdout)):
+            return run(cfg, a)
+    if a.cmd in ("quarantine", "show", "release", "scan"):
         return run(cfg, a)
     # Not a terminal: the output is most likely going to the agent, where it will be scanned like
     # any other text. It talks about injections and blocked results, so each line is tagged with a

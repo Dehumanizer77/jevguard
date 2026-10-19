@@ -215,6 +215,7 @@ the owner for approval.
 ```bash
 jevguard status                 # settings, key, token use, counts from the log
 jevguard log                    # recent scans that were not a plain pass (--all for every scan)
+jevguard quarantine             # every quarantined result, newest first, and how it begins (your own terminal only)
 jevguard show fw-20261009-ab12cd      # read a quarantined result (your own terminal only)
 jevguard release fw-20261009-ab12cd   # hand the original to Claude and let that content pass from now on
 jevguard trust https://docs.example.com/guide/   # never withhold what WebFetch gets from this address
@@ -225,7 +226,12 @@ jevguard gate ask-flagged       # ask before risky actions once something was fl
 
 When a result is withheld, Claude says the source was blocked and names a quarantine id
 (`fw-…`). If you think it was harmless, read it with `jevguard show <id>` and, if so, run
-`jevguard release <id>`. That does two things:
+`jevguard release <id>`. `jevguard quarantine` lists them all with the tool, the score, what
+the call was given and the first words of the text; `-n 20` shows only the newest twenty.
+Control characters in what these commands print (an escape sequence, a carriage return, a
+right-to-left override, a zero-width space) are written out as `\x1b`, `\r`, `‮`,
+`​`, so a result cannot work on your terminal or hide words from you. `release` does two
+things:
 
 - The original is written to `~/.local/state/jevguard-released/<id>.txt`. Tell Claude it is
   released; the notice it received names that file, and reading it with the Read tool is not
