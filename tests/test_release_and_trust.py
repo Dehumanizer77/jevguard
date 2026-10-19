@@ -89,6 +89,58 @@ def test_a_download_into_the_released_directory_is_still_outside_content(guard, 
     assert guard.hook("PostToolUse", "Read", {"file_path": target}, read(target, ATTACK)) is not None
 
 
+# ---- the list of what is in quarantine -----------------------------------------------------------
+def owner(guard, monkeypatch):
+    cfg = load(guard, monkeypatch)
+    monkeypatch.setattr(cli, "_owner_only", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+    return cfg
+
+
+def test_quarantine_lists_every_entry_newest_first(guard, monkeypatch, capsys):
+    guard.configure(mode="block")
+    fetch(guard, "https://news.example.com/old", ATTACK)
+    old = guard.log()[-1]["quarantine_id"]
+    fetch(guard, "https://news.example.com/new", "Weather today. " + ATTACK)
+    new = guard.log()[-1]["quarantine_id"]
+    cfg = owner(guard, monkeypatch)
+    os.utime(cfg.quarantine_dir / f"{old}.json", (1_700_000_000, 1_700_000_000))
+    store.release(cfg, old)
+    score = json.loads((cfg.quarantine_dir / f"{new}.json").read_text())["verdict"]["score"]
+    assert cli.main(["quarantine"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith(new) and lines[1].startswith(old)
+    assert "WebFetch" in lines[0] and "https://news.example.com/new" in lines[0] and f"{score:.2f}" in lines[0]
+    assert "Weather today." in lines[0].split("|", 1)[1] and "released" not in lines[0]
+    assert "released" in lines[1] and "https://news.example.com/old" in lines[1]
+    assert lines[-1].startswith("2 in quarantine;")
+    assert cli.main(["quarantine", "-n", "1"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith(new) and old not in "".join(lines) and lines[-1].startswith("2 in quarantine, the newest 1 shown")
+
+
+def test_the_list_is_for_the_owner_only(guard, monkeypatch, capsys):
+    """How each result begins is quarantined content too: an agent does not get it, as with show."""
+    guard.configure(mode="block")
+    fetch(guard, "https://news.example.com/a", ATTACK)
+    load(guard, monkeypatch)
+    assert cli.main(["quarantine"]) == 2  # no terminal here: the output would go to whoever ran it
+    out = capsys.readouterr()
+    assert ATTACK[:20] not in out.out and "Refused" in out.err
+
+
+def test_control_characters_are_written_out_for_the_terminal(guard, monkeypatch, capsys):
+    assert cli._printable("a\x1b[2Jb\rc‮d​e\nf\tg\x9bh\x07") == "a\\x1b[2Jb\\rc\\u202ed\\u200be\nf\tg\\x9bh\\x07"
+    guard.configure(mode="block")
+    fetch(guard, "https://news.example.com/a", "‮txt.exe \x1b]0;owned\x07Totally​ harmless\r\n" + ATTACK)
+    qid = guard.log()[-1]["quarantine_id"]
+    owner(guard, monkeypatch)
+    for args in (["quarantine"], ["show", qid]):
+        assert cli.main(args) == 0
+        out = capsys.readouterr().out
+        assert not any(c in out for c in "\x1b\x07\r​‮") and "\\u202etxt.exe" in out, args
+
+
 # ---- trusted addresses ---------------------------------------------------------------------------
 PREFIX = "https://docs.example.com/guide"
 
