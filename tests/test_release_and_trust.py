@@ -1,7 +1,10 @@
 """Releasing a result that will never come back the same, and the list of trusted addresses."""
 
+import fcntl
 import json
 import os
+import threading
+import time
 
 import pytest
 
@@ -139,6 +142,184 @@ def test_control_characters_are_written_out_for_the_terminal(guard, monkeypatch,
         assert cli.main(args) == 0
         out = capsys.readouterr().out
         assert not any(c in out for c in "\x1b\x07\r​‮") and "\\u202etxt.exe" in out, args
+
+
+# ---- discard, the opposite of release ------------------------------------------------------------
+def quarantined(guard, url, text=ATTACK):
+    fetch(guard, url, text)
+    return guard.log()[-1]["quarantine_id"]
+
+
+def test_discard_takes_a_release_back_and_the_content_is_blocked_again(guard, monkeypatch, capsys):
+    guard.configure(mode="block")
+    qid = quarantined(guard, "https://news.example.com/a")
+    cfg = owner(guard, monkeypatch)
+    _, files = store.release(cfg, qid)
+    other = "abc123 fw-20261001-aaaaaa WebFetch released 2026-10-01\n"
+    cfg.released_file.write_text("# kept by hand\n" + cfg.released_file.read_text() + other)
+    assert fetch(guard, "https://news.example.com/a", ATTACK) is None  # released: it passes
+    assert cli.main(["discard", qid]) == 0
+    said = capsys.readouterr().out
+    assert said.startswith(f"{qid}: discarded; its release taken back; deleted ") and str(files[0]) in said
+    assert not (cfg.quarantine_dir / f"{qid}.json").exists() and not files[0].exists()
+    assert cfg.released_file.read_text() == "# kept by hand\n" + other  # the other lines stay as they were
+    assert files[0].name not in json.loads(cfg.released_manifest.read_text())
+    assert fetch(guard, "https://news.example.com/a", ATTACK) is not None  # blocked again
+
+
+def test_discard_an_entry_that_was_never_released(guard, monkeypatch, capsys):
+    guard.configure(mode="block")
+    qid = quarantined(guard, "https://news.example.com/a")
+    cfg = owner(guard, monkeypatch)
+    assert cli.main(["discard", qid]) == 0 and capsys.readouterr().out == f"{qid}: discarded\n"
+    assert not (cfg.quarantine_dir / f"{qid}.json").exists() and not cfg.released_file.exists()
+    assert cli.main(["discard", qid]) == 1 and "no such quarantine entry" in capsys.readouterr().err
+    assert cli.main(["discard", "fw-1"]) == 1
+
+
+def test_content_released_as_another_entry_stays_released(guard, monkeypatch, capsys):
+    guard.configure(mode="block")
+    first = quarantined(guard, "https://news.example.com/a")
+    second = quarantined(guard, "https://news.example.com/a")
+    cfg = owner(guard, monkeypatch)
+    store.release(cfg, first)
+    assert cli.main(["discard", second]) == 0 and f"still released as {first}" in capsys.readouterr().out
+    assert fetch(guard, "https://news.example.com/a", ATTACK) is None
+
+
+def test_discard_older_than_asks_first(guard, monkeypatch, capsys):
+    guard.configure(mode="block")
+    ids = [quarantined(guard, f"https://news.example.com/{n}", f"Item {n}. " + ATTACK) for n in range(3)]
+    cfg = owner(guard, monkeypatch)
+    now = time.time()
+    for qid, days in zip(ids, (40, 10, 0)):
+        os.utime(cfg.quarantine_dir / f"{qid}.json", (now - days * 86400,) * 2)
+    store.release(cfg, ids[0])
+    asked, answers = [], iter(["n", "y"])
+    monkeypatch.setattr("builtins.input", lambda q: (asked.append(q), next(answers))[1])
+    assert cli.main(["discard", "--older-than", "30d"]) == 1 and "nothing discarded" in capsys.readouterr().out
+    assert asked == ["discard 1 quarantined result older than 30d, and take back the release of 1 of them? [y/N] "]
+    assert all((cfg.quarantine_dir / f"{q}.json").exists() for q in ids) and ids[0] in store.released_ids(cfg)
+    assert cli.main(["discard", "--older-than", "30d"]) == 0
+    assert not (cfg.quarantine_dir / f"{ids[0]}.json").exists() and ids[0] not in store.released_ids(cfg)
+    assert cli.main(["discard", "--older-than", "1w", "--yes"]) == 0 and len(asked) == 2
+    assert [p.stem for p in cfg.quarantine_dir.glob("*.json")] == [ids[2]]
+    capsys.readouterr()
+    assert cli.main(["discard", "--older-than", "1w"]) == 0 and "nothing in quarantine is older than 1w" in capsys.readouterr().out
+
+
+def test_discard_wants_entries_or_an_age(guard, monkeypatch, capsys):
+    owner(guard, monkeypatch)
+    assert cli.main(["discard"]) == 1
+    assert cli.main(["discard", "fw-20261019-abcdef", "--older-than", "1d"]) == 1
+    with pytest.raises(SystemExit):
+        cli.main(["discard", "--older-than", "30x"])
+    assert cli._age("1.5h") == (5400, "1.5h") and cli._age("2")[0] == 2 * 86400
+
+
+def test_release_and_discard_check_every_id_before_acting_on_any(guard, monkeypatch, capsys):
+    guard.configure(mode="block")
+    first = quarantined(guard, "https://news.example.com/a", "First. " + ATTACK)
+    second = quarantined(guard, "https://news.example.com/b", "Second. " + ATTACK)
+    cfg = owner(guard, monkeypatch)
+    typo = "fw-20261019-000000"
+    assert cli.main(["release", first, typo, second]) == 1
+    err = capsys.readouterr().err
+    assert f"{typo}: no such quarantine entry" in err and "nothing released" in err
+    assert not cfg.released_file.exists() and not (cfg.released_dir / f"{first}.txt").exists()
+    assert cli.main(["release", first, second, first]) == 0  # each once
+    assert sorted(store.released_ids(cfg)) == sorted([first, second]) and len(cfg.released_file.read_text().splitlines()) == 2
+    capsys.readouterr()
+    assert cli.main(["discard", first, typo, "nonsense"]) == 1
+    err = capsys.readouterr().err
+    assert f"{typo}: no such" in err and "nonsense: no such" in err and "nothing discarded" in err
+    assert sorted(store.released_ids(cfg)) == sorted([first, second]) and (cfg.quarantine_dir / f"{first}.json").exists()
+
+
+def test_discard_is_for_the_owner_only(guard, monkeypatch):
+    """Emptying the quarantine would let an agent hide what it had been shown."""
+    guard.configure(mode="block")
+    qid = quarantined(guard, "https://news.example.com/a")
+    cfg = load(guard, monkeypatch)
+    assert cli.main(["discard", qid]) == 2 and (cfg.quarantine_dir / f"{qid}.json").exists()
+
+
+def test_a_discard_that_stops_part_way_has_taken_the_release_back_first(guard, monkeypatch, tmp_path, capsys):
+    guard.configure(mode="block")
+    qid = quarantined(guard, "https://news.example.com/a")
+    cfg = owner(guard, monkeypatch)
+    store.release(cfg, qid)
+    elsewhere = tmp_path / "elsewhere"
+    cfg.released_dir.rename(elsewhere)
+    cfg.released_dir.symlink_to(elsewhere)
+    assert cli.main(["discard", qid]) == 1 and "symbolic link" in capsys.readouterr().err
+    assert qid not in store.released_ids(cfg) and (elsewhere / f"{qid}.txt").exists()
+    assert (cfg.quarantine_dir / f"{qid}.json").exists()  # kept: the owner can try again
+    assert fetch(guard, "https://news.example.com/a", ATTACK) is not None
+
+
+def at_once(monkeypatch, first, second) -> dict:
+    """Run first until it writes its first file, then second until it has finished or found a lock
+    held, then let both run to the end. Events, not sleeps, so the order is the same every time.
+    Returns what each raised, by name."""
+    paused, go, moved, errors = threading.Event(), threading.Event(), threading.Event(), {}
+    write, flock = store._write_private, fcntl.flock
+
+    def write_private(path, data):
+        if threading.current_thread().name == "first" and not paused.is_set():
+            paused.set()
+            go.wait(10)
+        write(path, data)
+
+    def lock(fd, op):
+        if threading.current_thread().name == "second":
+            try:
+                return flock(fd, op | fcntl.LOCK_NB)
+            except BlockingIOError:
+                moved.set()
+        return flock(fd, op)
+
+    def run(name, op):
+        try:
+            op()
+        except Exception as exc:
+            errors[name] = exc
+        finally:
+            if name == "second":
+                moved.set()
+
+    monkeypatch.setattr(store, "_write_private", write_private)
+    monkeypatch.setattr(fcntl, "flock", lock)
+    threads = [threading.Thread(target=run, args=(name, op), name=name) for name, op in (("first", first), ("second", second))]
+    threads[0].start()
+    assert paused.wait(10)
+    threads[1].start()
+    assert moved.wait(10)
+    go.set()
+    for t in threads:
+        t.join(10)
+    return errors
+
+
+@pytest.mark.parametrize("first", ["release", "discard"])
+def test_a_release_and_a_discard_at_once_leave_nothing_released(guard, monkeypatch, first):
+    """Whichever is under way when the other begins, nothing of the release is left after the
+    discard (#48). A release that had written its files must not put the content back on the list
+    once the discard has taken it off; one that waited for a discard finds the entry gone."""
+    guard.configure(mode="block")
+    qid = quarantined(guard, "https://news.example.com/a")
+    cfg = load(guard, monkeypatch)
+    digest, _ = store.release(cfg, qid)
+    ops = {"release": lambda: store.release(cfg, qid), "discard": lambda: store.discard(cfg, qid)}
+    errors = at_once(monkeypatch, ops[first], ops["discard" if first == "release" else "release"])
+    assert qid not in store.released_ids(cfg) and digest not in store.released(cfg)
+    assert not (cfg.quarantine_dir / f"{qid}.json").exists() and not any(cfg.released_dir.iterdir())
+    assert json.loads(cfg.released_manifest.read_text()) == {}
+    assert fetch(guard, "https://news.example.com/a", ATTACK) is not None
+    assert guard.log()[-1]["action"] != "passed-released"
+    if first == "discard":
+        assert str(errors.pop("second")) == "no longer in quarantine"
+    assert errors == {}
 
 
 # ---- trusted addresses ---------------------------------------------------------------------------

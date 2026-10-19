@@ -218,6 +218,8 @@ jevguard log                    # recent scans that were not a plain pass (--all
 jevguard quarantine             # every quarantined result, newest first, and how it begins (your own terminal only)
 jevguard show fw-20261009-ab12cd      # read a quarantined result (your own terminal only)
 jevguard release fw-20261009-ab12cd   # hand the original to Claude and let that content pass from now on
+jevguard discard fw-20261009-ab12cd   # throw it away, and take back its release if it had one
+jevguard discard --older-than 30d     # the same for everything quarantined more than 30 days ago (asks first)
 jevguard trust https://docs.example.com/guide/   # never withhold what WebFetch gets from this address
 jevguard own 'acme/*' solo/tool                  # your own GitHub repositories (`disown` takes them off)
 jevguard mode block             # start withholding; `jevguard mode log` to go back
@@ -243,6 +245,18 @@ things:
   scanned as outside content, and the hook asks you before a call that would write there.
 - The content goes on the release list, so if a tool returns the very same content again it
   passes. An edited version is scanned as usual.
+
+A result you do not release stays blocked: the guard scores what comes back every time, and
+the quarantine is only a copy for you to read. It never empties itself. `jevguard discard <id>`
+throws a copy away. If it had been released, the release is taken back first: its line comes
+off the release list and the original written for Claude is deleted, so the same content is
+blocked again. `jevguard discard --older-than 30d` does that for everything quarantined more
+than 30 days ago (`12h`, `2w` and `90m` work too) and asks before it starts; `-y` skips the
+question. Like `show` and `release` it runs only in your own terminal: an agent that could
+empty the quarantine could hide from you what it had been shown.
+
+`release` and `discard` both take several ids at once. They check every one before they act
+on any: if one of them names no entry, nothing is released or discarded.
 
 For an address that keeps being withheld without reason (documentation about hooks, articles
 about prompt injection), there is a list of trusted addresses:

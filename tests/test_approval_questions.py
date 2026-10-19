@@ -49,6 +49,8 @@ def test_working_on_a_project_called_jevguard_is_not_changing_the_guard(guard, c
     "rtk jevguard release fw-20261009-abcdef",
     "jevguard quarantine",
     "jevguard quarantine -n 5 | head",
+    "jevguard discard fw-20261009-abcdef",
+    "jevguard discard --older-than 1d -y",
     "bash -c 'jevguard mode log'",
     "python3 -c \"import os; os.system('jevguard uninstall')\"",
     "python3 -c \"import subprocess; subprocess.run(['/opt/jevguard/bin/jevguard', 'release', 'fw-20261009-abcdef'])\"",

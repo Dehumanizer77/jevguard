@@ -281,7 +281,7 @@ def test_issue8_cli_refuses_release_inside_claude_code_even_on_a_pty(guard):
     qid = guard.log()[-1]["quarantine_id"]
     master, slave = pty.openpty()
     env = {**os.environ, "JEVGUARD_HOME": str(guard.home), "CLAUDECODE": "1"}
-    for args in (["release", qid], ["show", qid], ["quarantine"]):
+    for args in (["release", qid], ["show", qid], ["quarantine"], ["discard", qid], ["discard", "--older-than", "0", "-y"]):
         r = subprocess.run([str(ROOT / "bin" / "jevguard"), *args], stdin=slave, stdout=slave, stderr=slave, env=env)
         assert r.returncode == 2
     os.close(slave)

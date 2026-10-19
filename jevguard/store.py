@@ -6,6 +6,7 @@ read-modify-write goes through an exclusive lock and the log is appended in sing
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -21,6 +22,18 @@ QID = re.compile(r"fw-\d{8}-[0-9a-f]{6}")
 def _private_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True, mode=0o700)
     return p
+
+
+@contextlib.contextmanager
+def _lock(path: Path):
+    """Writers of a file that is not JSON (the release list) queue on a lock file beside it."""
+    _private_dir(path.parent)
+    fd = os.open(f"{path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 class _locked:
@@ -165,38 +178,105 @@ def release(cfg, qid: str) -> tuple[str, list[Path]]:
     returns it again. And the original is written out as a plain file for the agent to read:
     a web page summarised afresh on every fetch, or an answer with a timestamp in it, never
     comes back the same, so waiting for it to be repeated would release nothing. What the agent
-    reads is exactly what the owner read."""
+    reads is exactly what the owner read.
+
+    The whole of it runs under the release list's lock, and so does the whole of a discard: a
+    release that had written its files when a discard began would otherwise put the content back
+    on the list after the discard had taken it off (#48). The entry is read under the lock too,
+    so a release that waited for a discard finds it gone and does nothing."""
     import base64
     import hashlib
-    rec = json.loads((cfg.quarantine_dir / f"{qid}.json").read_text())
-    if "text" in rec:
-        text, images = rec["text"], [base64.b64decode(i) for i in rec.get("images", [])]
-    else:  # an entry written before the text was kept: a Claude Code result
-        from . import toolio
-        text, images = toolio.text_of(rec.get("tool", ""), rec.get("raw"))
-    if cfg.released_dir.is_symlink():
-        raise OSError(f"{cfg.released_dir} is a symbolic link; refusing to write released originals through it")
-    _private_dir(cfg.released_dir)
-    contents = {released_copy(cfg, qid): text.encode("utf-8", "surrogatepass")}
-    for n, image in enumerate(images, 1):
-        kind = next((ext for magic, ext in _IMAGE_TYPES if image.startswith(magic)), "bin")
-        contents[cfg.released_dir / f"{qid}-{n}.{kind}"] = image
-    for path, data in contents.items():
-        _write_private(path, data)
-    # The record of what was written goes into the closed state directory. Being in the released
-    # directory exempts nothing by itself; matching this record does.
-    with _locked(cfg.released_manifest) as manifest:
+    with _lock(cfg.released_file):
+        try:
+            rec = json.loads((cfg.quarantine_dir / f"{qid}.json").read_text())
+        except FileNotFoundError:
+            raise FileNotFoundError("no longer in quarantine") from None
+        if "text" in rec:
+            text, images = rec["text"], [base64.b64decode(i) for i in rec.get("images", [])]
+        else:  # an entry written before the text was kept: a Claude Code result
+            from . import toolio
+            text, images = toolio.text_of(rec.get("tool", ""), rec.get("raw"))
+        if cfg.released_dir.is_symlink():
+            raise OSError(f"{cfg.released_dir} is a symbolic link; refusing to write released originals through it")
+        _private_dir(cfg.released_dir)
+        contents = {released_copy(cfg, qid): text.encode("utf-8", "surrogatepass")}
+        for n, image in enumerate(images, 1):
+            kind = next((ext for magic, ext in _IMAGE_TYPES if image.startswith(magic)), "bin")
+            contents[cfg.released_dir / f"{qid}-{n}.{kind}"] = image
         for path, data in contents.items():
-            manifest[path.name] = hashlib.sha256(data).hexdigest()
-    files = list(contents)
-    line = f"{rec['content_sha256']} {qid} {rec.get('tool', '?')} released {time.strftime('%Y-%m-%d')}\n"
-    _private_dir(cfg.released_file.parent)
-    fd = os.open(cfg.released_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            _write_private(path, data)
+        # The record of what was written goes into the closed state directory. Being in the released
+        # directory exempts nothing by itself; matching this record does.
+        with _locked(cfg.released_manifest) as manifest:
+            for path, data in contents.items():
+                manifest[path.name] = hashlib.sha256(data).hexdigest()
+        line = f"{rec['content_sha256']} {qid} {rec.get('tool', '?')} released {time.strftime('%Y-%m-%d')}\n"
+        fd = os.open(cfg.released_file, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line.encode())
+        finally:
+            os.close(fd)
+    return rec["content_sha256"], list(contents)
+
+
+def released_ids(cfg) -> dict:
+    """Quarantine id -> content hash, for every release on the list that names its entry."""
     try:
-        os.write(fd, line.encode())
-    finally:
-        os.close(fd)
-    return rec["content_sha256"], files
+        lines = cfg.released_file.read_text().splitlines()
+    except OSError:
+        return {}
+    found = {}
+    for line in lines:
+        parts = line.split()
+        if len(parts) > 1 and not line.startswith("#") and QID.fullmatch(parts[1]):
+            found[parts[1]] = parts[0]
+    return found
+
+
+def discard(cfg, qid: str) -> dict:
+    """The opposite of release: throw a quarantined result away, and take back its release if it
+    had one. Each step leaves a stricter state than the one before, so a failure part way leaves
+    nothing more allowed than before: the release comes off the list first, then the record of
+    the files release wrote for the agent, then those files, and the quarantined copy last.
+
+    Returns what was done: digest (the content's hash, if known), unreleased (a line came off the
+    release list), files (released copies deleted), entry (the quarantined copy deleted).
+
+    Runs whole under the release list's lock, as release does; the record of files is locked
+    inside it, in the same order in both."""
+    with _lock(cfg.released_file):
+        did = {"digest": released_ids(cfg).get(qid), "unreleased": False, "files": [], "entry": False}
+        entry = cfg.quarantine_dir / f"{qid}.json"
+        try:
+            did["digest"] = json.loads(entry.read_text()).get("content_sha256") or did["digest"]
+        except (OSError, ValueError, AttributeError):
+            pass
+        try:
+            lines = cfg.released_file.read_text().splitlines(keepends=True)
+        except FileNotFoundError:
+            lines = []
+        kept = [l for l in lines if l.startswith("#") or l.split()[1:2] != [qid]]
+        if len(kept) != len(lines):
+            _write_private(cfg.released_file, "".join(kept).encode())
+            did["unreleased"] = True
+        copies = re.compile(re.escape(qid) + r"(?:\.txt|-\d+\.[a-z]+)")
+        if cfg.released_manifest.exists():
+            with _locked(cfg.released_manifest) as manifest:
+                for name in [n for n in manifest if copies.fullmatch(n)]:
+                    del manifest[name]
+        if cfg.released_dir.is_symlink():
+            raise OSError(f"{cfg.released_dir} is a symbolic link; refusing to delete released originals through it")
+        if cfg.released_dir.is_dir():
+            for p in sorted(cfg.released_dir.iterdir()):
+                if copies.fullmatch(p.name):
+                    p.unlink(missing_ok=True)
+                    did["files"].append(p)
+        try:
+            entry.unlink()
+            did["entry"] = True
+        except FileNotFoundError:
+            pass
+    return did
 
 
 def _write_private(path: Path, data: bytes) -> None:
