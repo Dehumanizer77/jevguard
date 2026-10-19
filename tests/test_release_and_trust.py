@@ -215,6 +215,25 @@ def test_discard_wants_entries_or_an_age(guard, monkeypatch, capsys):
     assert cli._age("1.5h") == (5400, "1.5h") and cli._age("2")[0] == 2 * 86400
 
 
+def test_release_and_discard_check_every_id_before_acting_on_any(guard, monkeypatch, capsys):
+    guard.configure(mode="block")
+    first = quarantined(guard, "https://news.example.com/a", "First. " + ATTACK)
+    second = quarantined(guard, "https://news.example.com/b", "Second. " + ATTACK)
+    cfg = owner(guard, monkeypatch)
+    typo = "fw-20261019-000000"
+    assert cli.main(["release", first, typo, second]) == 1
+    err = capsys.readouterr().err
+    assert f"{typo}: no such quarantine entry" in err and "nothing released" in err
+    assert not cfg.released_file.exists() and not (cfg.released_dir / f"{first}.txt").exists()
+    assert cli.main(["release", first, second, first]) == 0  # each once
+    assert sorted(store.released_ids(cfg)) == sorted([first, second]) and len(cfg.released_file.read_text().splitlines()) == 2
+    capsys.readouterr()
+    assert cli.main(["discard", first, typo, "nonsense"]) == 1
+    err = capsys.readouterr().err
+    assert f"{typo}: no such" in err and "nonsense: no such" in err and "nothing discarded" in err
+    assert sorted(store.released_ids(cfg)) == sorted([first, second]) and (cfg.quarantine_dir / f"{first}.json").exists()
+
+
 def test_discard_is_for_the_owner_only(guard, monkeypatch):
     """Emptying the quarantine would let an agent hide what it had been shown."""
     guard.configure(mode="block")

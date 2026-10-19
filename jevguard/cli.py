@@ -422,11 +422,9 @@ def cmd_discard(cfg, a) -> int:
         return 1
     released = store.released_ids(cfg)
     if a.ids:
-        for qid in a.ids:
-            if not store.QID.fullmatch(qid) or not ((cfg.quarantine_dir / f"{qid}.json").is_file() or qid in released):
-                print(f"{qid}: no such quarantine entry", file=sys.stderr)
-                return 1
         ids = list(dict.fromkeys(a.ids))
+        if _unknown(cfg, ids, released, "nothing discarded"):
+            return 1
     else:
         seconds, said = a.older_than
         cutoff, ids = time.time() - seconds, []
@@ -464,14 +462,29 @@ def cmd_discard(cfg, a) -> int:
     return 0
 
 
+def _unknown(cfg, ids: list[str], also=(), outcome: str = "") -> list[str]:
+    """The ids that name no quarantine entry (nor one of `also`), each reported. Release and
+    discard check every id before they act on any, so a mistyped one leaves all as they were."""
+    unknown = [q for q in ids if not store.QID.fullmatch(q) or not ((cfg.quarantine_dir / f"{q}.json").is_file() or q in also)]
+    for qid in unknown:
+        print(f"{qid}: no such quarantine entry", file=sys.stderr)
+    if unknown and outcome:
+        print(outcome, file=sys.stderr)
+    return unknown
+
+
 def cmd_release(cfg, a) -> int:
     if not _owner_only():
         return 2
-    for qid in a.ids:
-        if not store.QID.fullmatch(qid) or not (cfg.quarantine_dir / f"{qid}.json").is_file():
-            print(f"{qid}: no such quarantine entry", file=sys.stderr)
+    ids = list(dict.fromkeys(a.ids))
+    if _unknown(cfg, ids, outcome="nothing released"):
+        return 1
+    for qid in ids:
+        try:
+            digest, files = store.release(cfg, qid)
+        except OSError as exc:
+            print(f"{qid}: stopped: {exc}", file=sys.stderr)
             return 1
-        digest, files = store.release(cfg, qid)
         print("released", qid, digest[:16])
         print("  the original is now in", ", ".join(str(f) for f in files))
         print("  tell Claude it is released; the notice it received names that file")

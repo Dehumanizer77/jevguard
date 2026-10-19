@@ -255,6 +255,9 @@ than 30 days ago (`12h`, `2w` and `90m` work too) and asks before it starts; `-y
 question. Like `show` and `release` it runs only in your own terminal: an agent that could
 empty the quarantine could hide from you what it had been shown.
 
+`release` and `discard` both take several ids at once. They check every one before they act
+on any: if one of them names no entry, nothing is released or discarded.
+
 For an address that keeps being withheld without reason (documentation about hooks, articles
 about prompt injection), there is a list of trusted addresses:
 
