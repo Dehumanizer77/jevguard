@@ -462,6 +462,9 @@ _SPECIAL_BUILTINS = {":", ".", "break", "continue", "eval", "exec", "exit", "exp
                      "shift", "source", "times", "trap", "unset"}
 # A command is read once for each combination of the values its variables may hold, up to this.
 _READINGS = 64
+# Times a loop is read again because a pass may leave a value the next begins with (#56), in one
+# command at most.
+_PASSES = 32
 
 
 def _values(env: dict, name: str) -> tuple:
@@ -517,6 +520,28 @@ def _readings(words: list[str], env: dict, inner: dict | None = None) -> list[li
     return readings
 
 
+def _grows(after: dict, before: dict) -> bool:
+    """after holds a value that before does not."""
+    return any(not set(_values(after, name)) <= set(_values(before, name)) for name in after)
+
+
+def _snapshot(out: Command) -> tuple:
+    return len(out.programs), len(out.globs), len(out.dirs), set(out.paths), set(out.writes)
+
+
+def _restore(out: Command, snapshot: tuple) -> None:
+    """out as it was at the snapshot: what was read since is read again."""
+    programs, globs, dirs, paths, writes = snapshot
+    for each in (out.programs, out.program_dirs, out.program_paths, out.program_globs, out.program_fed):
+        del each[programs:]
+    del out.globs[globs:]
+    del out.dirs[dirs:]
+    out.paths.clear()
+    out.paths.update(paths)
+    out.writes.clear()
+    out.writes.update(writes)
+
+
 def _operators(run: str):
     """The operators in a run of them as the tokenizer gives it: `);` is `)` and `;`."""
     i = 0
@@ -541,6 +566,9 @@ class _Frame:
         self.closed = None             # what a part closed just now left, until the operator after it
         self.case = ""                 # in a case: "head" up to `in`, "pattern" up to `)`, "arm" up to `;;`
         self.head = False              # its first command is the words of `for x in ...` or `case ... in`
+        self.entry = env               # in a loop: what the variables hold where a pass begins
+        self.at = 0                    # and the token it begins at, with out as it was there
+        self.snapshot = None
 
 
 def read(cmd: str, cwd: str = "") -> Command:
@@ -563,6 +591,16 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
     branch, case arm or loop, and as a prefix: `p=x cmd` sets p for cmd only."""
     frames = [_Frame("", env)]
     lost = False  # a closing word or `)` that fits nothing: from there on nothing is certain
+    text, runs = _lift_substitutions(cmd)
+    words_of = tokens(text)
+    i = 0         # the token being read
+    carry = None  # (a loop's first token, what its passes may leave): it is read again with that
+    passes = 0
+
+    def substitutions(word: str, env: dict) -> None:
+        """Each $(...) in the word runs before the word is used, and what it sets stays in it."""
+        for n in _RUN.findall(word):
+            _read(runs[int(n)], out, env, depth)
 
     def env_in(f: _Frame) -> dict:
         """What the variables hold where the next part of f's current list runs."""
@@ -599,6 +637,8 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
         words, after, f.words, f.closed = f.words, f.closed, [], None
         if f.head:  # words to loop over or to match, not a program
             f.head = False
+            for word in words:
+                substitutions(word, env_in(f))
             readings = _readings(words, env_in(f))
             for argv in readings:
                 for arg in argv[1:2] if argv[0] == "case" else argv[3:]:  # case WORD in, for NAME in WORDS
@@ -607,6 +647,7 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
                 # NAME holds each word in turn; without `in`, each argument the shell was given
                 each = [a for argv in readings for a in argv[3:]] if words[2:3] == ["in"] else [None]
                 part(f, {**env_in(f), words[1]: tuple(dict.fromkeys(each)) or (None,)}, ";")
+                f.entry = f.env
             return
         if words:  # after a closed part, its redirections: `done > log`
             left = simple(words, env_in(f) if after is None else after)
@@ -635,6 +676,22 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
         if kind != "<(":  # a <( ... ) runs beside the command it is in, which goes on
             frames[-1].closed = _union(f.start, f.env)
 
+    def again(f: _Frame) -> bool:
+        """At the `done` of loop f. When a pass may leave a value that the pass after it begins
+        with and this one did not, the loop is read again from its first word with that value
+        too (#56), and whatever was read in it is read anew. True if it is."""
+        nonlocal i, carry, passes
+        settle(f)
+        if not _grows(f.env, f.entry):
+            return False
+        passes += 1
+        if passes > _PASSES:
+            raise ValueError("a loop whose variables do not settle")
+        _restore(out, f.snapshot)
+        frames.pop()
+        carry, i = (f.at, f.env), f.at
+        return True
+
     def operator(op: str) -> None:
         f = frames[-1]
         if f.case == "pattern":
@@ -658,11 +715,14 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
         n = 0
         while n < len(words) and _ASSIGN.fullmatch(words[n]):
             n += 1
-        scope = dict(start) if n else start  # what the command itself is run with
-        for word in words[:n]:  # in turn: after `a=1 b=$a`, b is 1
-            name, value = _ASSIGN.fullmatch(word).groups()
-            scope[name] = tuple(dict.fromkeys(r[0] for r in _readings([value], scope)))
         rest = words[n:]
+        for word in rest:  # the shell expands these first, with what the variables held before
+            substitutions(word, start)
+        scope = dict(start) if n else start  # what the command itself is run with
+        for word in words[:n]:  # then these in turn: after `a=1 b=$a`, b is 1, and in b=$(...) too (#55)
+            name, value = _ASSIGN.fullmatch(word).groups()
+            substitutions(value, scope)
+            scope[name] = tuple(dict.fromkeys(r[0] for r in _readings([value], scope)))
         after = scope if not rest or rest[0].startswith("#") else start  # p=x on its own, or before a comment
         evaluated = []
         for argv in _readings(rest, start, scope) if rest else []:
@@ -732,18 +792,17 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
                         _program(rest[:end], False, scope)
         return None
 
-    text, runs = _lift_substitutions(cmd)
-    for token in tokens(text):
+    while i < len(words_of):
+        token = words_of[i]
+        i += 1
         if token and set(token) <= _SEPARATORS:
             for op in _operators(token):
                 operator(op)
             continue
         f = frames[-1]
-        for n in _RUN.findall(token):
-            # it runs before the command it is part of, and what it sets stays in it
-            _read(runs[int(n)], out, env_in(f) if f.closed is None else f.closed, depth)
         token = token.strip("`")
         if f.case == "pattern":
+            substitutions(token, env_in(f))
             if token == "esac":
                 close("case")
             continue  # a pattern is matched against, not run
@@ -753,11 +812,20 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
             f.case = "pattern"
         elif not f.words and (token in _KEYWORDS or token in _HEADS):
             finish(f, ";")  # what was closed before it: `{ a; } then`
+            if token == "done" and frames[-1].kind == "loop" and again(frames[-1]):
+                continue
             if token in _CLOSES:
                 close(_CLOSES[token])
             else:
                 if token in _OPENS:
+                    snapshot = _snapshot(out)
                     open_(_OPENS[token])
+                    if _OPENS[token] == "loop":
+                        loop = frames[-1]
+                        loop.at, loop.snapshot = i - 1, snapshot
+                        if carry and carry[0] == loop.at:
+                            loop.start = loop.env = loop.entry = _union(loop.start, carry[1])
+                            carry = None
                 if token in _HEADS:
                     frames[-1].words.append(token)
                     frames[-1].head = True

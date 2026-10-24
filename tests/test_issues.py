@@ -760,3 +760,44 @@ def test_assignments_that_may_not_run_add_a_value(guard):
     # past a limit, the readings of a command are too many to tell what it does
     many = "".join(f"test -f {v} && {v}=1; " for v in "abcdefg") + "rm $a$b$c$d$e$f$g"
     assert "could not be read" in _reason(guard, many)
+
+
+def test_a_substitution_in_an_assignment_sees_the_assignments_before_it(guard):
+    """#55: in `p=.claude q="$(rm -rf "$p")"` the shell sets p before it expands q's value, so
+    the rm is given .claude. The substitution was read where its word stood, before any of the
+    assignments of its command. The words of a command are still expanded before its
+    assignments: in `p=.claude echo "$(rm -rf "$p")"` the rm is given what p held before."""
+    for value in ('"$(rm -rf "$p")"', '$(rm -rf "$p")', '`rm -rf "$p"`'):
+        for after in ("", " true", " :"):
+            cmd = f"p=notes; p=.claude q={value}{after}"
+            assert "`rm`" in _reason(guard, cmd) and ".claude" in _reason(guard, cmd), cmd
+    assert _reason(guard, 'p=notes; p=.claude echo "$(rm -rf "$p")"') == ""
+
+    def rm(cmd):
+        return [argv for argv in shell.read(cmd, "/w").programs if argv[0] == "rm"]
+    assert rm('p=a; p=b q="$(rm "$p")"') == [["rm", "b"]]
+    assert rm('p=a; p=b q=$(rm "$p") cat "$(rm "$p")"') == [["rm", "a"], ["rm", "b"]]  # cat's word first
+    assert rm('p=a; test -f x && p=b q=$(rm "$p")') == [["rm", "b"]]
+
+
+def test_a_loop_is_read_with_what_its_passes_leave(guard):
+    """#56: a loop body was read once, with what the variables held before the loop. A value
+    set late in the body reaches the commands before it on the next pass. The loop is now read
+    again with what each pass may leave until nothing more comes, and what was read in it is
+    read anew. A loop whose values do not settle cannot be read."""
+    for loop in ('for n in 1 2; do\n    rm -rf "$p"\n    p=.claude\ndone',
+                 'while test -f x; do rm -rf "$p"; p=.claude; done',
+                 'until test -f x; do rm -rf "$p"; test -f y && p=.claude; done',
+                 'while test -f x; do rm -rf "$p"; q=$r; r=.claude; p=$q; done',
+                 'for i in 1 2; do for j in 1 2; do rm -rf "$p"; done; p=.claude; done',
+                 'while test -f x; do for j in 1 2; do rm -rf "$p"; p=$q; done; q=.claude; done'):
+        cmd = f"p=notes\n{loop}"
+        assert "`rm`" in _reason(guard, cmd) and ".claude" in _reason(guard, cmd), cmd
+    for cmd in ('for f in *.txt; do cat "$f"; done', 'p=notes; for n in 1 2; do rm -rf "$p"; done',
+                'n=0; for f in *.txt; do n=$((n + 1)); done; echo "$n"'):
+        assert _reason(guard, cmd) == "", cmd
+
+    c = shell.read('p=a; while test -f x; do rm "$p"; p=b; done; rm "$p"', "/w")
+    assert c.programs == [["test", "-f", "x"], ["rm", "a"], ["rm", "b"], ["rm", "a"], ["rm", "b"]]
+    # what keeps growing does not settle
+    assert "could not be read" in _reason(guard, 'p=x; for f in a b; do p="$p/$f"; done; rm -rf "$p"')
