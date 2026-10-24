@@ -26,7 +26,8 @@ _WRAPPER_CHDIR = {("env", "C"), ("sudo", "D"), ("doas", "C")}
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 _TAKES_COMMAND = _SHELLS | {"su", "script"}
 _ASSIGN = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S)
-_VAR = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+# \0 is a $ in single quotes (_LITERAL): a value known for it is put in all the same, wider than the truth
+_VAR = re.compile(r"[$\0](?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
 _SINGLE_QUOTED = re.compile(r"'[^']*'")
 # Which files these read is decided when they run: substitution, xargs, find, eval, sourced files.
 _DYNAMIC = re.compile(r"\$\(|`|<\(|(?:^|[\s;|&(])(?:xargs|eval|source|find)\s|(?:^|[;|&(])\s*\.\s+\S")
@@ -181,6 +182,104 @@ def _inline_heredocs(cmd: str) -> str:
     return _HEREDOC.sub(inline, cmd)
 
 
+# A $ the shell takes as it is, in single quotes ('$1' in awk, $8924 in a quoted here-document).
+# It stands in the words until a program's arguments are known, and is then a $ again.
+_LITERAL = "\0"
+
+
+def _backtick_end(cmd: str, i: int) -> int:
+    while i < len(cmd):
+        if cmd[i] == "\\":
+            i += 1
+        elif cmd[i] == "`":
+            return i
+        i += 1
+    return -1
+
+
+def _double_quote_end(cmd: str, i: int) -> int:
+    while i < len(cmd):
+        if cmd[i] == "\\":
+            i += 1
+        elif cmd[i] == '"':
+            return i
+        elif cmd.startswith("$(", i):
+            i = _substitution_end(cmd, i + 2)
+        elif cmd[i] == "`":
+            i = _backtick_end(cmd, i + 1)
+        if i < 0:
+            return -1
+        i += 1
+    return -1
+
+
+def _substitution_end(cmd: str, i: int) -> int:
+    """Where the `)` that closes a `$(` is. Inside it the shell quotes afresh, so a `"` there
+    opens a string of its own and does not close the one around the `$(`."""
+    depth = 1
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch == "\\":
+            i += 1
+        elif ch == "'":
+            i = cmd.find("'", i + 1)
+        elif ch == '"':
+            i = _double_quote_end(cmd, i + 1)
+        elif ch == "`":
+            i = _backtick_end(cmd, i + 1)
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if not depth:
+                return i
+        if i < 0:
+            return -1
+        i += 1
+    return -1
+
+
+def _lift_substitutions(cmd: str, depth: int = 0) -> str:
+    """`echo "n: $(grep -c "a|b" f)"` as `echo "n: $" ; grep -c "a|b" f`. The tokenizer knows
+    neither backticks nor the fresh quoting inside a `$(` in double quotes: it would pair the
+    inner quotes with the outer ones, take the `|` for a pipe and `b" f)"` for a program, and
+    not see the command at all. So each such substitution is taken out and read after the line
+    as a command of its own, with a `$` left where its output goes: the program it is given to
+    has an argument from elsewhere, as with `$(...)` outside quotes, which the tokenizer reads.
+    A `$` in single quotes becomes _LITERAL on the way."""
+    out, runs, i, quoted = [], [], 0, False
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch == "\\":
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if ch == "'" and not quoted:
+            end = cmd.find("'", i + 1)
+            if end < 0:
+                break
+            out.append(cmd[i:end + 1].replace("$", _LITERAL))
+            i = end + 1
+            continue
+        if ch == "`" or (quoted and cmd.startswith("$(", i)):
+            start = i + 1 if ch == "`" else i + 2
+            end = _backtick_end(cmd, start) if ch == "`" else _substitution_end(cmd, start)
+            if end < 0:
+                break
+            runs.append(cmd[start:end])
+            out.append("$")
+            i = end + 1
+            continue
+        if ch == '"':
+            quoted = not quoted
+        out.append(ch)
+        i += 1
+    out.append(cmd[i:])  # what follows a quote or substitution that is not closed, as it was
+    if depth < 8:
+        runs = [_lift_substitutions(run, depth + 1) for run in runs]
+    return "".join(out) + "".join(f" ; {run}" for run in runs)
+
+
 def read(cmd: str, cwd: str = "") -> Command:
     cmd = _inline_heredocs(cmd.replace("\0", ""))
     out = Command(cwd)
@@ -220,8 +319,10 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> None:
             _program(argv, fed)
 
     def _program(argv: list[str], fed: bool = False) -> None:
+        fed = fed or any("$" in a for a in argv[1:])  # a $ in single quotes is text, not a value
+        argv = [a.replace(_LITERAL, "$") for a in argv]
         out.programs.append(argv)
-        out.program_fed.append(fed or any("$" in a for a in argv[1:]))
+        out.program_fed.append(fed)
         out.program_dirs.append(list(out.dirs))
         paths: set[str] = set()
         globs: list[str] = []
@@ -257,7 +358,7 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> None:
                     if rest[:end]:
                         _program(rest[:end])
 
-    for token in tokens(cmd):
+    for token in tokens(_lift_substitutions(cmd)):
         if token and set(token) <= _SEPARATORS:
             finish()
         else:
