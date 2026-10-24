@@ -1,10 +1,10 @@
 """Just enough shell reading to see which programs a command runs and which files it names.
 
 This is pattern reading, not a shell. It follows what a command says in plain sight: programs,
-their arguments, `cd`, variables assigned in the same command, `bash -c '...'`, `find -exec`,
-command substitutions, redirections, globs. It cannot follow a script that opens a file, an
-alias, or a value computed at run time; `Command.dynamic` says when part of the command is of
-that kind.
+their arguments, `cd`, variables assigned in the same command, `bash -c '...'`, eval, `find -exec`,
+the functions and traps it defines, command substitutions, redirections, globs. It cannot follow
+a script that opens a file, an alias, or a value computed at run time; `Command.dynamic` says
+when part of the command is of that kind.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import os
 import re
 import shlex
 
-_SEPARATORS = set("();|&")
 _REDIRECT_CHARS = set("<>&|")
 # Programs that only run another program: the command after them is what counts. For each, the
 # options whose value is a separate word, so that the value is not taken for the program.
@@ -24,13 +23,17 @@ _WRAPPERS = {"rtk": "", "sudo": "ughpCDRTU", "doas": "uC", "env": "uCS", "time":
              "builtin": "", "exec": "a", "nice": "n", "ionice": "cnp", "stdbuf": "ioe", "setsid": "",
              "timeout": "sk", "xargs": "IEnPLdsa", "watch": "n", "busybox": "", "toybox": "", "chronic": "",
              "unbuffer": "", "caffeinate": ""}
-_WRAPPER_CHDIR = {("env", "C"), ("sudo", "D"), ("doas", "C")}
+_WRAPPER_CHDIR = {("sudo", "D"), ("doas", "C"), ("sudo", "--chdir")}  # env: _env
 # Programs that take a command line as the string after -c (bash -lc '...', script -qc '...').
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 _TAKES_COMMAND = _SHELLS | {"su", "script"}
+# Programs that take their program from stdin when they are given none: through a pipe, that is
+# what the command before them prints.
+_INTERPRETER = re.compile(r"(?:python|pypy|perl|ruby|node|nodejs|php|lua|tclsh|Rscript)[\d.]*")
 _ASSIGN = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S)
-# \0 is a $ in single quotes (_LITERAL): a value known for it is put in all the same, wider than the truth
-_VAR = re.compile(r"[$\0](?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+_VAR = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+# \0 is a $ quoted against expansion (_LITERAL): text, which a shell may expand later (_wider)
+_LITERAL_VAR = re.compile(r"\0(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
 _SINGLE_QUOTED = re.compile(r"'[^']*'")
 # Which files these read is decided when they run: substitution, xargs, find, eval, sourced files.
 _DYNAMIC = re.compile(r"\$\(|`|<\(|(?:^|[\s;|&(])(?:xargs|eval|source|find)\s|(?:^|[;|&(])\s*\.\s+\S")
@@ -49,16 +52,6 @@ def canonical(path: str, base: str = "") -> str:
 
 def under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
-
-
-def tokens(cmd: str) -> list[str]:
-    lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
-    lex.whitespace_split = True
-    lex.commenters = ""  # '#' is part of many URLs
-    try:
-        return list(lex)
-    except ValueError:  # unbalanced quotes: split without honouring them
-        return re.findall(r"[();|&<>]+|[^\s();|&<>]+", cmd)
 
 
 _BARE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-")
@@ -171,15 +164,16 @@ def glob_reaches_above(pattern: str, path: str) -> bool:
 
 _HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_]\w*)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
 def _inline_heredocs(cmd: str) -> str:
-    """`python3 - <<'EOF' ... EOF` as `python3 - '...'`. A here-document is text handed to the
-    program, not shell: read line by line as commands, its first word of each line would be
-    taken for a program and the paths it names would be lost. With an unquoted marker the shell
-    still runs the $(...) and `...` inside it, so those follow the text as words of their own,
-    where _read reads them as it reads any other."""
+    """`python3 - <<'EOF' ... EOF` as `python3 - <<< '...'`. A here-document is text handed to
+    the program, not shell: read line by line as commands, its first word of each line would be
+    taken for a program and the paths it names would be lost. It stays a redirection, so that
+    `p=x <<EOF` is still an assignment and nothing else (#57). With an unquoted marker the shell
+    still runs the $(...) and `...` inside it, so those follow the text in the same word, where
+    _walk reads them with the redirection."""
     def inline(m: re.Match) -> str:
         body, rest = m.group(4), m.group(3)
-        runs = "" if m.group(1) else "".join(f" {run}" for run in _substitutions_in(body))
-        return f" {shlex.quote(body)}{runs} {rest}"
+        runs = "" if m.group(1) else "".join(_substitutions_in(body))
+        return f" <<< {shlex.quote(body)}{runs} {rest}"
     return _HEREDOC.sub(inline, cmd)
 
 
@@ -448,6 +442,152 @@ def _lift_substitutions(cmd: str) -> tuple[str, list[str]]:
     return "".join(out), runs
 
 
+# Every operator, longest first. A run of ; & | ( ) < > is split into these as the shell splits it:
+# `a;>f` is a, ;, >, f, and in `(a)>f` the bracket closes before f is written.
+_SHELL_OPS = sorted({"&&", "||", ";;&", ";;", ";&", "|&", ";", "&", "|", "(", ")", "<(", ">(", "<<<", "<<-", "<<",
+                     "<>", "<&", ">&", ">>", ">|", "&>>", "&>", "<", ">"}, key=len, reverse=True)
+# Those that join or end commands. The others are redirections, and part of the command they are in.
+_LIST_OPS = {"&&", "||", ";;&", ";;", ";&", "|&", ";", "&", "|", "(", ")"}
+_FD = re.compile(r"\d+|\{[A-Za-z_]\w*\}")              # 2>, {fd}>: the descriptor a redirection is for
+_REDIRECTION = re.compile(r"[<>&]*[<>][<>&|]*")
+_ARRAY = re.compile(r"[A-Za-z_]\w*\+?=")                 # NAME=( ... ), NAME+=( ... )
+# An assignment as written: its name, any [index] and the = outside quotes. `'p=x'` and `p\=x` are programs.
+_ASSIGN_WORD = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
+_ASSIGN_PARTS = re.compile(r"([A-Za-z_]\w*)(\[[^\]]*\])?(\+?)=(.*)", re.S)
+
+
+class _Token(str):
+    """A word or an operator of a command line, and how it was written. The shell takes `done`
+    for the end of a loop and `'done'` for a program, `p=x` for an assignment and `'p=x'` or
+    `p\\=x` for a program, `>` for a redirection and `'>'` for an argument."""
+    op = False     # an operator or a redirection, outside quotes
+    fd = False     # the 2 of `2>`, the {fd} of `{fd}>`: part of the redirection after it
+    plain = False  # nothing in it is quoted or escaped: if it is a reserved word, it is one
+    raw = ""       # as written; empty where that cannot be told
+    array = None   # NAME=( ... ): the words in the brackets
+
+
+def _token(text: str, raw: str, **how) -> _Token:
+    token = _Token(text)
+    token.raw = raw
+    token.__dict__.update(how)
+    return token
+
+
+def _unquote(raw: str) -> str:
+    """A word as the shell has it once its quotes are taken away. A $ that was quoted or escaped
+    against expansion is _LITERAL: `\\$p` and `"\\$p"` are the text $p, as '$p' is."""
+    out, i = [], 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "\\":
+            nxt = raw[i + 1:i + 2]
+            out.append(_LITERAL if nxt == "$" else "" if nxt == "\n" else nxt)
+            i += 2
+        elif ch == "'":
+            end = raw.find("'", i + 1)
+            end = len(raw) if end < 0 else end
+            out.append(raw[i + 1:end].replace("$", _LITERAL))
+            i = end + 1
+        elif ch == '"':
+            i += 1
+            while i < len(raw) and raw[i] != '"':
+                if raw[i] == "\\" and raw[i + 1:i + 2] in ("$", "`", '"', "\\", "\n"):
+                    nxt = raw[i + 1]
+                    out.append(_LITERAL if nxt == "$" else "" if nxt == "\n" else nxt)
+                    i += 2
+                else:
+                    out.append(raw[i])
+                    i += 1
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _array(text: str, i: int) -> tuple[list[str], int]:
+    """The words of `NAME=( ... )` from just after its `(`, and where its `)` ends."""
+    words = []
+    while i < len(text):
+        if text[i] in " \t\n" or text.startswith("\\\n", i):
+            i += 1 if text[i] != "\\" else 2
+        elif text[i] == "#":
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+        elif text[i] == ")":
+            return words, i + 1
+        elif text[i] in _WORD_BREAKS:
+            break
+        else:
+            end = _word_end(text, i)
+            if end < 0:
+                break
+            words.append(_unquote(text[i:end]))
+            i = end
+    raise ValueError("an array that cannot be read")
+
+
+def _tokens(text: str) -> list[_Token]:
+    """The words and operators of a command line, as _lift_substitutions leaves it. A line break
+    is a `;`, and a `#` that begins a word begins a comment. From a quote that does not end, the
+    shell runs nothing on that line; the rest is split at its operators all the same."""
+    out, i = [], 0
+    while i < len(text):
+        ch = text[i]
+        if ch in " \t" or text.startswith("\\\n", i):
+            i += 1 if ch != "\\" else 2
+        elif ch == "\n":
+            out.append(_token(";", ch, op=True))
+            i += 1
+        elif ch == "#":
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+        elif ch in "();<>|&":
+            op = next(o for o in _SHELL_OPS if text.startswith(o, i))
+            out.append(_token(op, op, op=True))
+            i += len(op)
+        else:
+            end = _word_end(text, i)
+            if end < 0:  # neither a reserved word nor an assignment can be told there
+                for piece in re.findall(r"[();|&<>]+|[^\s();|&<>]+", text[i:]):
+                    out.extend(_tokens(piece) if piece[0] in "();|&<>" else [_token(piece, "")])
+                break
+            raw = text[i:end]
+            if text[end:end + 1] in ("<", ">") and _FD.fullmatch(raw):
+                out.append(_token(raw, raw, fd=True))
+            elif text[end:end + 1] == "(" and _ARRAY.fullmatch(raw):
+                words, end = _array(text, end + 1)
+                out.append(_token(raw, raw, array=words))
+            else:
+                out.append(_token(_unquote(raw), raw, plain=not re.search(r"[\\'\"]", raw)))
+            i = end
+    return out
+
+
+def _parts(words: list[_Token]) -> tuple[list[_Token], list[_Token], list[_Token]]:
+    """A simple command's assignments, its words, and its redirections with their targets.
+    Redirections may stand anywhere, before and between the assignments too, and do not make a
+    program of anything: `p=x >f` and `>f p=x` set p (#57). An assignment counts only before the
+    first word and only as written (_ASSIGN_WORD)."""
+    assigns, command, redirects, k = [], [], [], 0
+    while k < len(words):
+        word = words[k]
+        k += 1
+        if word.fd:
+            redirects.append(word)
+        elif word.op:
+            redirects.append(word)
+            if k < len(words) and not (words[k].op or words[k].fd):
+                redirects.append(words[k])
+                k += 1
+        elif not command and (word.array is not None or _ASSIGN_WORD.match(word.raw)):
+            assigns.append(word)
+        else:
+            command.append(word)
+    return assigns, command, redirects
+
+
 # Reserved words where a command begins. They run nothing: the command is what follows them.
 _KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "!", "{", "fi", "done", "esac", "}"}
 # These begin words to loop over or to match, not a command.
@@ -455,16 +595,29 @@ _HEADS = {"for", "select", "case"}
 # What they all open and close.
 _OPENS = {"if": "if", "while": "loop", "until": "loop", "for": "loop", "select": "loop", "case": "case", "{": "{"}
 _CLOSES = {"fi": "if", "done": "loop", "esac": "case", "}": "{"}
+# What may follow `f()`: the body of a function is a compound command.
+_BODIES = {"{", "if", "while", "until", "for", "select", "case"}
 # In a branch, a case arm or a loop an assignment may not run, or may run again later.
 _CONDITIONAL = {"if", "case", "loop"}
 # Before these `p=x` stays set in POSIX mode: in sh, which is dash on Debian, and bash --posix.
 _SPECIAL_BUILTINS = {":", ".", "break", "continue", "eval", "exec", "exit", "export", "readonly", "return", "set",
                      "shift", "source", "times", "trap", "unset"}
+# Builtins that set the variables they are given, in this shell: `export p=x`.
+_DECLARE = {"export", "declare", "typeset", "local", "readonly"}
+# Builtins that give variables values the command does not show: `read p < f`.
+_SETS = {"read", "mapfile", "readarray", "getopts", "printf", "unset"}
+# After these, what follows in the part of the command they leave may not run.
+_LEAVES = {"return", "break", "continue", "exit"}
 # A command is read once for each combination of the values its variables may hold, up to this.
 _READINGS = 64
 # Times a loop is read again because a pass may leave a value the next begins with (#56), in one
 # command at most.
 _PASSES = 32
+# Shells inside shells (bash -c, eval) read, at most; functions inside functions; and tokens
+# read in all, loops and calls counted each time. Past any of them the command cannot be read.
+_DEPTH = 4
+_CALLS = 8
+_WORK = 100000
 
 
 def _values(env: dict, name: str) -> tuple:
@@ -498,26 +651,140 @@ def _merge(held: tuple, more: tuple) -> tuple:
     return held + tuple(v for v in more if v not in held)
 
 
-def _readings(words: list[str], env: dict, inner: dict | None = None) -> list[list[str]]:
+def _exported(env: dict, names=()) -> dict:
+    """What a program this shell starts finds in its environment. A variable Claude Code gave
+    the command, and one exported to the program (names: `p=x bash -c ...`), holds what it holds
+    here; any other the command set may not have been exported, and may not be set there."""
+    return {name: values if name in names or name in os.environ else _merge(values, (None,))
+            for name, values in env.items()}
+
+
+def _reset(env: dict) -> dict:
+    """The environment sudo, doas and su give a program: they keep some variables and set or
+    drop others, by their own rules. Each may hold what it held, or not be set."""
+    return {name: _merge(_values(env, name), (None,)) for name in {*env, *os.environ}}
+
+
+def _cleared(env: dict) -> dict:
+    """`env -i`: nothing set but what env sets after it."""
+    return {name: (None,) for name in {*env, *os.environ}}
+
+
+# $NAME, ${NAME}, and ${NAME} with an operator after the name: ${p:-x}, ${p%/*}, ${p//a/b}, ${p:1:2}
+_EXPANSION = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|\{([A-Za-z_]\w*)"
+                        r"(:?[-=+?]|##?|%%?|/[/#%]?|\^\^?|,,?|:)([^{}]*)\})")
+# ${p:=x} and ${p=x} give p the value x where it is not set, in this shell
+_DEFAULT = re.compile(r"\$\{([A-Za-z_]\w*):?=([^{}]*)\}")
+
+
+# Not set: beside None, which stands for not set or not known, where the two read differently.
+_UNSET = object()
+
+
+def _param(value: str | None, op: str, arg: str) -> str | None:
+    """What ${NAME<op><arg>} gives for a NAME that holds value (None: not set), or None where
+    that cannot be told: the word then stays as it is written, and counts as fed from elsewhere."""
+    if re.search(r"[$`\\'\"" + _LITERAL + _MARK + "]", arg):
+        return None
+    unset = value is None
+    null = unset or value == ""
+    if op in ("-", "="):
+        return arg if unset else value
+    if op in (":-", ":="):
+        return arg if null else value
+    if op in ("+", ":+"):
+        return "" if (unset if op == "+" else null) else arg
+    if unset or op in ("?", ":?"):
+        return value
+    if op in ("#", "##"):  # the shortest or longest start that matches, taken off
+        for k in range(len(value) + 1) if op == "#" else range(len(value), -1, -1):
+            if fnmatch.fnmatchcase(value[:k], arg):
+                return value[k:]
+        return value
+    if op in ("%", "%%"):  # the shortest or longest end
+        for k in range(len(value), -1, -1) if op == "%" else range(len(value) + 1):
+            if fnmatch.fnmatchcase(value[k:], arg):
+                return value[:k]
+        return value
+    if op[0] == "/":
+        pattern, _, put = arg.partition("/")
+        if not pattern:
+            return value
+        rx = fnmatch.translate(pattern)[:-2]  # (?s:...) without its \Z
+        if op == "/#":
+            rx = "^" + rx
+        elif op == "/%":
+            rx = rx + "$"
+        return re.sub(rx, put.replace("\\", "\\\\"), value, count=0 if op == "//" else 1)
+    if op in ("^", "^^", ",", ",,"):
+        if arg:
+            return None
+        case = str.upper if op[0] == "^" else str.lower
+        return case(value) if len(op) == 2 else case(value[:1]) + value[1:]
+    if op == ":":  # ${p:offset} and ${p:offset:length}
+        m = re.fullmatch(r"\s*\(?\s*(-?\d+)\s*\)?\s*(?::\s*(-?\d+)\s*)?", arg)
+        if not m:
+            return None
+        start = int(m.group(1))
+        start = max(len(value) + start, 0) if start < 0 else start
+        if m.group(2) is None:
+            return value[start:]
+        length = int(m.group(2))
+        return value[start:start + length] if length >= 0 else value[start:len(value) + length]
+    return None
+
+
+def _readings(words: list[str], env: dict, envs: list[dict] | None = None) -> list[list[str]]:
     """The words with the values of their variables put in, once for each combination of the
-    values they may hold. Past _READINGS what the command is given cannot be told. A $ in single
-    quotes is filled in from inner: in `p=x bash -c 'rm $p'` the shell that expands it has p=x."""
-    def key(m: re.Match) -> str:  # $p and p's $ in single quotes are filled in apart
-        return m.group(0)[0] + (m.group(1) or m.group(2))
-    keys = list(dict.fromkeys(key(m) for word in words for m in _VAR.finditer(word)))
-    choices = [_values(inner if k[0] == _LITERAL and inner is not None else env, k[1:]) for k in keys]
-    if math.prod(len(c) for c in choices) > _READINGS:
+    values they may hold; envs gives each word an env of its own. Past _READINGS what the command
+    is given cannot be told. A $ in single quotes (_LITERAL) is not filled in: it is text, and a
+    shell that reads it later, in `bash -c` or eval, has variables of its own then (#58)."""
+    envs = envs or [env] * len(words)
+    held: dict[tuple, tuple] = {}
+    for word, e in zip(words, envs):
+        for m in _EXPANSION.finditer(word):
+            name = m.group(1) or m.group(2) or m.group(3)
+            key = (id(e), name)
+            held.setdefault(key, _values(e, name))
+            if m.group(4) and None in held[key] and _UNSET not in held[key]:
+                held[key] += (_UNSET,)  # ${p:-x} on what may not be known: read as unknown, and as not set
+    keys = list(held)
+    if math.prod(len(held[k]) for k in keys) > _READINGS:
         raise ValueError("variables that may hold more values than can be read")
     readings = []
-    for combination in itertools.product(*choices):
+    for combination in itertools.product(*(held[k] for k in keys)):
         value = dict(zip(keys, combination))
+        reading = []
+        for word, e in zip(words, envs):
+            def put(m: re.Match, e=e) -> str:
+                v = value[(id(e), m.group(1) or m.group(2) or m.group(3))]
+                if m.group(4):
+                    v = None if v is None else _param(None if v is _UNSET else v, m.group(4), m.group(5))
+                return m.group(0) if v is None or v is _UNSET else v
+            # after _EXPANSION: `$` and what follows the mark is no name
+            reading.append(_RUN.sub("", _EXPANSION.sub(put, word)))
+        readings.append(reading)
+    return readings
+
+
+def _wider(arg: str, env: dict) -> list[str]:
+    """The argument as text, and again with each $ in single quotes in it filled in from env.
+    A program may hand such text to a shell of its own (python's os.system, an alias, a trap), and
+    what the variables hold there cannot be told; the paths it names are read as naming what the
+    command's variables hold. Wider than the truth."""
+    names = list(dict.fromkeys(m.group(1) or m.group(2) for m in _LITERAL_VAR.finditer(arg)))
+    texts = [arg.replace(_LITERAL, "$")]
+    choices = [tuple(v for v in _values(env, name) if v is not None) or (None,) for name in names]
+    if math.prod(len(c) for c in choices) > _READINGS:
+        raise ValueError("variables that may hold more values than can be read")
+    for combination in itertools.product(*choices) if names else ():
+        value = dict(zip(names, combination))
 
         def put(m: re.Match) -> str:
-            v = value[key(m)]
+            v = value[m.group(1) or m.group(2)]
             return m.group(0) if v is None else v
-        # after _VAR: `$` and what follows the mark is no name
-        readings.append([_RUN.sub("", _VAR.sub(put, word)) for word in words])
-    return readings
+        texts.append(_LITERAL_VAR.sub(put, arg).replace(_LITERAL, "$"))
+    return list(dict.fromkeys(texts))
 
 
 def _grows(after: dict, before: dict) -> bool:
@@ -542,24 +809,178 @@ def _restore(out: Command, snapshot: tuple) -> None:
     out.writes.update(writes)
 
 
-def _operators(run: str):
-    """The operators in a run of them as the tokenizer gives it: `);` is `)` and `;`."""
-    i = 0
-    while i < len(run):
-        op = run[i] if run[i] in "()" else next(o for o in _OPERATORS if run.startswith(o, i))
-        yield op
-        i += len(op)
+# Long options of wrappers that take their value as the next word, and options that name a file the
+# wrapper writes.
+_WRAPPER_LONG = {"sudo": {"--user", "--group", "--host", "--prompt", "--chdir", "--chroot", "--close-from",
+                          "--command-timeout", "--other-user", "--role", "--type", "--login-class"},
+                 "timeout": {"--signal", "--kill-after"}, "nice": {"--adjustment"},
+                 "ionice": {"--class", "--classdata", "--pid", "--pgid", "--uid"},
+                 "stdbuf": {"--input", "--output", "--error"}, "time": {"--format", "--output"},
+                 "xargs": {"--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-lines", "--max-chars",
+                           "--process-slot-var"}, "watch": {"--interval"}}
+_WRAPPER_WRITES = {("time", "o"), ("time", "--output")}
+_ENV_LONG = {"--ignore-environment": "i", "--null": "0", "--debug": "v", "--unset": "u", "--chdir": "C",
+             "--split-string": "S", "--argv0": "a"}
+
+
+def _env(argv: list[str], child: dict, out: Command) -> tuple[list[str], dict]:
+    """env's options and NAME=VALUE operands: the program after them, and what it is run with
+    (#59). The variables env sets, unsets (-u) or clears (-i) are the program's, not this shell's.
+    An option this does not know may change what the program is or what it finds, and cannot be
+    read."""
+    options = True
+    while argv:
+        word = argv.pop(0)
+        if options and word == "--":  # NAME=VALUE operands may still follow
+            options = False
+            continue
+        if options and word == "-":
+            child = _cleared(child)
+            continue
+        if not (options and word.startswith("-")):
+            if "=" not in word[1:]:
+                argv.insert(0, word)
+                break
+            name, value = word.split("=", 1)
+            child = {**child, name: (value,)}
+            continue
+        if word.startswith("--"):
+            option, eq, value = word.partition("=")
+            if option in ("--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"):
+                continue
+            if option in ("--help", "--version"):
+                return [], child
+            if option not in _ENV_LONG:
+                raise ValueError(f"env {option}")
+            if option in ("--unset", "--chdir", "--split-string", "--argv0") and not eq:
+                if not argv:
+                    raise ValueError(f"env {option}")
+                value = argv.pop(0)
+            given = [(_ENV_LONG[option], value)]
+        else:
+            given, k = [], 1
+            while k < len(word):
+                letter = word[k]
+                if letter in "i0v":
+                    given.append((letter, ""))
+                    k += 1
+                    continue
+                if letter not in "uCSa" or not (word[k + 1:] or argv):
+                    raise ValueError(f"env -{letter}")
+                given.append((letter, word[k + 1:] or argv.pop(0)))
+                break
+        for letter, value in given:
+            if letter == "i":
+                child = _cleared(child)
+            elif letter == "u":
+                child = {**child, value: (None,)}
+            elif letter == "C":
+                out.dirs.extend([canonical(value, d) for d in out.dirs[:8]])
+            elif letter == "S":  # the string is split into words and read on as env's
+                if re.search(r"[$\\" + _LITERAL + "]", value):
+                    raise ValueError("env -S with what env itself expands")
+                argv[0:0] = shlex.split(value, comments=True)
+    return argv, child
+
+
+def _unwrap(argv: list[str], child, out: Command) -> tuple[list[str], bool, object]:
+    """The program the wrappers in front of it run, whether its arguments come from elsewhere
+    (xargs), and what it finds in its environment. That is made only where it is needed: child is
+    a function that makes it, and so is what is returned."""
+    fed = False
+    while argv and os.path.basename(argv[0]) in _WRAPPERS:
+        wrapper = os.path.basename(argv.pop(0))
+        if wrapper == "env":
+            argv, env = _env(argv, child(), out)
+            child = lambda env=env: env
+            continue
+        fed = fed or wrapper == "xargs"
+        if wrapper in ("sudo", "doas"):
+            env = _reset(child())
+            child = lambda env=env: env
+        run_words = edit = False
+        while argv and (argv[0].startswith("-") or argv[0].replace(".", "").isdigit()
+                        or argv[0] == "{}" or _ASSIGN.fullmatch(argv[0])):
+            option = argv.pop(0)
+            if option == "--":
+                break
+            if _ASSIGN.fullmatch(option):
+                if wrapper == "sudo":  # sudo p=x cmd: where the policy lets it, cmd has p=x
+                    name, value = _ASSIGN.fullmatch(option).groups()
+                    env = {**child(), name: (value,)}
+                    child = lambda env=env: env
+                continue
+            run_words = run_words or option in ("-x", "--exec")
+            edit = edit or (wrapper == "sudo" and option in ("-e", "--edit"))
+            if option.startswith("--"):
+                name, eq, value = option.partition("=")
+                if not eq and name in _WRAPPER_LONG.get(wrapper, ()) and argv:
+                    eq, value = "=", argv.pop(0)
+                key = (wrapper, name)
+            elif len(option) == 2 and option[1] in _WRAPPERS[wrapper] and argv:
+                eq, value, key = "=", argv.pop(0), (wrapper, option[1])  # sudo -u root, timeout -s KILL
+            else:
+                eq, value, key = "=", option[2:], (wrapper, option[1:2])  # -D/dir, -o/file
+            if eq and value and key in _WRAPPER_CHDIR:
+                out.dirs.extend([canonical(value, d) for d in out.dirs[:8]])
+            if eq and value and key in _WRAPPER_WRITES:
+                out.writes.update(resolve(value, out.dirs))
+        if edit:
+            argv = ["sudoedit", *argv]
+        if wrapper == "watch" and argv and not run_words:  # watch hands its words to sh -c
+            argv = ["sh", "-c", " ".join(argv)]
+    return argv, fed, child
+
+
+class _Context:
+    """What the reading of one command keeps across the texts it reads: the functions it defines,
+    the traps it sets, and how much it has read."""
+
+    def __init__(self, out: Command):
+        self.out = out
+        self.functions: dict[str, tuple] = {}  # name: (the tokens of its body, the substitutions they mark)
+        self.defined = 0                       # functions defined or changed so far
+        self.calls: list[str] = []             # the functions being read, innermost last
+        self.called: set[str] = set()          # and those read where they are called
+        self.traps: dict[tuple, list] = {}     # (text, depth): [what the variables may hold while it may run, signals]
+        self.work = 0
+
+    def define(self, name: str, body: list, runs: list) -> None:
+        if self.functions.get(name) != (body, runs):
+            self.functions[name] = (body, runs)
+            self.defined += 1
+
+    def finish(self, end: dict) -> None:
+        """What runs after the command has been read, or at a time it does not show. A trap runs
+        when its signal comes or the shell exits (end): it is read with all the variables may hold
+        from where it was set, and one that changes them at another time than the exit, the
+        command cannot be read with. A function that is defined and not called where this can
+        see it may still be called (a name made at run time, a sourced file): it is read once, with
+        what the variables hold at the end."""
+        for held in self.traps.values():
+            held[0] = _union(held[0], end)
+        done = set()
+        while len(done) < len(self.traps) or self.functions.keys() - self.called:
+            for key in [k for k in self.traps if k not in done]:
+                done.add(key)
+                env, signals = self.traps[key]
+                after = _read(key[0], self, env, key[1])
+                if signals - {"EXIT", "0"} and _grows(after, env):
+                    raise ValueError("a trap that changes variables at a time that cannot be told")
+            for name in list(self.functions.keys() - self.called):
+                self.called.add(name)
+                _walk(*self.functions[name], self, end, 0)
 
 
 class _Frame:
-    """A part of a command that _read keeps apart: all of it, a ( ... ) or { ... }, a branch,
+    """A part of a command that _walk keeps apart: all of it, a ( ... ) or { ... }, a branch,
     case or loop, a <( ... ). What is set in it reaches the part around it only as values the
     variables may hold beside those they held before."""
 
     def __init__(self, kind: str, env: dict):
         self.kind = kind
         self.start = self.env = env    # what the variables held where it began, and after its lists so far
-        self.words: list[str] = []     # of the command being read
+        self.words: list[_Token] = []  # of the command being read
         self.before = ""               # the operator before the next part of the current list: "", && or ||
         self.ok = self.failed = None   # what they hold if the list has so far succeeded, or failed
         self.pipe = None               # (what they held where a pipeline began, what its parts set)
@@ -569,38 +990,54 @@ class _Frame:
         self.entry = env               # in a loop: what the variables hold where a pass begins
         self.at = 0                    # and the token it begins at, with out as it was there
         self.snapshot = None
+        self.defined = 0               # and the functions defined there
+        self.function = None           # the body of this function, being defined: it runs where it is called
+        self.cut = False               # a return, break, continue or exit was read in it: what follows may not run
 
 
 def read(cmd: str, cwd: str = "") -> Command:
-    cmd = _inline_heredocs(cmd.replace("\0", "").replace(_MARK, ""))
+    cmd = cmd.replace("\0", "").replace(_MARK, "")
     out = Command(cwd)
+    ctx = _Context(out)
     # The hook runs in the environment Claude Code gives its commands, so a variable set there
     # has the value the command saw (_values). Only what neither that nor the command itself sets is unknown.
-    env = _read(cmd, out, {"HOME": (os.path.expanduser("~"),), "PWD": (cwd,)}, 0)
-    visible = _SINGLE_QUOTED.sub("''", cmd)  # '$1' in an awk program is not a shell variable
+    env = _read(cmd, ctx, {"HOME": (os.path.expanduser("~"),), "PWD": (cwd,)}, 0)
+    ctx.finish(env)
+    visible = _SINGLE_QUOTED.sub("''", _inline_heredocs(cmd))  # '$1' in an awk program is not a shell variable
     unset = {a or b for a, b in _VAR.findall(visible)} - set(env) - set(os.environ)
     out.dynamic = bool(_DYNAMIC.search(visible) or unset)
     return out
 
 
-def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
-    """Read cmd into out, with the variables holding what env says, and return what they may
-    hold once it has run. Each holds a set of values it may have (#53): an assignment that
-    certainly runs in this shell replaces them, and one that may not adds its value. It may not
-    in a subshell, a pipeline, the background or a `bash -c` string, after && or ||, in a
-    branch, case arm or loop, and as a prefix: `p=x cmd` sets p for cmd only."""
+def _read(cmd: str, ctx: _Context, env: dict, depth: int, inline: bool = True) -> dict:
+    """Read cmd into ctx.out, with the variables holding what env says, and return what they may
+    hold once it has run."""
+    text, runs = _lift_substitutions(_inline_heredocs(cmd) if inline else cmd)
+    return _walk(_tokens(text), runs, ctx, env, depth)
+
+
+def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: int) -> dict:
+    """Read the tokens into ctx.out, with the variables holding what env says, and return what
+    they may hold once they have run. Each holds a set of values it may have (#53): an assignment
+    that certainly runs in this shell replaces them, and one that may not adds its value. It may
+    not in a subshell, a pipeline, the background or a `bash -c` string, after && or ||, in a
+    branch, case arm or loop, after a return, break, continue or exit, and as a prefix: `p=x cmd`
+    sets p for cmd only."""
+    out = ctx.out
     frames = [_Frame("", env)]
-    lost = False  # a closing word or `)` that fits nothing: from there on nothing is certain
-    text, runs = _lift_substitutions(cmd)
-    words_of = tokens(text)
-    i = 0         # the token being read
-    carry = None  # (a loop's first token, what its passes may leave): it is read again with that
+    lost = False     # a closing word or `)` that fits nothing: from there on nothing is certain
+    silent = 0       # in the body of a function being defined: read for where it ends, not run
+    defining = None  # the name of a function whose body comes next
+    i = 0            # the token being read
+    carry = None     # (a loop's first token, what its passes may leave): it is read again with that
     passes = 0
+    piped = False    # the command being read is given its input by the one before it, through a pipe
 
     def substitutions(word: str, env: dict) -> None:
         """Each $(...) in the word runs before the word is used, and what it sets stays in it."""
-        for n in _RUN.findall(word):
-            _read(runs[int(n)], out, env, depth)
+        if not silent:
+            for n in _RUN.findall(word):
+                _read(runs[int(n)], ctx, env, depth, inline=False)
 
     def env_in(f: _Frame) -> dict:
         """What the variables hold where the next part of f's current list runs."""
@@ -611,7 +1048,7 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
     def part(f: _Frame, after: dict, op: str) -> None:
         """A part of f's current list has run and left the variables as after; op follows it."""
         start = env_in(f)
-        if lost or f.kind in _CONDITIONAL:
+        if lost or f.cut or f.kind in _CONDITIONAL:
             after = _union(start, after)
         if op in ("|", "|&"):  # each part of a pipeline runs in a subshell of its own
             f.pipe = (start, after if f.pipe is None else _union(f.pipe[1], after))
@@ -634,7 +1071,11 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
 
     def finish(f: _Frame, op: str) -> None:
         """The command f is reading ends at op."""
+        nonlocal piped
         words, after, f.words, f.closed = f.words, f.closed, [], None
+        if silent:
+            f.head = False
+            return
         if f.head:  # words to loop over or to match, not a program
             f.head = False
             for word in words:
@@ -650,6 +1091,7 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
                 f.entry = f.env
             return
         if words:  # after a closed part, its redirections: `done > log`
+            piped = f.pipe is not None
             left = simple(words, env_in(f) if after is None else after)
             after = left if after is None else after
         if after is not None:
@@ -662,27 +1104,35 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
             part(f, env_in(f), ";")
 
     def open_(kind: str) -> None:
+        nonlocal defining, silent
         f = frames[-1]
         frames.append(_Frame(kind, env_in(f) if f.closed is None else f.closed))
+        if defining is not None:
+            frames[-1].function, frames[-1].at, defining = defining, i - 1, None
+            silent += 1
 
     def close(kind: str) -> None:
-        nonlocal lost
+        nonlocal lost, silent
         f = frames[-1]
         settle(f)
         if f.kind != kind:
             lost = True
             return
         frames.pop()
-        if kind != "<(":  # a <( ... ) runs beside the command it is in, which goes on
+        if f.function is not None:  # defining a function runs nothing; its body is read where it is called (#60)
+            silent -= 1
+            ctx.define(f.function, toks[f.at:i], runs)
+            frames[-1].closed = f.start
+        elif kind != "<(":  # a <( ... ) runs beside the command it is in, which goes on
             frames[-1].closed = _union(f.start, f.env)
 
     def again(f: _Frame) -> bool:
         """At the `done` of loop f. When a pass may leave a value that the pass after it begins
-        with and this one did not, the loop is read again from its first word with that value
-        too (#56), and whatever was read in it is read anew. True if it is."""
+        with and this one did not, or defines a function, the loop is read again from its first
+        word with that (#56), and whatever was read in it is read anew. True if it is."""
         nonlocal i, carry, passes
         settle(f)
-        if not _grows(f.env, f.entry):
+        if silent or (not _grows(f.env, f.entry) and ctx.defined == f.defined):
             return False
         passes += 1
         if passes > _PASSES:
@@ -692,14 +1142,25 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
         carry, i = (f.at, f.env), f.at
         return True
 
+    def leave(word: str) -> None:
+        """return, break, continue, exit: what follows them in the frames they leave may not run."""
+        for f in reversed(frames):
+            f.cut = True
+            if (word in ("break", "continue") and f.kind == "loop") or (word == "exit" and f.kind == "("):
+                break
+
     def operator(op: str) -> None:
+        nonlocal i, defining
         f = frames[-1]
         if f.case == "pattern":
             if op == ")":
                 f.case = "arm"
             return  # `(` may begin a pattern, `|` joins two, and a line break ends none
-        if op == "(":
-            finish(f, ";")  # `f()`: the name of a function
+        if op == "(" and len(f.words) == 1 and not f.head and toks[i:i + 1] == [")"] and toks[i].op:
+            defining, f.words = f.words[0], []  # `f()`: a function, and its body comes next
+            i += 1
+        elif op == "(":
+            finish(f, ";")
             open_("(")
         elif op == ")":
             close("<(" if f.kind == "<(" else "(")
@@ -709,108 +1170,253 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
         else:
             finish(f, op)
 
-    def simple(words: list[str], start: dict) -> dict:
+    def assign(word: _Token, env: dict, expand: bool) -> tuple[str, tuple]:
+        """NAME=VALUE, NAME+=VALUE, NAME[I]=VALUE, NAME=(A B): the name, and the values it may
+        hold after. What it is given is a path the command names: a program fed from elsewhere may
+        be given it (_note_paths)."""
+        name, index, plus, value = _ASSIGN_PARTS.fullmatch(word).groups()
+        if word.array is not None:
+            for element in word.array:
+                substitutions(element, env)
+            values = tuple(dict.fromkeys(r[0] for e in word.array for r in _readings([e], env))) or ("",)
+        else:
+            if expand:
+                substitutions(value, env)
+            values = tuple(dict.fromkeys(r[0] for r in _readings([value], env)))
+        for v in values:
+            _note_paths(v.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
+        if plus and not index and word.array is None:  # p+=x: x after each value p may hold, and after ${p}
+            values = tuple(dict.fromkeys((old if old is not None else "${" + name + "}") + v
+                                         for old in _values(env, name) for v in values))
+        elif index or plus:  # one element, or more: the others are still there
+            values = _merge(_values(env, name), values)
+        return name, values
+
+    def declare(command: list[_Token], env: dict) -> dict | None:
+        """export, declare, local, readonly, typeset: the variables they set, whose values are
+        expanded before they run, and with `builtin` or `command` in front of them. A name
+        reference (-n) the command cannot be read with."""
+        k = 0
+        while k + 1 < len(command) and command[k].plain and command[k] in ("builtin", "command"):
+            k += 1
+        builtin = command[k]
+        if not (builtin.plain and builtin in _DECLARE):
+            return None
+        declared = {}
+        for word in command[k + 1:]:
+            if word.startswith(("-", "+")) and word.array is None:
+                if builtin != "export" and "n" in word[1:]:
+                    raise ValueError("a name reference")
+                if "f" in word[1:] or "F" in word[1:]:
+                    return declared  # functions, not variables
+            elif word.array is not None or _ASSIGN_PARTS.fullmatch(word):
+                name, values = assign(word, env, False)
+                declared[name] = values
+            elif builtin in ("local", "declare", "typeset") and re.fullmatch(r"[A-Za-z_]\w*", word):
+                declared[word] = _merge(_values(env, word), (None,))  # in a function: a variable of its own
+        return declared
+
+    def sets(argv: list[str], env: dict) -> dict:
+        """read, mapfile, getopts, printf -v, unset: variables given values the command does not show."""
+        program, args = argv[0], argv[1:]
+        if program == "unset" and "-f" in args:
+            return env
+        if program in ("mapfile", "readarray") and any(a.startswith("-") and "C" in a for a in args):
+            raise ValueError("a callback the shell runs")
+        names = [a for a in args if re.fullmatch(r"[A-Za-z_]\w*", a)]
+        if program == "printf":
+            names = [a[2:] or (args[k + 1] if k + 1 < len(args) else "") for k, a in enumerate(args) if a.startswith("-v")]
+        elif program in ("mapfile", "readarray"):
+            names = names[-1:] or ["MAPFILE"]
+        elif program == "getopts":
+            names = args[1:2]
+        elif program == "read":
+            names = names or ["REPLY"]
+        env = dict(env)
+        for name in names:
+            env[name] = (None,) if program == "unset" else _merge(_values(env, name), (None,))
+        return env
+
+    def trap(args: list[str], env: dict) -> None:
+        """trap TEXT SIGNALS: TEXT runs later, and is read later (_Context.run_traps)."""
+        if args[:1] == ["--"]:
+            args = args[1:]
+        if len(args) < 2 or args[0] in ("", "-", "-p", "-l"):
+            return
+        key = (args[0].replace(_LITERAL, "$"), depth)
+        signals = {s.upper().removeprefix("SIG") for s in args[1:]}
+        held = ctx.traps.get(key)
+        ctx.traps[key] = [_union(held[0], env), held[1] | signals] if held else [env, signals]
+
+    def call(name: str, env: dict) -> dict:
+        """A function runs its body in this shell, with what the variables hold where it is
+        called (#60). What it sets may stay after it, beside what they held before."""
+        if len(ctx.calls) >= _CALLS:
+            raise ValueError("functions that call each other deeper than can be read")
+        body, body_runs = ctx.functions[name]
+        ctx.calls.append(name)
+        ctx.called.add(name)
+        try:
+            return _union(env, _walk(body, body_runs, ctx, env, depth))
+        finally:
+            ctx.calls.pop()
+
+    def simple(words: list[_Token], start: dict) -> dict:
         """One simple command, read once for each combination of the values its variables may
-        hold. Returns what they hold after it."""
-        n = 0
-        while n < len(words) and _ASSIGN.fullmatch(words[n]):
-            n += 1
-        rest = words[n:]
-        for word in rest:  # the shell expands these first, with what the variables held before
-            substitutions(word, start)
-        scope = dict(start) if n else start  # what the command itself is run with
-        for word in words[:n]:  # then these in turn: after `a=1 b=$a`, b is 1, and in b=$(...) too (#55)
-            name, value = _ASSIGN.fullmatch(word).groups()
-            substitutions(value, scope)
-            scope[name] = tuple(dict.fromkeys(r[0] for r in _readings([value], scope)))
-        after = scope if not rest or rest[0].startswith("#") else start  # p=x on its own, or before a comment
-        evaluated = []
-        for argv in _readings(rest, start, scope) if rest else []:
-            if n and os.path.basename(argv[0]) in _SPECIAL_BUILTINS:
-                after = _union(start, scope)
-            fed = False
-            while argv and os.path.basename(argv[0]) in _WRAPPERS:
-                wrapper = os.path.basename(argv.pop(0))
-                fed = fed or wrapper == "xargs"
-                while argv and (argv[0].startswith("-") or argv[0].replace(".", "").isdigit()
-                                or argv[0] == "{}" or _ASSIGN.fullmatch(argv[0])):
-                    option = argv.pop(0)
-                    if len(option) == 2 and option[0] == "-" and option[1] in _WRAPPERS[wrapper] and argv:
-                        value = argv.pop(0)  # sudo -u root, timeout -s KILL, env -C dir
-                        if (wrapper, option[1]) in _WRAPPER_CHDIR:
-                            out.dirs.extend([canonical(value, d) for d in out.dirs[:8]])
-                    elif len(option) > 2 and option[0] == "-" and option[1] != "-" and \
-                            (wrapper, option[1]) in _WRAPPER_CHDIR:
-                        out.dirs.extend([canonical(option[2:], d) for d in out.dirs[:8]])
-            if argv:
-                evaluated.append(_program(argv, fed, scope))
-        evaluated = [e for e in evaluated if e is not None]
-        if evaluated:  # eval runs its text in this shell
-            after = _union(*evaluated, *([start] if n else []))
+        hold. Returns what they hold after it: ${p:=x} in it may give p the value x."""
+        after = command_(words, start)
+        for name, value in {m.groups() for word in words for m in _DEFAULT.finditer(word)}:
+            plain = not re.search(r"[$`\\'\"" + _LITERAL + _MARK + "]", value)
+            after = {**after, name: _merge(_values(after, name), (value if plain else None,))}
         return after
 
-    def _program(argv: list[str], fed: bool, scope: dict) -> dict | None:
-        """Record one program. For eval, returns what the variables hold after the text it runs."""
-        fed = fed or any("$" in a for a in argv[1:])  # a $ in single quotes is text, not a value
-        argv = [a.replace(_LITERAL, "$") for a in argv]
-        out.programs.append(argv)
+    def command_(words: list[_Token], start: dict) -> dict:
+        for held in ctx.traps.values():  # a trap set before may run while this does
+            held[0] = _union(held[0], start)
+        assigns, command, redirects = _parts(words)
+        for word in command:  # the shell expands these first, with what the variables held before
+            substitutions(word, start)
+        scope = dict(start) if assigns else start  # what the command itself is run with
+        for word in assigns:  # then these in turn: after `a=1 b=$a`, b is 1, and in b=$(...) too (#55)
+            name, values = assign(word, scope, True)
+            scope[name] = values
+        # A redirection, bash expands after the assignments of a command without a program, dash before.
+        late = _union(start, scope) if assigns and redirects else start
+        for word in redirects:
+            substitutions(word, late)
+        if not command:  # p=x, p=x >f, >f p=x: the assignments stay in this shell (#57)
+            for argv in _readings(redirects, late) if redirects else []:
+                _program(argv, False, scope, lambda: scope)
+            return scope
+        declared = declare(command, start)
+        made = []
+
+        def child() -> dict:  # what a program the command starts finds in its environment
+            if not made:
+                made.append(_exported(scope, {_ASSIGN_PARTS.fullmatch(w).group(1) for w in assigns}))
+            return made[0]
+        envs = [start] * len(command) + [late] * len(redirects)
+        return _union(*[run(argv, start, scope, child, declared, bool(assigns))
+                        for argv in _readings(command + redirects, start, envs)])
+
+    def run(argv: list[str], start: dict, scope: dict, child, declared: dict | None, prefixed: bool) -> dict:
+        """One reading of a simple command: what the variables hold after it."""
+        while len(argv) > 1 and argv[0] == "":  # a variable that holds nothing, unquoted, is no word
+            argv = argv[1:]
+        name, after = argv[0], start
+        if prefixed and os.path.basename(name) in _SPECIAL_BUILTINS:
+            after = _union(start, scope)
+        if declared is not None:
+            after = {**after, **declared}
+        elif name in _SETS:
+            after = sets(argv, after)
+        elif name in _LEAVES:
+            leave(name)
+        elif name == "trap":
+            trap(argv[1:], start)
+        if name in ctx.functions:
+            after = _union(after, call(name, scope))
+        elif "$" in name:  # a program picked at run time may be any of the functions
+            for other in [f for f in ctx.functions if f not in ctx.calls]:
+                after = _union(after, call(other, scope))
+        argv, fed, child = _unwrap(argv, child, out)
+        if argv:
+            evaluated = _program(argv, fed, scope, child)
+            if evaluated is not None:  # eval runs its text in this shell
+                after = _union(evaluated, start) if prefixed else evaluated
+        return after
+
+    def nest(text: str, env: dict) -> dict:
+        if depth >= _DEPTH:
+            raise ValueError("shells inside shells deeper than can be read")
+        return _read(text, ctx, env, depth + 1)
+
+    def _program(argv: list[str], fed: bool, scope: dict, child) -> dict | None:
+        """Record one program. For eval, returns what the variables hold after the text it runs.
+        A shell it starts (bash -c) is read with child(), what that shell finds in its environment."""
+        fed = fed or any("$" in a for a in argv)  # a $ in single quotes (_LITERAL) is text, not a value
+        raw = [a.replace(_LITERAL, "$") for a in argv]
+        operands = raw[1:]  # up to its redirections, which _parts puts after its words
+        for k, a in enumerate(operands):
+            if _REDIRECTION.fullmatch(a) or (_FD.fullmatch(a) and _REDIRECTION.fullmatch((operands[k + 1:] or [""])[0])):
+                operands = operands[:k]
+                break
+        if piped and _INTERPRETER.fullmatch(os.path.basename(raw[0])) and \
+                all(a.startswith("-") and a not in ("-c", "-e", "-E", "-m", "-r") for a in operands):
+            fed = True  # `echo '...' | python3`: its program, and the paths in it, come through the pipe
+        out.programs.append(raw)
         out.program_fed.append(fed)
         out.program_dirs.append(list(out.dirs))
         paths: set[str] = set()
         globs: list[str] = []
         out.program_paths.append(paths)
         out.program_globs.append(globs)
-        program = os.path.basename(argv[0])
+        program = os.path.basename(raw[0])
         for i, arg in enumerate(argv[1:], 1):
-            _note_paths(arg, out.dirs, paths, globs)
-            if ">" in argv[i - 1] and set(argv[i - 1]) <= _REDIRECT_CHARS and not (
-                    argv[i - 1].endswith("&") and (arg.isdigit() or arg == "-")):  # 2>&1 writes no file
-                for target in expand_braces(arg):
+            for text in _wider(arg, scope):
+                _note_paths(text, out.dirs, paths, globs)
+            if ">" in raw[i - 1] and set(raw[i - 1]) <= _REDIRECT_CHARS and not (
+                    raw[i - 1].endswith("&") and (raw[i].isdigit() or raw[i] == "-")):  # 2>&1 writes no file
+                for target in expand_braces(raw[i]):
                     out.writes.update(resolve(target, out.dirs))
         out.paths |= paths
         out.globs += globs
         if program == "cd":
-            targets = [a for a in argv[1:] if not a.startswith("-")][:1] or \
+            targets = [a for a in raw[1:] if not a.startswith("-")][:1] or \
                 [home for home in _values(scope, "HOME") if home is not None]
             out.dirs.extend([canonical(t, d) for t in targets for d in out.dirs[:8]])
-        if depth >= 3:
-            return None
+        if program in _SHELLS and piped and not any(re.fullmatch(r"-\w*c", a) for a in raw[1:]):
+            raise ValueError("a shell that reads its commands from a pipe")  # `echo 'rm ...' | bash`
         if program in _TAKES_COMMAND:
-            for i, arg in enumerate(argv[1:], 1):
+            shell_env = _reset(child()) if program == "su" else child()
+            for i, arg in enumerate(raw[1:], 1):
                 # the string after -c, and for a shell any argument with spaces in it: a script
                 # given as a here-document arrives that way. A shell of its own: what it sets stays there.
-                if re.fullmatch(r"-\w*c", argv[i - 1]) or (program in _SHELLS and re.search(r"\s", arg)):
-                    _read(arg, out, scope, depth + 1)
+                if re.fullmatch(r"-\w*c", raw[i - 1]) or (program in _SHELLS and re.search(r"\s", arg)):
+                    nest(arg, shell_env)
         elif program == "eval":
-            return _read(" ".join(argv[1:]), out, scope, depth + 1)
+            return nest(" ".join(raw[1:]), scope)
         elif program == "find":
             for i, arg in enumerate(argv):
                 if arg in ("-exec", "-execdir", "-ok", "-okdir"):
                     rest = argv[i + 1:]
                     end = next((j for j, a in enumerate(rest) if a in (";", "+", "\\;")), len(rest))
                     if rest[:end]:
-                        _program(rest[:end], False, scope)
+                        _program(rest[:end], False, scope, child)
         return None
 
-    while i < len(words_of):
-        token = words_of[i]
+    while i < len(toks):
+        token = toks[i]
         i += 1
-        if token and set(token) <= _SEPARATORS:
-            for op in _operators(token):
-                operator(op)
+        ctx.work += 1
+        if ctx.work > _WORK:
+            raise ValueError("more to read than can be read")
+        if defining is not None and not ((token.op and token in (";", "(")) or (token.plain and token in _BODIES)):
+            raise ValueError("a function whose body cannot be read")
+        if token.op and token in _LIST_OPS:
+            operator(token)
             continue
         f = frames[-1]
-        token = token.strip("`")
         if f.case == "pattern":
             substitutions(token, env_in(f))
-            if token == "esac":
+            if token == "esac" and token.plain:
                 close("case")
             continue  # a pattern is matched against, not run
-        if f.case == "head" and token == "in":
+        if f.case == "head" and token == "in" and token.plain:
             f.words.append(token)
             finish(f, ";")
             f.case = "pattern"
-        elif not f.words and (token in _KEYWORDS or token in _HEADS):
+        elif not f.words and token.plain and token == "function" and i < len(toks):
+            defining, i = toks[i], i + 1  # function NAME [()] BODY
+            if toks[i:i + 2] == ["(", ")"] and toks[i].op:
+                i += 2
+        elif not f.words and token.plain and token == "coproc":  # coproc [NAME] COMMAND, in the background
+            if len(toks) > i + 1 and not toks[i].op and toks[i + 1] in ("{", "(") and (toks[i + 1].plain or toks[i + 1].op):
+                i += 1
+        elif not f.words and token.plain and token == "time":
+            if toks[i:i + 1] == ["-p"]:  # bash's own: `time p=x` sets p, as `p=x` does
+                i += 1
+        elif not f.words and token.plain and (token in _KEYWORDS or token in _HEADS):
             finish(f, ";")  # what was closed before it: `{ a; } then`
             if token == "done" and frames[-1].kind == "loop" and again(frames[-1]):
                 continue
@@ -822,7 +1428,7 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
                     open_(_OPENS[token])
                     if _OPENS[token] == "loop":
                         loop = frames[-1]
-                        loop.at, loop.snapshot = i - 1, snapshot
+                        loop.at, loop.snapshot, loop.defined = i - 1, snapshot, ctx.defined
                         if carry and carry[0] == loop.at:
                             loop.start = loop.env = loop.entry = _union(loop.start, carry[1])
                             carry = None
@@ -831,8 +1437,8 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> dict:
                     frames[-1].head = True
                 if token == "case":
                     frames[-1].case = "head"
-        elif token in ("<(", ">("):  # the program is given a file that the commands in it write or read
-            f.words.append("/dev/fd/63")
+        elif token.op and token in ("<(", ">("):  # the program is given a file that the commands in it write or read
+            f.words.append(_token("/dev/fd/63", "/dev/fd/63", plain=True))
             open_("<(")
         else:
             f.words.append(token)

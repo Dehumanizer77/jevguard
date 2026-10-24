@@ -801,3 +801,162 @@ def test_a_loop_is_read_with_what_its_passes_leave(guard):
     assert c.programs == [["test", "-f", "x"], ["rm", "a"], ["rm", "b"], ["rm", "a"], ["rm", "b"]]
     # what keeps growing does not settle
     assert "could not be read" in _reason(guard, 'p=x; for f in a b; do p="$p/$f"; done; rm -rf "$p"')
+
+
+def _rm_in_bash(tmp_path, cmd) -> set:
+    """What `rm -rf` is given when bash runs cmd, with rm swapped for a program that only writes
+    its arguments down. The reader has to see every one of them."""
+    stub, log, work = tmp_path / "bin" / "zap", tmp_path / "zap.log", tmp_path / "work"
+    if not stub.exists():
+        stub.parent.mkdir()
+        stub.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a" >> "$ZAPLOG"; done\n')
+        stub.chmod(0o755)
+        work.mkdir()
+    swapped = cmd.replace("rm -rf", "zap -rf")
+    assert "rm " not in swapped, cmd
+    log.unlink(missing_ok=True)
+    subprocess.run(["bash", "-c", swapped], cwd=work, capture_output=True, timeout=10,
+                   env={**os.environ, "PATH": f"{stub.parent}:{os.environ['PATH']}", "ZAPLOG": str(log)})
+    return set(log.read_text().split()) - {"-rf"} if log.exists() else set()
+
+
+def _asked_like_bash(guard, tmp_path, cmd):
+    """bash gives rm .claude; the reader gives it .claude too, or a value it cannot tell, and
+    the real hook asks about .claude (the question names the first program given it)."""
+    assert ".claude" in _rm_in_bash(tmp_path, cmd), cmd
+    c = shell.read(cmd, "/work")
+    assert any(".claude" in argv or fed for argv, fed in zip(c.programs, c.program_fed) if argv[0] == "rm"), cmd
+    assert ".claude" in _reason(guard, cmd), cmd
+
+
+def test_redirections_do_not_make_a_program_of_assignments(guard, tmp_path):
+    """#57: a redirection was taken for the program, so `p=x >f` set p for that program only,
+    and an assignment after it was an argument, its $(...) read with what p held before. The
+    shell sets p in both; a redirection may stand before, between and after assignments. A
+    quoted or escaped `p=x`, and an assignment before a word like `2 >f`, make a program."""
+    for cmd in ('p=notes; p=.claude > /dev/null; rm -rf "$p"', 'p=notes; p=.claude > /dev/null q="$(rm -rf "$p")"',
+                'p=notes; > /dev/null p=.claude; rm -rf "$p"', 'p=notes; p=.claude 2>/dev/null; rm -rf "$p"',
+                'p=notes; p=.claude 2>&1 >/dev/null q=$(rm -rf "$p")', 'p=notes; p=.claude {fd}>/dev/null; rm -rf "$p"',
+                'p=notes; p=.claude <<EOF\nx\nEOF\nrm -rf "$p"', 'p=notes; p=.claude <<< x; rm -rf "$p"',
+                'p=notes; time p=.claude; rm -rf "$p"', 'p=notes; true;>/dev/null p=.claude; rm -rf "$p"',
+                "p=.claude; 'p=notes' 2>/dev/null; rm -rf \"$p\"", 'p=.claude; p\\=notes 2>/dev/null; rm -rf "$p"',
+                'p=.claude; p=notes 2 >/dev/null; rm -rf "$p"',
+                "p=notes; for i in 1 2; do rm -rf \"$p\"; 'done' 2>/dev/null; p=.claude; done"):
+        _asked_like_bash(guard, tmp_path, cmd)
+    for cmd in ('p=.claude; p=notes 2>/dev/null; rm -rf "$p"', 'p=.claude; >/dev/null p=notes q=1; rm -rf "$p"',
+                'p=.claude; p=notes >/dev/null q="$(rm -rf "$p")"', 'p=notes; p=.claude >/dev/null rm -rf "$p"'):
+        assert _rm_in_bash(tmp_path, cmd) <= {"notes"} and _reason(guard, cmd) == "", cmd
+
+    def rm(cmd):
+        return [argv for argv in shell.read(cmd, "/w").programs if argv[0] == "rm"]
+    assert rm('p=a; p=b >/dev/null; rm "$p"') == rm('p=a; >/dev/null p=b; rm "$p"') == [["rm", "b"]]
+    assert rm('p=a; p=b >f q=$(rm "$p")') == [["rm", "b"]]
+    assert rm('p=a; p=b >/dev/null rm "$p"') == [["rm", "a", ">", "/dev/null"]]  # a prefix, its word expanded first
+    assert rm("p=a; 'p=b'; rm \"$p\"") == rm('p=a; p=b 2 >/dev/null; rm "$p"') == [["rm", "a"]]
+    # the redirection is still written to
+    c = shell.read("p=b >/w/f", "/w")
+    assert c.programs == [[">", "/w/f"]] and c.writes == {"/w/f"}
+
+
+def test_text_a_shell_reads_later_is_read_with_its_variables(guard, tmp_path):
+    """#58: a $ in single quotes was filled in with what the variable held in the command around
+    it, so that `bash -c 'p=.claude; rm "$p"'` was read as removing what p held outside. The text
+    is read as the shell that runs it reads it: with its own assignments, loops and conditions,
+    and with what it finds in its environment. A variable the command set is there only when it
+    is exported to it (`p=x bash -c ...`); otherwise it may not be set."""
+    for cmd in ("p=notes; bash -c 'p=.claude; rm -rf \"$p\"'", "p=notes; eval 'p=.claude; rm -rf \"$p\"'",
+                "p=notes; bash -c 'for p in .claude; do rm -rf \"$p\"; done'", "p=notes; sh -c 'p=.claude; rm -rf \"$p\"'",
+                'p=notes; bash -c "p=.claude; rm -rf \\"\\$p\\""', 'p=notes; eval "p=.claude; rm -rf \\$p"',
+                "p=notes; bash -c 'bash -c '\"'\"'p=.claude; rm -rf \"$p\"'\"'\"",
+                "p=notes; bash <<'EOF'\np=.claude; rm -rf \"$p\"\nEOF", "p=notes; p=.claude bash -c 'rm -rf \"$p\"'",
+                "p=notes; bash -c 'p=.claude; echo \"$(rm -rf \"$p\")\"'", "p=notes; eval 'p=.claude; q=$(rm -rf \"$p\")'"):
+        _asked_like_bash(guard, tmp_path, cmd)
+    for cmd in ("p=.claude; bash -c 'p=notes; rm -rf \"$p\"'", "p=.claude; eval 'p=notes; rm -rf \"$p\"'",
+                "awk '{print $1}' notes.txt"):
+        assert ".claude" not in _rm_in_bash(tmp_path, cmd) and _reason(guard, cmd) == "", cmd
+
+    def rm(cmd):
+        return [argv for argv in shell.read(cmd, "/w").programs if argv[0] == "rm"]
+    assert rm("p=a; bash -c 'p=b; rm \"$p\"'") == rm("p=a; bash -c \"p=b; rm \\\"\\$p\\\"\"") == [["rm", "b"]]
+    assert rm("p=a; eval 'p=b; rm \"$p\"'; rm \"$p\"") == [["rm", "b"], ["rm", "b"]]  # eval runs in this shell
+    assert rm("p=a; bash -c 'rm \"$p\"'") == [["rm", "a"], ["rm", "$p"]]  # not exported: it may not be set
+    assert rm("p=a; p=b bash -c 'rm \"$p\"'") == [["rm", "b"]]
+    assert shell.read("bash -c 'p=b; rm \"$p\"'", "/w").programs[0] == ["bash", "-c", 'p=b; rm "$p"']
+    # what a shell is handed through a pipe cannot be read; an interpreter is given what the command names
+    assert "could not be read" in _reason(guard, "echo 'rm -rf .claude' | bash")
+    home = os.path.expanduser("~")
+    assert "`python3`" in _reason(guard, f"echo 'import shutil; shutil.rmtree(\"{home}/.claude\")' | python3")
+    assert _reason(guard, "cat ~/.claude/settings.json | python3 -c 'import json, sys; print(json.load(sys.stdin))'") == ""
+
+
+def test_env_gives_the_program_its_variables(guard, tmp_path):
+    """#59: env's NAME=VALUE operands were dropped, and the shell it started was read with what
+    the variables held in the command around it. They are now the program's, with -i, -u, -S
+    and `--` as env has them, and stay out of the command around it; sudo p=x the same. An env
+    option this does not know may change what runs, and cannot be read."""
+    for cmd in ("p=notes; env p=.claude bash -c 'rm -rf \"$p\"'", "env p=.claude bash -c 'rm -rf \"$p\"'",
+                "p=notes; env p=.claude sh -c 'rm -rf \"$p\"'", "p=notes; env q=1 p=.claude bash -c 'rm -rf \"$p\"'",
+                "p=notes; env -u q p=.claude bash -c 'rm -rf \"$p\"'", "p=notes; env -- p=.claude bash -c 'rm -rf \"$p\"'",
+                "p=notes; env -i p=.claude PATH=\"$PATH\" ZAPLOG=\"$ZAPLOG\" bash -c 'rm -rf \"$p\"'",
+                "p=notes; env p=.claude env bash -c 'rm -rf \"$p\"'", "p=notes; nice env p=.claude bash -c 'rm -rf \"$p\"'",
+                "watch -n1 -t -g 'rm -rf .claude'"):
+        if not cmd.startswith("watch"):
+            assert ".claude" in _rm_in_bash(tmp_path, cmd), cmd
+        r = _reason(guard, cmd)
+        assert "`rm`" in r and ".claude" in r, (cmd, r)
+    assert "`rm`" in _reason(guard, "p=notes; sudo p=.claude bash -c 'rm -rf \"$p\"'")
+    for cmd in ("p=.claude; env p=notes bash -c 'rm -rf \"$p\"'", "p=notes; env p=.claude true; rm -rf \"$p\""):
+        assert ".claude" not in _rm_in_bash(tmp_path, cmd) and _reason(guard, cmd) == "", cmd
+    for cmd in ("env --frobnicate p=.claude bash -c 'rm -rf \"$p\"'", "env -S 'p=$q bash -c \"rm -rf .claude\"'"):
+        assert "could not be read" in _reason(guard, cmd), cmd
+
+    def rm(cmd):
+        return [argv for argv in shell.read(cmd, "/w").programs if argv[0] == "rm"]
+    assert rm("p=a; env p=b bash -c 'rm \"$p\"'; rm \"$p\"") == [["rm", "b"], ["rm", "a"]]
+    assert rm("env -i p=b bash -c 'rm \"$p\" \"$HOME\"'") == [["rm", "b", "$HOME"]]  # nothing else is set
+    assert shell.read("env -S 'rm -rf x'", "/w").programs == [["rm", "-rf", "x"]]
+
+
+def test_a_function_is_read_where_it_is_called(guard, tmp_path):
+    """#60: a function body was read where it was defined, with what the variables held there.
+    It runs where it is called: it is read there, each time, with what they hold then, and what
+    it sets may stay after it. A call the command does not show (a name made at run time, eval)
+    reads it as well, and one defined and not called is read once at the end. Calls deeper than
+    _CALLS cannot be read."""
+    for cmd in ('p=notes; f() { rm -rf "$p"; }; p=.claude; f', 'p=notes; function f { rm -rf "$p"; }; p=.claude; f',
+                'p=notes; function f() { rm -rf "$p"; }; p=.claude; f', 'p=notes; f() ( rm -rf "$p" ); p=.claude; f',
+                'p=notes; f() { rm -rf "$p"; }; f; p=.claude; f', 'f() { rm -rf "$p"; }; g() { p=.claude; f; }; p=notes; g',
+                'f() { p=.claude; }; p=notes; f; rm -rf "$p"', 'f() { local p=.claude; rm -rf "$p"; }; p=notes; f',
+                'p=.claude; f() { true && return; p=notes; }; f; rm -rf "$p"',
+                'p=notes; f() { rm -rf "$p"; }; x=f; p=.claude; $x', 'p=notes; f() { rm -rf "$p"; }; p=.claude; eval f',
+                'p=notes; f() { rm -rf "$p"; }; p=.claude; time f', "p=notes; trap 'rm -rf \"$p\"' EXIT; p=.claude",
+                'p=notes; f() {\n  rm -rf "$p"\n}\np=.claude\nf'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    for cmd in ('p=.claude; f() { rm -rf "$p"; }; p=notes; f', 'f() { local p=notes; rm -rf "$p"; }; p=.claude; f',
+                'log() { echo "$*"; }; log start; make; log done'):
+        assert ".claude" not in _rm_in_bash(tmp_path, cmd) and _reason(guard, cmd) == "", cmd
+    assert "`rm`" in _reason(guard, "f() { rm -rf ~/.claude; }")  # defined, and may be called unseen
+
+    def rm(cmd):
+        return [argv for argv in shell.read(cmd, "/w").programs if argv[0] == "rm"]
+    assert rm('p=a; f() { rm "$p"; }; p=b; f; p=c; f') == [["rm", "b"], ["rm", "c"]]
+    assert rm('f() { p=b; }; p=a; f; rm "$p"') == [["rm", "a"], ["rm", "b"]]
+    for cmd in ("f() { f; }; f", "f() echo hi", "trap 'p=.claude' INT; rm -rf \"$p\""):
+        assert "could not be read" in _reason(guard, cmd), cmd
+
+
+def test_other_ways_to_give_a_variable_a_value(guard, tmp_path):
+    """Beside NAME=VALUE: export, declare, local and readonly (with builtin or command in front),
+    arrays, +=, an element, ${p:-x} and ${p:=x}, and ${p%x} and the like on a value the command
+    set. read and printf -v give a value the command does not show; a name reference cannot be
+    read."""
+    for cmd in ('p=notes; export p=.claude; rm -rf "$p"', 'p=notes; declare p=.claude; rm -rf "$p"',
+                'p=notes; builtin export p=.claude; rm -rf "$p"', 'p=notes; command export p=.claude; rm -rf "$p"',
+                'p=(.claude); rm -rf "$p"', 'p=(notes .claude); rm -rf "${p[1]}"', 'p=.cl; p+=aude; rm -rf "$p"',
+                'p=notes; p[0]=.claude; rm -rf "$p"', 'rm -rf "${x:-.claude}"', 'p=; : "${p:=.claude}"; rm -rf "$p"',
+                'p=.claudeX; rm -rf "${p%X}"', 'p=.cXaude; rm -rf "${p/X/l}"', 'p=.CLAUDE; rm -rf "${p,,}"',
+                'p=notes; read p <<< .claude; rm -rf "$p"', 'p=notes; printf -v p %s .claude; rm -rf "$p"'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    for cmd in ('for f in *.txt; do mv "$f" "${f%.txt}.md"; done', 'x=${1:-default}; echo "$x"'):
+        assert _reason(guard, cmd) == "", cmd
+    assert "could not be read" in _reason(guard, 'q=.claude; declare -n p=q; rm -rf "$p"')
