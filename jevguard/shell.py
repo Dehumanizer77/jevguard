@@ -2,8 +2,9 @@
 
 This is pattern reading, not a shell. It follows what a command says in plain sight: programs,
 their arguments, `cd`, variables assigned in the same command, `bash -c '...'`, `find -exec`,
-redirections, globs. It cannot follow a script that opens a file, an alias, or a value computed
-at run time; `Command.dynamic` says when part of the command is of that kind.
+command substitutions, redirections, globs. It cannot follow a script that opens a file, an
+alias, or a value computed at run time; `Command.dynamic` says when part of the command is of
+that kind.
 """
 
 from __future__ import annotations
@@ -167,31 +168,55 @@ def glob_reaches_above(pattern: str, path: str) -> bool:
 
 
 _HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_]\w*)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
-_SUBSTITUTION = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
-
-
 def _inline_heredocs(cmd: str) -> str:
     """`python3 - <<'EOF' ... EOF` as `python3 - '...'`. A here-document is text handed to the
     program, not shell: read line by line as commands, its first word of each line would be
     taken for a program and the paths it names would be lost. With an unquoted marker the shell
-    still runs the $(...) inside it, so those are kept as commands."""
+    still runs the $(...) and `...` inside it, so those follow the text as words of their own,
+    where _read reads them as it reads any other."""
     def inline(m: re.Match) -> str:
         body, rest = m.group(4), m.group(3)
-        runs = "" if m.group(1) else "".join(f" ; {a or b}" for a, b in _SUBSTITUTION.findall(body))
-        return f" {shlex.quote(body)} {rest}{runs}"
+        runs = "" if m.group(1) else "".join(f" {run}" for run in _substitutions_in(body))
+        return f" {shlex.quote(body)}{runs} {rest}"
     return _HEREDOC.sub(inline, cmd)
 
 
 # A $ the shell takes as it is, in single quotes ('$1' in awk, $8924 in a quoted here-document).
 # It stands in the words until a program's arguments are known, and is then a $ again.
 _LITERAL = "\0"
+# Marks where the output of a command substitution goes: $\x01<n>\x01 for the nth of a command.
+_MARK = "\x01"
+_RUN = re.compile(_MARK + r"(\d+)" + _MARK)
+_WORD_BREAKS = set(" \t\n;&|()<>")
+_OPERATORS = (";;&", ";;", ";&", "&&", "||", "|&", ";", "&", "|")
+# Words after which the next one is again in the place of a command.
+_BEFORE_COMMAND = {"if", "then", "else", "elif", "while", "until", "do", "!", "{", "time"}
 
 
-def _backtick_end(cmd: str, i: int) -> int:
+def _substitutions_in(text: str) -> list[str]:
+    """The $(...) and `...` in the text of a here-document whose marker is not quoted, as written."""
+    found, i = [], 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text.startswith("$(", i) or text[i] == "`":
+            end = _substitution_end(text, i + 2) if text[i] == "$" else _escaped_end(text, i + 1, "`")
+            if end < 0:
+                raise ValueError("a command substitution that does not end")
+            found.append(text[i:end + 1])
+            i = end
+        i += 1
+    return found
+
+
+def _escaped_end(cmd: str, i: int, close: str) -> int:
+    """Where the backtick that ends `...`, or the quote that ends $'...', is: only a backslash
+    escapes it."""
     while i < len(cmd):
         if cmd[i] == "\\":
             i += 1
-        elif cmd[i] == "`":
+        elif cmd[i] == close:
             return i
         i += 1
     return -1
@@ -206,17 +231,15 @@ def _double_quote_end(cmd: str, i: int) -> int:
         elif cmd.startswith("$(", i):
             i = _substitution_end(cmd, i + 2)
         elif cmd[i] == "`":
-            i = _backtick_end(cmd, i + 1)
+            i = _escaped_end(cmd, i + 1, "`")
         if i < 0:
             return -1
         i += 1
     return -1
 
 
-def _substitution_end(cmd: str, i: int) -> int:
-    """Where the `)` that closes a `$(` is. Inside it the shell quotes afresh, so a `"` there
-    opens a string of its own and does not close the one around the `$(`."""
-    depth = 1
+def _brace_end(cmd: str, i: int) -> int:
+    """Where the `}` that closes a `${` is: `${x:-)}` holds a `)` that closes nothing."""
     while i < len(cmd):
         ch = cmd[i]
         if ch == "\\":
@@ -226,62 +249,203 @@ def _substitution_end(cmd: str, i: int) -> int:
         elif ch == '"':
             i = _double_quote_end(cmd, i + 1)
         elif ch == "`":
-            i = _backtick_end(cmd, i + 1)
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if not depth:
-                return i
+            i = _escaped_end(cmd, i + 1, "`")
+        elif cmd.startswith("$(", i):
+            i = _substitution_end(cmd, i + 2)
+        elif cmd.startswith("${", i):
+            i = _brace_end(cmd, i + 2)
+        elif ch == "}":
+            return i
         if i < 0:
             return -1
         i += 1
     return -1
 
 
-def _lift_substitutions(cmd: str, depth: int = 0) -> str:
-    """`echo "n: $(grep -c "a|b" f)"` as `echo "n: $" ; grep -c "a|b" f`. The tokenizer knows
-    neither backticks nor the fresh quoting inside a `$(` in double quotes: it would pair the
-    inner quotes with the outer ones, take the `|` for a pipe and `b" f)"` for a program, and
-    not see the command at all. So each such substitution is taken out and read after the line
-    as a command of its own, with a `$` left where its output goes: the program it is given to
-    has an argument from elsewhere, as with `$(...)` outside quotes, which the tokenizer reads.
-    A `$` in single quotes becomes _LITERAL on the way."""
+def _word_end(cmd: str, i: int) -> int:
+    """Where the word that starts at i ends, the quotes and substitutions in it taken whole."""
+    while i < len(cmd) and cmd[i] not in _WORD_BREAKS:
+        ch = cmd[i]
+        if ch == "\\":
+            i += 1
+        elif ch == "'":
+            i = cmd.find("'", i + 1)
+        elif ch == '"':
+            i = _double_quote_end(cmd, i + 1)
+        elif ch == "`":
+            i = _escaped_end(cmd, i + 1, "`")
+        elif cmd.startswith("$'", i):
+            i = _escaped_end(cmd, i + 2, "'")
+        elif cmd.startswith("$(", i):
+            i = _substitution_end(cmd, i + 2)
+        elif cmd.startswith("${", i):
+            i = _brace_end(cmd, i + 2)
+        if i < 0:
+            return -1
+        i += 1
+    return i
+
+
+def _arithmetic_end(cmd: str, i: int) -> int:
+    """Where the second `)` of the `))` that closes a `$((` is, or -1. The shell takes `$((` for
+    arithmetic when a `))` closes it, and otherwise for a `$(` with a subshell in it:
+    `$((cd d; ls) )`."""
+    depth = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch == "\\":
+            i += 1
+        elif ch == "'":
+            i = cmd.find("'", i + 1)
+        elif ch == '"':
+            i = _double_quote_end(cmd, i + 1)
+        elif ch == "`":
+            i = _escaped_end(cmd, i + 1, "`")
+        elif cmd.startswith("$(", i):
+            i = _substitution_end(cmd, i + 2)
+        elif cmd.startswith("${", i):
+            i = _brace_end(cmd, i + 2)
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            if not depth:
+                return i + 1 if cmd.startswith("))", i) else -1
+            depth -= 1
+        if i < 0:
+            return -1
+        i += 1
+    return -1
+
+
+def _substitution_end(cmd: str, i: int) -> int:
+    """Where the `)` that closes a `$(` is, or -1. Inside it the shell reads commands afresh, and
+    so does this, word by word: a `"` there opens a string of its own, a `#` that begins a word
+    begins a comment to the end of the line, and in `case x in a) ...;; esac` the `)` ends a
+    pattern (#52). A `)` closes the `$(` only when nothing opened in it is still open; one that
+    fits nothing here, and a here-document (those are inlined before), give -1: the caller does
+    not guess where the command ends."""
+    if cmd.startswith("(", i):  # `$((`: arithmetic, where `<<` is a shift, when `))` closes it
+        end = _arithmetic_end(cmd, i + 1)
+        if end >= 0:
+            return end
+    open_: list[str] = []  # "(", "case" before its `in`, "pattern" and "arm" after it
+    command = True  # the next word is the first of a command, where `case` and `esac` are the shell's
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch in " \t":
+            i += 1
+        elif cmd.startswith("\\\n", i):  # the line goes on: what follows starts a word as here
+            i += 2
+        elif ch == "\n":
+            command, i = True, i + 1
+        elif ch == "#":
+            end = cmd.find("\n", i)
+            i = len(cmd) if end < 0 else end
+        elif ch in ";&|":
+            op = next(o for o in _OPERATORS if cmd.startswith(o, i))
+            if op in (";;", ";&", ";;&") and open_ and open_[-1] == "arm":
+                open_[-1] = "pattern"
+            command, i = True, i + len(op)
+        elif ch in "<>":
+            if cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+                return -1
+            i += 1
+            while i < len(cmd) and cmd[i] in "<>&|" and cmd[i - 1] in "<>":
+                i += 1
+        elif ch == "(":
+            if not (open_ and open_[-1] == "pattern"):  # `(a)`: a pattern may open with one
+                open_.append("(")
+            command, i = True, i + 1
+        elif ch == ")":
+            if not open_:
+                return i
+            if open_[-1] == "(":
+                open_.pop()
+            elif open_[-1] == "pattern":
+                open_[-1] = "arm"
+            else:
+                return -1
+            command, i = True, i + 1
+        else:
+            start, i = i, _word_end(cmd, i)
+            if i < 0:
+                return -1
+            word, state = cmd[start:i], open_[-1] if open_ else ""
+            if state == "case":
+                if word == "in":
+                    open_[-1] = "pattern"
+            elif state == "pattern" and word == "esac":
+                open_.pop()
+            elif state == "pattern":
+                pass  # a pattern, or one of several between `|`
+            elif command and word == "case":
+                open_.append("case")
+            elif command and word == "esac" and state == "arm":
+                open_.pop()
+            command = command and word in _BEFORE_COMMAND
+    return -1
+
+
+def _lift_substitutions(cmd: str) -> tuple[str, list[str]]:
+    """The command with each $(...) and `...` in it replaced by a `$` and a mark, and the commands
+    they run. The tokenizer knows neither backticks nor the fresh quoting inside a `$(` in double
+    quotes: in `echo "n: $(grep -c "a|b" f)"` it would pair the inner quotes with the outer ones,
+    take the `|` for a pipe and `b" f)"` for a program, and not see the command at all. _read
+    reads each where its mark is, before the command it is part of and with what was set up to
+    there (#51). The `$` stays: that command has an argument from elsewhere.
+
+    On the way, a `$` in single quotes becomes _LITERAL, $'...' becomes the '...' it stands for,
+    and the quotes in a comment are taken out: the `'` in `# don't` would pair with the next one.
+    A substitution that does not end raises ValueError: what it runs cannot be told."""
     out, runs, i, quoted = [], [], 0, False
+    word_start = True  # a word begins at i: `#` begins a comment there, not after `\ ` or in `a#`
     while i < len(cmd):
         ch = cmd[i]
         if ch == "\\":
             out.append(cmd[i:i + 2])
+            word_start = word_start and cmd[i + 1:i + 2] == "\n"  # a joined line goes on as before
             i += 2
             continue
-        if ch == "'" and not quoted:
+        if not quoted and ch == "'":
             end = cmd.find("'", i + 1)
             if end < 0:
                 break
             out.append(cmd[i:end + 1].replace("$", _LITERAL))
-            i = end + 1
+            word_start, i = False, end + 1
             continue
-        if ch == "`" or (quoted and cmd.startswith("$(", i)):
-            start = i + 1 if ch == "`" else i + 2
-            end = _backtick_end(cmd, start) if ch == "`" else _substitution_end(cmd, start)
+        if not quoted and cmd.startswith("$'", i):
+            end = _escaped_end(cmd, i + 2, "'")
             if end < 0:
                 break
+            text = re.sub(r"\\([\\'\"])", r"\1", cmd[i + 2:end])
+            out.append(shlex.quote(text).replace("$", _LITERAL))
+            word_start, i = False, end + 1
+            continue
+        if not quoted and ch == "#" and word_start:
+            end = cmd.find("\n", i)
+            end = len(cmd) if end < 0 else end
+            out.append(re.sub(r"[\\'\"`]", " ", cmd[i:end]))
+            i = end
+            continue
+        if ch == "`" or cmd.startswith("$(", i):
+            start = i + 1 if ch == "`" else i + 2
+            end = _escaped_end(cmd, start, "`") if ch == "`" else _substitution_end(cmd, start)
+            if end < 0:
+                raise ValueError("a command substitution that does not end")
+            out.append(f"${_MARK}{len(runs)}{_MARK}")
             runs.append(cmd[start:end])
-            out.append("$")
-            i = end + 1
+            word_start, i = False, end + 1
             continue
         if ch == '"':
             quoted = not quoted
         out.append(ch)
-        i += 1
-    out.append(cmd[i:])  # what follows a quote or substitution that is not closed, as it was
-    if depth < 8:
-        runs = [_lift_substitutions(run, depth + 1) for run in runs]
-    return "".join(out) + "".join(f" ; {run}" for run in runs)
+        word_start, i = ch in _WORD_BREAKS, i + 1
+    out.append(cmd[i:])  # after a single quote that is not closed: as it was, for tokens() to split
+    return "".join(out), runs
 
 
 def read(cmd: str, cwd: str = "") -> Command:
-    cmd = _inline_heredocs(cmd.replace("\0", ""))
+    cmd = _inline_heredocs(cmd.replace("\0", "").replace(_MARK, ""))
     out = Command(cwd)
     # The hook runs in the environment Claude Code gives its commands, so a variable set there
     # has the value the command saw. Only what neither that nor the command itself sets is unknown.
@@ -358,12 +522,16 @@ def _read(cmd: str, out: Command, env: dict, depth: int) -> None:
                     if rest[:end]:
                         _program(rest[:end])
 
-    for token in tokens(_lift_substitutions(cmd)):
+    text, runs = _lift_substitutions(cmd)
+    for token in tokens(text):
         if token and set(token) <= _SEPARATORS:
             finish()
         else:
-            token = token.strip("`")
-            current.append(_VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), token))
+            for n in _RUN.findall(token):
+                # it runs before the command it is part of, and what it sets stays in it
+                _read(runs[int(n)], out, dict(env), depth)
+            token = _VAR.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), token.strip("`"))
+            current.append(_RUN.sub("", token))  # after _VAR: `$` and what follows the mark is no name
     finish()
 
 
