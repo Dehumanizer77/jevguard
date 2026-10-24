@@ -758,7 +758,7 @@ def test_assignments_that_may_not_run_add_a_value(guard):
     c = shell.read('if test -f x; then p=b; fi; rm "$p"', "/w")
     assert c.programs == [["test", "-f", "x"], ["rm", "$p"], ["rm", "b"]]
     # past a limit, the readings of a command are too many to tell what it does
-    many = "".join(f"test -f {v} && {v}=1; " for v in "abcdefg") + "rm $a$b$c$d$e$f$g"
+    many = "".join(f"{v}=0; test -f {v} && {v}=1; " for v in "abcdefg") + "rm $a$b$c$d$e$f$g"
     assert "could not be read" in _reason(guard, many)
 
 
@@ -960,3 +960,94 @@ def test_other_ways_to_give_a_variable_a_value(guard, tmp_path):
     for cmd in ('for f in *.txt; do mv "$f" "${f%.txt}.md"; done', 'x=${1:-default}; echo "$x"'):
         assert _reason(guard, cmd) == "", cmd
     assert "could not be read" in _reason(guard, 'q=.claude; declare -n p=q; rm -rf "$p"')
+
+
+def test_a_function_has_each_body_it_may_have_where_it_is_called(guard, tmp_path):
+    """#61: a definition replaced the one before it wherever it stood, in a branch that does not
+    run, a subshell or a `bash -c` too. Which body a name has is now kept with the variables: a
+    definition that may not run, or runs in another shell, adds a body the call may run."""
+    for cmd in ('p=.claude; f() { rm -rf "$p"; }; if false; then f() { :; }; fi; f',
+                'f() { rm -rf .claude; }; ( f() { :; }; ); f', "f() { rm -rf .claude; }; bash -c 'f() { :; }'; f",
+                'f() { rm -rf .claude; }; false && f() { :; }; f', 'f() { rm -rf .claude; }; f() { :; } | cat; f',
+                'f() { rm -rf .claude; }; g() { f() { :; }; }; f', 'f() { :; }; g() { f() { rm -rf .claude; }; }; g; f',
+                'f() { :; }; for i in 1 2; do f; f() { rm -rf .claude; }; done'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    for cmd in ('f() { rm -rf notes; }; if false; then f() { :; }; fi; f', 'f() { :; }; ( f() { :; }; ); f'):
+        assert _reason(guard, cmd) == "", cmd
+
+    def rm(cmd):
+        return [argv for argv in shell.read(cmd, "/w").programs if argv[0] == "rm"]
+    assert rm('f() { rm a; }; if false; then f() { rm b; }; fi; f') == [["rm", "a"], ["rm", "b"]]
+    assert rm('f() { rm a; }; f() { rm b; }; f') == [["rm", "b"], ["rm", "a"]]  # the first, never called, read at the end
+
+
+def test_builtin_and_command_run_the_builtin_in_this_shell(guard, tmp_path):
+    """#62: `builtin printf -v`, `command printf -v` and `builtin unset` were read as builtin and
+    command, and what they set was lost. They are read as the builtin they run. A name the
+    command only makes at run time may be any builtin, and so may change any variable."""
+    for cmd in ('p=notes; builtin printf -v p %s .claude; rm -rf "$p"', 'p=notes; command printf -v p %s .claude; rm -rf "$p"',
+                'p=notes; builtin unset p; rm -rf "${p:-.claude}"', 'p=notes; command read -r p <<< .claude; rm -rf "$p"',
+                'p=notes; builtin command builtin printf -v p %s .claude; rm -rf "$p"',
+                'p=notes; read -ra p <<< .claude; rm -rf "$p"', 'n=p; p=notes; declare "$n=.claude"; rm -rf "$p"',
+                'n=p; p=notes; printf -v "$n" %s .claude; rm -rf "$p"', 'p=notes; c=export; $c p=.claude; rm -rf "$p"',
+                'p=notes; f() { "$@"; }; f read p <<< .claude; rm -rf "$p"'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    # a program, not a builtin: what it is given does not set this shell's variables
+    for cmd in ('p=notes; env printf -v p %s .claude; rm -rf "$p"', 'p=notes; command -v printf; rm -rf "$p"'):
+        assert ".claude" not in _rm_in_bash(tmp_path, cmd) and _reason(guard, cmd) == "", cmd
+
+    def rm(cmd):
+        return [argv for argv in shell.read(cmd, "/w").programs if argv[0] == "rm"]
+    assert rm('p=a; builtin unset p; rm "${p:-b}"') == [["rm", "${p:-b}"], ["rm", "b"]]
+    assert rm('p=a; command printf -v p %s b; rm "$p"') == [["rm", "a"], ["rm", "$p"]]
+
+
+def test_a_here_document_is_expanded_where_it_is_written(guard, tmp_path):
+    """#63: the text of a here-document whose marker is not quoted is expanded by the shell that
+    writes it, before the program reads it; an assignment in it cannot change what $p was. It was
+    read as if the program expanded it. A quoted marker leaves the text as it is."""
+    for cmd in ('p=.claude; bash <<EOF\np=notes; rm -rf "$p"\nEOF', 'p=.claude; bash <<-EOF\n\tp=notes; rm -rf "$p"\n\tEOF',
+                'p=.claude; sh <<EOF\np=notes; rm -rf "${p}"\nEOF', 'p=.claude; bash <<EOF\np=notes; rm -rf "$(echo $p)"\nEOF',
+                'p=.claude; bash <<EOF\np=notes; rm -rf "`echo $p`"\nEOF', "p=notes; bash <<'EOF'\np=.claude; rm -rf \"$p\"\nEOF",
+                'p=notes; bash <<EOF\np=.claude; rm -rf "\\$p"\nEOF', 'read p <<< .claude; eval "p=notes; rm -rf $p"'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    for cmd in ("p=.claude; bash <<'EOF'\np=notes; rm -rf \"$p\"\nEOF", 'p=.claude; bash <<EOF\np=notes; rm -rf "\\$p"\nEOF'):
+        assert ".claude" not in _rm_in_bash(tmp_path, cmd) and _reason(guard, cmd) == "", cmd
+    # only a `<<` the shell takes for one begins a here-document; text after any other is commands
+    for cmd in ("cat <<<EOF\nrm -rf .claude\nEOF", "echo '<<EOF'\nrm -rf .claude\nEOF", "echo hi # <<EOF\nrm -rf .claude\nEOF",
+                "echo $(( 1 <<EOF ))\nrm -rf .claude\nEOF", 'echo "<<EOF"\nrm -rf .claude\nEOF', "echo ${x:-<<EOF}\nrm -rf .claude\nEOF"):
+        assert "`rm`" in _reason(guard, cmd), cmd
+    assert "could not be read" in _reason(guard, "cat <<EOF\nrm -rf .claude")  # no line ends it
+
+    c = shell.read('p=a; bash <<EOF\np=b; rm "$p"\nEOF', "/w")
+    assert c.programs == [["bash", "<<<", 'p=b; rm "a"'], ["rm", "a"]]
+
+
+def test_an_expansion_that_assigns_is_seen_by_what_follows_it(guard, tmp_path):
+    """#64: ${p:=x} sets p before the words after it are expanded, in the same command too. It
+    was applied once the command had been read. Arithmetic that assigns (`$((p = 0))`, let, a
+    subscript) gives the variable a number this does not work out."""
+    for cmd in ('p=; echo "${p:=.claude}" "$(rm -rf "$p")"', 'p=; q=${p:=.claude} r=$(rm -rf "$p")',
+                'p=; : ${p:=${q:-.claude}}; rm -rf "$p"', 'unset p; echo "${p=.claude}" "$(rm -rf "$p")"',
+                'p=; echo "${q:-${p:=.claude}}" "$(rm -rf "$p")"', 'p=; : ${p[0]:=.claude}; rm -rf "$p"',
+                'p=notes; ((p = 0)); rm -rf "${p/#0/.claude}"', 'p=notes; let p=0; rm -rf "${p/#0/.claude}"',
+                'p=; [[ 1 -eq p=1 ]]; rm -rf "${p:+.claude}"', 'p=; a[p=1]=z; rm -rf "${p:+.claude}"'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    for cmd in ('p=notes; echo "${p:=.claude}" "$(rm -rf "$p")"', 'p=; echo "$(rm -rf "$p")" "${p:=.claude}" >/dev/null'):
+        assert _reason(guard, cmd) == "" or ".claude" not in _rm_in_bash(tmp_path, cmd), cmd
+
+    def rm(cmd):
+        return [argv for argv in shell.read(cmd, "/w").programs if argv[0] == "rm"]
+    assert rm('p=; echo "${p:=b}" "$(rm "$p")"') == [["rm", ""], ["rm", "b"]]
+
+
+def test_a_line_continuation_is_taken_out_before_the_words_are_told(guard, tmp_path):
+    """#65: a backslash at the end of a line joins the next line to it before the shell tells
+    an assignment or a reserved word, in the middle of a word too. Not in single quotes."""
+    for cmd in ('p=notes; p\\\n=.claude; rm -rf "$p"', 'p=notes; p=\\\n.claude; rm -rf "$p"',
+                'p=notes\nex\\\nport p=.claude\nrm -rf "$p"', 'p=notes; for i in 1; do :; do\\\nne; p=.claude; rm -rf "$p"',
+                'rm -rf .cla\\\nude', "rm -rf $'\\x2eclaude'", "echo `echo \\`rm -rf .claude\\``"):
+        _asked_like_bash(guard, tmp_path, cmd)
+    cmd = "p=.claude; 'p\\\n=notes'; rm -rf \"$p\""  # quoted: a program, and p is still .claude
+    assert _rm_in_bash(tmp_path, cmd) == {".claude"} and ".claude" in _reason(guard, cmd)
+    assert shell.read('p=a; p\\\n=b; rm "$p"', "/w").programs == [["rm", "b"]]
