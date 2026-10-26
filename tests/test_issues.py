@@ -1051,3 +1051,43 @@ def test_a_line_continuation_is_taken_out_before_the_words_are_told(guard, tmp_p
     cmd = "p=.claude; 'p\\\n=notes'; rm -rf \"$p\""  # quoted: a program, and p is still .claude
     assert _rm_in_bash(tmp_path, cmd) == {".claude"} and ".claude" in _reason(guard, cmd)
     assert shell.read('p=a; p\\\n=b; rm "$p"', "/w").programs == [["rm", "b"]]
+
+
+def test_the_first_set_tr_is_given_names_no_path(guard, tmp_path):
+    """`tr / _` in a $(...) made / a path the command names, and a program given a value from a
+    variable or $(...) is taken to be given any path the command names: / is above every file of
+    the guard's, so `curl -o "$(echo $f | tr / _)"` was asked about. tr opens no file, and writes
+    none of the characters of its first set that it did not read. Its second set it may write,
+    its last word the next command has as $_, and a tr the command defines is its own."""
+    evcc = ('cd /opt && mkdir -p evccsrc && cd evccsrc && for f in core/site.go i18n/en.toml; do '
+            'curl -sfL "https://raw.githubusercontent.com/evcc-io/evcc/0.317.2/$f" -o "$(echo $f | tr / _)" '
+            '|| echo "FAIL $f"; done; ls -la')
+    for cmd in (evcc, 'curl -sfL https://x/y -o "$(echo a/b | tr / _)"', 'cp x "$(echo "$f" | tr -- / -)"',
+                'mv "$f" "$(echo "$f" | tr -s / _)"', "touch \"$(echo $f | tr '[:upper:]/' '[:lower:]_')\""):
+        assert _reason(guard, cmd) == "", cmd
+    for cmd in ('tr -d .claude </dev/null; rm -rf "$_"', 'tr() { rm -rf "$1"; }; tr .claude _',
+                '/usr/bin/tr() { rm -rf "$1"; }; /usr/bin/tr .claude _',
+                "tr() { rm -rf \"$1\"; }; export -f tr; bash -c 'tr .claude _'",
+                'for i in 1 2; do tr .claude _ </dev/null; tr() { rm -rf "$1"; }; done'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    assert "`rm`" in _reason(guard, 'rm -rf "$(echo x | tr x /)"')  # the second set is what it writes
+
+    def named(cmd):
+        return "/" in shell.read(cmd, "/w").paths
+    assert not named("echo a/b | tr / _") and not named("tr -c -- / _ <f")
+    assert named("tr -d /") and named("echo a/b | xargs tr / _") and named("x | tr x /")
+    # what the person asked is told: the path is not among the program's words
+    reason = _reason(guard, 'curl -sL https://x/y -o "$OUT"; ls /')
+    assert "`curl` is given a value from a variable, $(...) or xargs, and the command names /," in reason
+
+
+def test_what_the_shell_sets_itself_is_not_taken_from_the_guards_environment(guard, tmp_path):
+    """$_ is the last word of the command before, and cd sets $PWD and $OLDPWD. $_ was taken from
+    the environment the guard was started in, and the others kept what they held before the cd:
+    `ls .claude; rm -rf "$_"` was read as rm given /usr/bin/python3, and nothing was asked."""
+    _rm_in_bash(tmp_path, "true")
+    (tmp_path / "work" / ".claude").mkdir()
+    for cmd in ('ls .claude; rm -rf "$_"', 'tr -d .claude </dev/null; rm -rf "$_"', 'cd .claude && rm -rf "$PWD"',
+                'cd .claude; cd /; rm -rf "$OLDPWD"', 'pushd .claude; rm -rf "$PWD"'):
+        assert any(a.endswith(".claude") for a in _rm_in_bash(tmp_path, cmd)), cmd
+        assert "`rm`" in _reason(guard, cmd), cmd

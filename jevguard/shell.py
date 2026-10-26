@@ -112,6 +112,9 @@ class Command:
         self.program_paths: list[set[str]] = []  # for each program, the paths its arguments name
         self.program_globs: list[list[str]] = []  # and the glob patterns
         self.program_fed: list[bool] = []    # its arguments come from elsewhere: xargs, $(...), a variable
+        # and what an argument that is a set of characters would name (tr's first, _set_operand):
+        # kept apart, and named with the others only if the command may make a tr of its own
+        self.program_sets: list[tuple[set[str], list[str]]] = []
         self.writes: set[str] = set()        # canonical targets of > >> &> redirections
         self.dirs: list[str] = [canonical(cwd)] if cwd else []  # the starting directory and every `cd` target
         self.paths: set[str] = set()         # canonical paths the command names
@@ -829,7 +832,10 @@ _WORK = 100000
 
 def _values(env: dict, name: str) -> tuple:
     """What a variable may hold. None stands for not set: where it is used, the word stays as
-    it is written."""
+    it is written. $_ is the last word of the command before, which this does not keep: it is
+    not what it was where the guard was started, nor what the command assigned to it."""
+    if name == "_":
+        return (None,)
     if name in env:
         return env[name]
     return (os.environ[name],) if name in os.environ else (None,)
@@ -1099,7 +1105,8 @@ def _snapshot(out: Command) -> tuple:
 def _restore(out: Command, snapshot: tuple) -> None:
     """out as it was at the snapshot: what was read since is read again."""
     programs, globs, dirs, paths, writes = snapshot
-    for each in (out.programs, out.program_dirs, out.program_paths, out.program_globs, out.program_fed):
+    for each in (out.programs, out.program_dirs, out.program_paths, out.program_globs, out.program_fed,
+                 out.program_sets):
         del each[programs:]
     del out.globs[globs:]
     del out.dirs[dirs:]
@@ -1256,6 +1263,7 @@ class _Context:
     def __init__(self, out: Command):
         self.out = out
         self.bodies: set[_Function] = set()  # every body defined, wherever
+        self.defined: set[str] = set()       # and the names they are defined under
         self.calls: list[str] = []           # the functions being read, innermost last
         self.called: set[_Function] = set()  # the bodies read where they are called
         self.traps: dict[tuple, list] = {}   # (text, depth): [what the variables may hold while it may run, signals]
@@ -1313,6 +1321,14 @@ def read(cmd: str, cwd: str = "") -> Command:
     # has the value the command saw (_values). Only what neither that nor the command itself sets is unknown.
     env = _read(cmd, ctx, {"HOME": (os.path.expanduser("~"),), "PWD": (cwd,)}, 0)
     ctx.finish(env)
+    if ctx.defined & set(_TR) or any(argv[0] == "alias" for argv in out.programs):
+        # `tr() { rm -rf "$1"; }; tr / _`: the tr run is the command's own, and its words are
+        # what that is given
+        for paths, globs, (more, more_globs) in zip(out.program_paths, out.program_globs, out.program_sets):
+            paths |= more
+            globs += more_globs
+            out.paths |= more
+            out.globs += more_globs
     visible = _SINGLE_QUOTED.sub("''", _prepare(cmd))  # '$1' in an awk program is not a shell variable
     unset = {a or b for a, b in _VAR.findall(visible)} - set(env) - set(os.environ)
     out.dynamic = bool(_DYNAMIC.search(visible) or unset)
@@ -1441,6 +1457,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             silent -= 1
             body = _Function(toks[f.at:i], runs)
             ctx.bodies.add(body)
+            ctx.defined.add(f.function)
             frames[-1].closed = {**f.start, f"{f.function}()": (body,)}
         elif kind != "<(":  # a <( ... ) runs beside the command it is in, which goes on
             frames[-1].closed = _union(f.start, f.env)
@@ -1681,6 +1698,8 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                     after = _arithmetic(builtin[k + 1], _arithmetic(builtin[k - 1], after))
         elif name in (".", "source") or "$" in name:  # runs in this shell what the command does not show
             after = _unknown(after)
+        elif name in ("cd", "pushd", "popd"):  # the directory it went to, or still the one before
+            after = {**after, **{v: _merge(_values(after, v), (None,)) for v in ("PWD", "OLDPWD")}}
         if builtin is argv:  # builtin f and command f run no function
             for body in _values(scope, f"{name}()"):
                 if body is not None:
@@ -1719,10 +1738,13 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         globs: list[str] = []
         out.program_paths.append(paths)
         out.program_globs.append(globs)
+        sets: tuple[set[str], list[str]] = (set(), [])
+        out.program_sets.append(sets)
+        charset = 0 if fed else _set_operand(raw)
         program = os.path.basename(raw[0])
         for i, arg in enumerate(argv[1:], 1):
             for form in _wider(arg, scope):
-                _note_paths(form, out.dirs, paths, globs)
+                _note_paths(form, out.dirs, *(sets if i == charset else (paths, globs)))
             if ">" in raw[i - 1] and set(raw[i - 1]) <= _REDIRECT_CHARS and not (
                     raw[i - 1].endswith("&") and (raw[i].isdigit() or raw[i] == "-")):  # 2>&1 writes no file
                 for target in expand_braces(raw[i]):
@@ -1825,6 +1847,26 @@ def _operands(argv: list[str]) -> list[str]:
         if _REDIRECTION.fullmatch(a) or (_FD.fullmatch(a) and _REDIRECTION.fullmatch((argv[k + 1:] or [""])[0])):
             return argv[:k]
     return argv
+
+
+_TR = ("tr", "/usr/bin/tr", "/bin/tr")  # and a function the command defines may have any of these names
+
+
+def _set_operand(raw: list[str]) -> int:
+    """Where tr's first set (`/` in `tr / _`) is among the words, or 0. tr opens no file, and the
+    characters of that set are the ones it takes out of what it reads or puts others in place
+    of: what it writes has none of them that was not in what it read. So it names no path,
+    and none that $(... | tr / _) may give another program. Not when it is the last word: the
+    next command has that as $_. Not when a word up to it is expanded: it may be several words."""
+    if raw[0] not in _TR:
+        return 0
+    words = _operands(raw)
+    k = 1
+    while k < len(words) and words[k].startswith("-") and words[k] != "-":  # none of its options takes a value
+        k += 1
+        if words[k - 1] == "--":
+            break
+    return k if k < len(words) - 1 and not any("$" in w for w in words[:k + 1]) else 0
 
 
 def resolve(name: str, dirs: list[str]) -> list[str]:
