@@ -450,12 +450,14 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
     for argv, dirs, paths, globs, fed in zip(c.programs, c.program_dirs, c.program_paths, c.program_globs,
                                              c.program_fed):
         program = os.path.basename(argv[0])
+        given = (paths, globs)  # its own words, before what a fed program may be given
         if fed:  # xargs, $(...): what this program is given is named elsewhere in the command, if at all
             paths, globs = c.paths, c.globs
         if program == "jevguard":
             # Its other subcommands change nothing; of their arguments only real paths count
             # (`jevguard scan <file>`), not words like "status" resolved against the directory.
             paths = {p for a in argv[1:] if "/" in a or a.startswith("~") for p in shell.resolve(a, dirs)}
+            given = (paths, globs)
         elif not _reads_only(argv):
             inside = next((d for d in dirs for r in [*roots, released] if under(d, r)), None)
             if inside:  # `git reset --hard` there names no file and changes them all
@@ -466,19 +468,19 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
         hit = next((p for p in sorted(paths) if any(under(p, r) for r in roots)), None) or \
             next((g for g in globs if any(shell.glob_reaches(g, r) for r in roots)), None)
         if hit:
-            return f"`{program}` {_names(argv, hit)} {_show(hit)}, {kind(hit)}"
+            return f"`{program}` {_names(argv, hit, given)} {_show(hit)}, {kind(hit)}"
         if _reads_only(argv):
             continue  # cat .claude/settings.json, cat a released original, ls ~: looking is not a change
         hit = next((p for p in sorted(paths) if _SETTINGS.search(p) or under(p, released)), None) or \
             next((g for g in globs if _settings_glob(g) or any(shell.glob_reaches(g, t) for t in [released, *hook_files])), None)
         if hit:
-            return f"`{program}` {_names(argv, hit)} {_show(hit)}, {kind(hit)}"
+            return f"`{program}` {_names(argv, hit, given)} {_show(hit)}, {kind(hit)}"
         # A directory above any of them, and any project's .claude, .cursor, .grok/hooks, ...:
         # removing it removes the hooks, unpacking or copying into it can plant a settings file.
         hit = next((p for p in sorted(paths) if above(p)), None) or \
             next((g for g in globs if any(shell.glob_reaches_above(g, t) for t in targets) or _holds_hooks(g)), None)
         if hit:
-            return (f"`{program}` {_names(argv, hit)} {_show(hit)}, a directory that holds the guard's files "
+            return (f"`{program}` {_names(argv, hit, given)} {_show(hit)}, a directory that holds the guard's files "
                     "or an agent's hooks, and it is not a program that only reads")
     return ""
 
@@ -488,9 +490,14 @@ def _show(path: str) -> str:
     return "~" + path[len(home):] if path != home and under(path, home) else path
 
 
-def _names(argv: list[str], hit: str) -> str:
+def _names(argv: list[str], hit: str, given: tuple) -> str:
     """Whether the path is an argument of its own or sits inside a longer text (a script passed
-    to python, a here-document): the second is where false alarms come from."""
-    leaf = os.path.basename(hit.rstrip("/"))
+    to python, a here-document): the second is where false alarms come from. Or whether it is
+    not among the program's words at all, and counts because something in them is filled in when
+    the command runs: then the path may be anywhere in the command, and the person asked has to
+    know to look there."""
+    if hit not in given[0] and hit not in given[1]:
+        return "is given a value from a variable, $(...) or xargs, and the command names"
+    leaf = os.path.basename(hit.rstrip("/")) or "/"
     direct = any(leaf in a and len(a) <= 300 and not re.search(r"\s", a) for a in argv[1:])
     return "is given" if direct else "is given a text that mentions"

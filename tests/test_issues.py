@@ -1051,3 +1051,99 @@ def test_a_line_continuation_is_taken_out_before_the_words_are_told(guard, tmp_p
     cmd = "p=.claude; 'p\\\n=notes'; rm -rf \"$p\""  # quoted: a program, and p is still .claude
     assert _rm_in_bash(tmp_path, cmd) == {".claude"} and ".claude" in _reason(guard, cmd)
     assert shell.read('p=a; p\\\n=b; rm "$p"', "/w").programs == [["rm", "b"]]
+
+
+def test_the_first_set_tr_is_given_names_no_path(guard, tmp_path):
+    """`tr / _` in a $(...) made / a path the command names, and a program given a value from a
+    variable or $(...) is taken to be given any path the command names: / is above every file of
+    the guard's, so `curl -o "$(echo $f | tr / _)"` was asked about. tr opens no file, and writes
+    none of the characters of its first set that it did not read. Its second set it may write,
+    its last word the next command has as $_, and a tr the command defines is its own."""
+    evcc = ('cd /opt && mkdir -p evccsrc && cd evccsrc && for f in core/site.go i18n/en.toml; do '
+            'curl -sfL "https://raw.githubusercontent.com/evcc-io/evcc/0.317.2/$f" -o "$(echo $f | tr / _)" '
+            '|| echo "FAIL $f"; done; ls -la')
+    for cmd in (evcc, 'curl -sfL https://x/y -o "$(echo a/b | tr / _)"', 'cp x "$(echo "$f" | tr -- / -)"',
+                'mv "$f" "$(echo "$f" | tr -s / _)"', "touch \"$(echo $f | tr '[:upper:]/' '[:lower:]_')\""):
+        assert _reason(guard, cmd) == "", cmd
+    for cmd in ('tr -d .claude </dev/null; rm -rf "$_"', 'tr() { rm -rf "$1"; }; tr .claude _',
+                '/usr/bin/tr() { rm -rf "$1"; }; /usr/bin/tr .claude _',
+                "tr() { rm -rf \"$1\"; }; export -f tr; bash -c 'tr .claude _'",
+                'for i in 1 2; do tr .claude _ </dev/null; tr() { rm -rf "$1"; }; done'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    assert "`rm`" in _reason(guard, 'rm -rf "$(echo x | tr x /)"')  # the second set is what it writes
+
+    def named(cmd):
+        return "/" in shell.read(cmd, "/w").paths
+    assert not named("echo a/b | tr / _") and not named("tr -c -- / _ <f")
+    assert named("tr -d /") and named("echo a/b | xargs tr / _") and named("x | tr x /")
+    # what the person asked is told: the path is not among the program's words
+    reason = _reason(guard, 'curl -sL https://x/y -o "$OUT"; ls /')
+    assert "`curl` is given a value from a variable, $(...) or xargs, and the command names /," in reason
+
+
+def test_what_the_shell_sets_itself_is_not_taken_from_the_guards_environment(guard, tmp_path):
+    """$_ is the last word of the command before, and cd sets $PWD and $OLDPWD. $_ was taken from
+    the environment the guard was started in, and the others kept what they held before the cd:
+    `ls .claude; rm -rf "$_"` was read as rm given /usr/bin/python3, and nothing was asked."""
+    _rm_in_bash(tmp_path, "true")
+    (tmp_path / "work" / ".claude").mkdir()
+    for cmd in ('ls .claude; rm -rf "$_"', 'tr -d .claude </dev/null; rm -rf "$_"', 'cd .claude && rm -rf "$PWD"',
+                'cd .claude; cd /; rm -rf "$OLDPWD"', 'pushd .claude; rm -rf "$PWD"'):
+        assert any(a.endswith(".claude") for a in _rm_in_bash(tmp_path, cmd)), cmd
+        assert "`rm`" in _reason(guard, cmd), cmd
+
+
+def test_a_word_that_may_vanish_leaves_the_set_the_last_word(guard, tmp_path):
+    """#68: an empty variable, one that holds only spaces, {,} and a glob or an extended glob that
+    matches nothing under nullglob are no word at all. tr's first set was then its last word, and the next
+    command had it as $_. The set names no path only when each word of the command is one word
+    as written. A quoted empty word is one."""
+    for cmd in ('empty=; tr .claude $empty </dev/null; read p <<< "$_"; rm -rf "$p"',
+                'x=" "; tr .claude $x </dev/null; read p <<< "$_"; rm -rf "$p"',
+                'tr .claude {,} </dev/null; read p <<< "$_"; rm -rf "$p"',
+                'shopt -s nullglob\ntr .claude unmatched-* </dev/null\nread p <<< "$_"\nrm -rf "$p"',
+                'shopt -s extglob nullglob\ntr .claude @(unmatched) </dev/null\nread p <<< "$_"\nrm -rf "$p"'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    cmd = 'tr .claude "" </dev/null; read p <<< "$_"; rm -rf "$p"'
+    assert ".claude" not in _rm_in_bash(tmp_path, cmd) and _reason(guard, cmd) == "", cmd
+    # what the command reads is scanned: the outside file is named as before
+    guard.configure(mode="block", on_error="closed", external_paths=["/work/payload"])
+    for cmd in ("cat payload", 'empty=; tr payload $empty </dev/null; cat "$_"'):
+        assert guard.hook("PostToolUse", "Bash", {"command": cmd}, bash(ATTACK), cwd="/work",
+                          session="no-downloads") is not None, cmd
+    assert shell.read('cat "$_"', "/w").dynamic  # $_ is picked at run time
+
+
+def test_a_function_bash_takes_from_its_environment_cannot_be_read(guard, tmp_path, monkeypatch):
+    """#69: bash takes an environment entry BASH_FUNC_name%%=() { ...; } for a function, in the
+    bash env starts and in any started after it. Its body was not read, and the tr or cat it
+    replaces only reads. Such an entry given to any program, or one whose name is not known,
+    makes the command one that cannot be read. So does a word env or sudo may take for one once
+    it is filled in: a variable, a glob, what xargs -I puts in its place; and a name env -S
+    joins from quoted pieces, which the words of the command do not show. A function the guard's
+    own environment has, the shell has as well: it is not the command's."""
+    body = "'BASH_FUNC_cat%%=() { rm -rf \"$1\"; }'"
+    assert ".claude" in _rm_in_bash(tmp_path, f"env {body} bash -c 'cat .claude'")
+    (tmp_path / "entries").write_text('BASH_FUNC_cat%%=() { zap -rf "$1"; }\n')
+    (tmp_path / "work" / 'BASH_FUNC_cat%%=() { zap -rf "$1"; }').touch()
+    split = "env -S \"'BASH_''FUNC_cat%%=() { rm -rf .claude; }' bash -c 'cat .claude'\""
+    filled = ("read a < ../entries; env \"$a\" bash -c 'cat .claude'", "env * bash -c 'cat .claude'",
+              "xargs -I X env X bash -c 'cat .claude' < ../entries", "xargs -i env {} bash -c 'cat .claude' < ../entries",
+              split, f"nohup env {split[4:]}", f"env FOO=1 env {split[4:]}")
+    for cmd in filled:
+        assert ".claude" in _rm_in_bash(tmp_path, cmd), cmd
+    for cmd in (f"env {body} bash -c 'cat .claude'", f"env -i {body} /bin/bash -c 'cat .claude'",
+                f"nohup env env {body} bash -c 'cat .claude'", f"sudo {body} bash -c 'cat .claude'",
+                "env 'BASH_FUNC_tr%%=() { rm -rf \"$1\"; }' bash -c 'tr .claude _'",
+                "env \"BASH_FU\"'NC_cat%%=() { :; }' bash -c 'cat .claude'", 'read n; env "$n=() { :; }" bash',
+                *filled, "read a; sudo \"$a\" bash -c 'cat .claude'", "xargs -I{} sudo {} bash -c 'cat .claude' < f"):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ("env FOO=1 bash -c 'cat notes'", "sudo -u root FOO=1 cat notes", "sudo FOO-BAR=1 cat notes",
+                "env FOO=\"$(pwd)\" bash -c 'cat notes'", "xargs -I X env FOO=1 cp X out < list",
+                "xargs -I{} sudo chown me {} < list", 'sudo -e "$f"', "env -S 'FOO=1 bash -c \"cat notes\"'",
+                "env -S \"bash -c 'cat notes'\""):
+        assert _reason(guard, cmd) == "", cmd
+    assert shell.read("sudo /opt/a=b/run notes", "/w").programs == [["/opt/a=b/run", "notes"]]
+    monkeypatch.setenv("BASH_FUNC_module%%", "() { :; }")
+    for cmd in ("env -i FOO=1 bash -c 'cat notes'", "sudo bash -c 'cat notes'", "bash -c 'cat notes'"):
+        assert ["cat", "notes"] in shell.read(cmd, "/w").programs, cmd
