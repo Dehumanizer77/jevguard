@@ -1091,3 +1091,51 @@ def test_what_the_shell_sets_itself_is_not_taken_from_the_guards_environment(gua
                 'cd .claude; cd /; rm -rf "$OLDPWD"', 'pushd .claude; rm -rf "$PWD"'):
         assert any(a.endswith(".claude") for a in _rm_in_bash(tmp_path, cmd)), cmd
         assert "`rm`" in _reason(guard, cmd), cmd
+
+
+def test_a_word_that_may_vanish_leaves_the_set_the_last_word(guard, tmp_path):
+    """#68: an empty variable, one that holds only spaces, {,} and a glob or an extended glob that
+    matches nothing under nullglob are no word at all. tr's first set was then its last word, and the next
+    command had it as $_. The set names no path only when each word of the command is one word
+    as written. A quoted empty word is one."""
+    for cmd in ('empty=; tr .claude $empty </dev/null; read p <<< "$_"; rm -rf "$p"',
+                'x=" "; tr .claude $x </dev/null; read p <<< "$_"; rm -rf "$p"',
+                'tr .claude {,} </dev/null; read p <<< "$_"; rm -rf "$p"',
+                'shopt -s nullglob\ntr .claude unmatched-* </dev/null\nread p <<< "$_"\nrm -rf "$p"',
+                'shopt -s extglob nullglob\ntr .claude @(unmatched) </dev/null\nread p <<< "$_"\nrm -rf "$p"'):
+        _asked_like_bash(guard, tmp_path, cmd)
+    cmd = 'tr .claude "" </dev/null; read p <<< "$_"; rm -rf "$p"'
+    assert ".claude" not in _rm_in_bash(tmp_path, cmd) and _reason(guard, cmd) == "", cmd
+    # what the command reads is scanned: the outside file is named as before
+    guard.configure(mode="block", on_error="closed", external_paths=["/work/payload"])
+    for cmd in ("cat payload", 'empty=; tr payload $empty </dev/null; cat "$_"'):
+        assert guard.hook("PostToolUse", "Bash", {"command": cmd}, bash(ATTACK), cwd="/work",
+                          session="no-downloads") is not None, cmd
+    assert shell.read('cat "$_"', "/w").dynamic  # $_ is picked at run time
+
+
+def test_a_function_bash_takes_from_its_environment_cannot_be_read(guard, tmp_path):
+    """#69: bash takes an environment entry BASH_FUNC_name%%=() { ...; } for a function, in the
+    bash env starts and in any started after it. Its body was not read, and the tr or cat it
+    replaces only reads. Such an entry given to any program, or one whose name is not known,
+    makes the command one that cannot be read. So does a word env or sudo may take for one once
+    it is filled in: a variable, a glob, what xargs -I puts in its place."""
+    body = "'BASH_FUNC_cat%%=() { rm -rf \"$1\"; }'"
+    assert ".claude" in _rm_in_bash(tmp_path, f"env {body} bash -c 'cat .claude'")
+    (tmp_path / "entries").write_text('BASH_FUNC_cat%%=() { zap -rf "$1"; }\n')
+    (tmp_path / "work" / 'BASH_FUNC_cat%%=() { zap -rf "$1"; }').touch()
+    filled = ("read a < ../entries; env \"$a\" bash -c 'cat .claude'", "env * bash -c 'cat .claude'",
+              "xargs -I X env X bash -c 'cat .claude' < ../entries", "xargs -i env {} bash -c 'cat .claude' < ../entries")
+    for cmd in filled:
+        assert ".claude" in _rm_in_bash(tmp_path, cmd), cmd
+    for cmd in (f"env {body} bash -c 'cat .claude'", f"env -i {body} /bin/bash -c 'cat .claude'",
+                f"nohup env env {body} bash -c 'cat .claude'", f"sudo {body} bash -c 'cat .claude'",
+                "env 'BASH_FUNC_tr%%=() { rm -rf \"$1\"; }' bash -c 'tr .claude _'",
+                "env \"BASH_FU\"'NC_cat%%=() { :; }' bash -c 'cat .claude'", 'read n; env "$n=() { :; }" bash',
+                *filled, "read a; sudo \"$a\" bash -c 'cat .claude'", "xargs -I{} sudo {} bash -c 'cat .claude' < f"):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ("env FOO=1 bash -c 'cat notes'", "sudo -u root FOO=1 cat notes", "sudo FOO-BAR=1 cat notes",
+                "env FOO=\"$(pwd)\" bash -c 'cat notes'", "xargs -I X env FOO=1 cp X out < list",
+                "xargs -I{} sudo chown me {} < list", 'sudo -e "$f"'):
+        assert _reason(guard, cmd) == "", cmd
+    assert shell.read("sudo /opt/a=b/run notes", "/w").programs == [["/opt/a=b/run", "notes"]]

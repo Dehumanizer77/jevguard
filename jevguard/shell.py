@@ -1126,15 +1126,34 @@ _WRAPPER_LONG = {"sudo": {"--user", "--group", "--host", "--prompt", "--chdir", 
                  "xargs": {"--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-lines", "--max-chars",
                            "--process-slot-var"}, "watch": {"--interval"}}
 _WRAPPER_WRITES = {("time", "o"), ("time", "--output")}
+# Options of xargs that put its input in place of a string in the words after it ({} if none is given).
+_WRAPPER_REPLACES = {("xargs", "I"), ("xargs", "i"), ("xargs", "--replace")}
 _ENV_LONG = {"--ignore-environment": "i", "--null": "0", "--debug": "v", "--unset": "u", "--chdir": "C",
              "--split-string": "S", "--argv0": "a"}
 
 
-def _env(argv: list[str], child: dict, out: Command) -> tuple[list[str], dict]:
+_IMPORTS = "BASH_FUNC_"  # the names bash takes functions from in its environment: BASH_FUNC_name%%
+
+
+def _known_entry(word: str, replaced: list[str]) -> None:
+    """The name of an entry env or sudo puts in the environment of what it runs, or a word they may
+    take for NAME=VALUE once it is filled in: "$a", a glob that matches a file named so, a word
+    with what xargs -I puts its input in place of (replaced). One whose text is not known may be a
+    function bash imports (#69)."""
+    if not _as_written(word) or any(g in word for g in replaced):
+        raise ValueError("an environment entry whose name is not known")
+
+
+def _sudo_entry(wrapper: str, word: str) -> bool:
+    """sudo takes a word with = in it, before its program, for NAME=VALUE, unless it begins with /."""
+    return wrapper == "sudo" and "=" in word and not word.startswith(("-", "/"))
+
+
+def _env(argv: list[str], child: dict, out: Command, replaced: list[str]) -> tuple[list[str], dict]:
     """env's options and NAME=VALUE operands: the program after them, and what it is run with
     (#59). The variables env sets, unsets (-u) or clears (-i) are the program's, not this shell's.
     An option this does not know may change what the program is or what it finds, and cannot be
-    read."""
+    read. replaced: what an xargs before it puts its input in place of (_known_entry)."""
     options = True
     while argv:
         word = argv.pop(0)
@@ -1146,9 +1165,11 @@ def _env(argv: list[str], child: dict, out: Command) -> tuple[list[str], dict]:
             continue
         if not (options and word.startswith("-")):
             if "=" not in word[1:]:
+                _known_entry(word, replaced)  # the program, unless the shell or xargs makes NAME=VALUE of it
                 argv.insert(0, word)
                 break
             name, value = word.split("=", 1)
+            _known_entry(name, replaced)
             child = {**child, name: (value,)}
             continue
         if word.startswith("--"):
@@ -1195,10 +1216,11 @@ def _unwrap(argv: list[str], child, out: Command) -> tuple[list[str], bool, obje
     (xargs), and what it finds in its environment. That is made only where it is needed: child is
     a function that makes it, and so is what is returned."""
     fed = False
+    replaced: list[str] = []  # what xargs -I puts its input in place of
     while argv and os.path.basename(argv[0]) in _WRAPPERS:
         wrapper = os.path.basename(argv.pop(0))
         if wrapper == "env":
-            argv, env = _env(argv, child(), out)
+            argv, env = _env(argv, child(), out, replaced)
             child = lambda env=env: env
             continue
         fed = fed or wrapper == "xargs"
@@ -1207,12 +1229,14 @@ def _unwrap(argv: list[str], child, out: Command) -> tuple[list[str], bool, obje
             child = lambda env=env: env
         run_words = edit = False
         while argv and (argv[0].startswith("-") or argv[0].replace(".", "").isdigit()
-                        or argv[0] == "{}" or _ASSIGN.fullmatch(argv[0])):
+                        or argv[0] == "{}" or _ASSIGN.fullmatch(argv[0]) or _sudo_entry(wrapper, argv[0])):
             option = argv.pop(0)
             if option == "--":
                 break
-            if _ASSIGN.fullmatch(option):
-                if wrapper == "sudo":  # sudo p=x cmd: where the policy lets it, cmd has p=x
+            if wrapper == "sudo" and not option.startswith("-"):  # NAME=VALUE, or a {} xargs may fill in with one
+                _known_entry(option.split("=", 1)[0], replaced)
+            if _ASSIGN.fullmatch(option) or _sudo_entry(wrapper, option):
+                if wrapper == "sudo" and _ASSIGN.fullmatch(option):  # sudo p=x cmd: where the policy lets it, cmd has p=x
                     name, value = _ASSIGN.fullmatch(option).groups()
                     env = {**child(), name: (value,)}
                     child = lambda env=env: env
@@ -1232,6 +1256,10 @@ def _unwrap(argv: list[str], child, out: Command) -> tuple[list[str], bool, obje
                 out.dirs.extend([canonical(value, d) for d in out.dirs[:8]])
             if eq and value and key in _WRAPPER_WRITES:
                 out.writes.update(resolve(value, out.dirs))
+            if key in _WRAPPER_REPLACES:
+                replaced.append(value or "{}")
+        if wrapper == "sudo" and argv and not edit:
+            _known_entry(argv[0], replaced)  # "$a", *: sudo takes it for NAME=VALUE if it is one
         if edit:
             argv = ["sudoedit", *argv]
         if wrapper == "watch" and argv and not run_words:  # watch hands its words to sh -c
@@ -1330,7 +1358,8 @@ def read(cmd: str, cwd: str = "") -> Command:
             out.paths |= more
             out.globs += more_globs
     visible = _SINGLE_QUOTED.sub("''", _prepare(cmd))  # '$1' in an awk program is not a shell variable
-    unset = {a or b for a, b in _VAR.findall(visible)} - set(env) - set(os.environ)
+    used = {a or b for a, b in _VAR.findall(visible)}
+    unset = used - set(env) - set(os.environ) | used & {"_"}  # $_: never known (_values)
     out.dynamic = bool(_DYNAMIC.search(visible) or unset)
     return out
 
@@ -1668,11 +1697,14 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             if not made:
                 made.append(_exported(scope, {_ASSIGN_PARTS.fullmatch(w).group(1) for w in assigns}))
             return made[0]
-        return _union(*[run(argv, env, scope, child, declared, bool(assigns))
+        written = all(_as_written(w) for w in command)
+        return _union(*[run(argv, env, scope, child, declared, bool(assigns), written)
                         for argv in _readings(command + redirects, env, envs)])
 
-    def run(argv: list[str], start: dict, scope: dict, child, declared: dict | None, prefixed: bool) -> dict:
-        """One reading of a simple command: what the variables hold after it."""
+    def run(argv: list[str], start: dict, scope: dict, child, declared: dict | None, prefixed: bool,
+            written: bool = False) -> dict:
+        """One reading of a simple command: what the variables hold after it. written: each of its
+        words is one word as written, with nothing in it the shell expands (_as_written)."""
         while len(argv) > 1 and argv[0] == "":  # a variable that holds nothing, unquoted, is no word
             argv = argv[1:]
         builtin = _builtin(argv)
@@ -1709,9 +1741,13 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 for body in _values(scope, key):
                     if body is not None:
                         after = _union(after, call(key[:-2], body, scope))
+        if any(_IMPORTS in a for a in argv):
+            # BASH_FUNC_tr%%=() { ...; } in an environment: bash, there or in any program it starts,
+            # takes it for a function named tr (#69), whose body this does not read
+            raise ValueError("an environment entry a shell takes for a function")
         argv, fed, child = _unwrap(argv, child, out)
         if argv:
-            evaluated = _program(argv, fed, scope, child)
+            evaluated = _program(argv, fed, scope, child, written)
             if evaluated is not None:  # eval runs its text in this shell
                 after = _union(evaluated, start) if prefixed else evaluated
         return after
@@ -1721,7 +1757,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             raise ValueError("shells inside shells deeper than can be read")
         return _read(text, ctx, env, depth + 1)
 
-    def _program(argv: list[str], fed: bool, scope: dict, child) -> dict | None:
+    def _program(argv: list[str], fed: bool, scope: dict, child, written: bool = False) -> dict | None:
         """Record one program. For eval, returns what the variables hold after the text it runs.
         A shell it starts (bash -c) is read with child(), what that shell finds in its environment."""
         fed = fed or any("$" in a for a in argv)  # a $ in single quotes (_LITERAL) is text, not a value
@@ -1740,7 +1776,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         out.program_globs.append(globs)
         sets: tuple[set[str], list[str]] = (set(), [])
         out.program_sets.append(sets)
-        charset = 0 if fed else _set_operand(raw)
+        charset = _set_operand(raw) if written and not fed else 0
         program = os.path.basename(raw[0])
         for i, arg in enumerate(argv[1:], 1):
             for form in _wider(arg, scope):
@@ -1852,12 +1888,22 @@ def _operands(argv: list[str]) -> list[str]:
 _TR = ("tr", "/usr/bin/tr", "/bin/tr")  # and a function the command defines may have any of these names
 
 
+def _as_written(word: str) -> bool:
+    """The shell gives the word to the program as one word, as it is written: there is nothing in
+    it that it expands, splits or matches against file names. An empty variable or a glob that
+    matches nothing is no word at all (#68), and a brace or a variable may be several. A word that
+    ends in @, + or ! may begin an extended glob, @(x), which this takes for the word and a ( ... )
+    after it."""
+    return not re.search(r"[$`*?\[{" + _MARK + _OPAQUE + "]|[@+!]$", word)
+
+
 def _set_operand(raw: list[str]) -> int:
     """Where tr's first set (`/` in `tr / _`) is among the words, or 0. tr opens no file, and the
     characters of that set are the ones it takes out of what it reads or puts others in place
     of: what it writes has none of them that was not in what it read. So it names no path,
-    and none that $(... | tr / _) may give another program. Not when it is the last word: the
-    next command has that as $_. Not when a word up to it is expanded: it may be several words."""
+    and none that $(... | tr / _) may give another program. Only for a command whose words are
+    each one word as written (_as_written), and not when the set is the last of them: the next
+    command has that as $_."""
     if raw[0] not in _TR:
         return 0
     words = _operands(raw)
@@ -1866,7 +1912,7 @@ def _set_operand(raw: list[str]) -> int:
         k += 1
         if words[k - 1] == "--":
             break
-    return k if k < len(words) - 1 and not any("$" in w for w in words[:k + 1]) else 0
+    return k if k < len(words) - 1 else 0
 
 
 def resolve(name: str, dirs: list[str]) -> list[str]:
