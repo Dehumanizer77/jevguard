@@ -1114,18 +1114,22 @@ def test_a_word_that_may_vanish_leaves_the_set_the_last_word(guard, tmp_path):
     assert shell.read('cat "$_"', "/w").dynamic  # $_ is picked at run time
 
 
-def test_a_function_bash_takes_from_its_environment_cannot_be_read(guard, tmp_path):
+def test_a_function_bash_takes_from_its_environment_cannot_be_read(guard, tmp_path, monkeypatch):
     """#69: bash takes an environment entry BASH_FUNC_name%%=() { ...; } for a function, in the
     bash env starts and in any started after it. Its body was not read, and the tr or cat it
     replaces only reads. Such an entry given to any program, or one whose name is not known,
     makes the command one that cannot be read. So does a word env or sudo may take for one once
-    it is filled in: a variable, a glob, what xargs -I puts in its place."""
+    it is filled in: a variable, a glob, what xargs -I puts in its place; and a name env -S
+    joins from quoted pieces, which the words of the command do not show. A function the guard's
+    own environment has, the shell has as well: it is not the command's."""
     body = "'BASH_FUNC_cat%%=() { rm -rf \"$1\"; }'"
     assert ".claude" in _rm_in_bash(tmp_path, f"env {body} bash -c 'cat .claude'")
     (tmp_path / "entries").write_text('BASH_FUNC_cat%%=() { zap -rf "$1"; }\n')
     (tmp_path / "work" / 'BASH_FUNC_cat%%=() { zap -rf "$1"; }').touch()
+    split = "env -S \"'BASH_''FUNC_cat%%=() { rm -rf .claude; }' bash -c 'cat .claude'\""
     filled = ("read a < ../entries; env \"$a\" bash -c 'cat .claude'", "env * bash -c 'cat .claude'",
-              "xargs -I X env X bash -c 'cat .claude' < ../entries", "xargs -i env {} bash -c 'cat .claude' < ../entries")
+              "xargs -I X env X bash -c 'cat .claude' < ../entries", "xargs -i env {} bash -c 'cat .claude' < ../entries",
+              split, f"nohup env {split[4:]}", f"env FOO=1 env {split[4:]}")
     for cmd in filled:
         assert ".claude" in _rm_in_bash(tmp_path, cmd), cmd
     for cmd in (f"env {body} bash -c 'cat .claude'", f"env -i {body} /bin/bash -c 'cat .claude'",
@@ -1136,6 +1140,10 @@ def test_a_function_bash_takes_from_its_environment_cannot_be_read(guard, tmp_pa
         assert "could not be read" in _reason(guard, cmd), cmd
     for cmd in ("env FOO=1 bash -c 'cat notes'", "sudo -u root FOO=1 cat notes", "sudo FOO-BAR=1 cat notes",
                 "env FOO=\"$(pwd)\" bash -c 'cat notes'", "xargs -I X env FOO=1 cp X out < list",
-                "xargs -I{} sudo chown me {} < list", 'sudo -e "$f"'):
+                "xargs -I{} sudo chown me {} < list", 'sudo -e "$f"', "env -S 'FOO=1 bash -c \"cat notes\"'",
+                "env -S \"bash -c 'cat notes'\""):
         assert _reason(guard, cmd) == "", cmd
     assert shell.read("sudo /opt/a=b/run notes", "/w").programs == [["/opt/a=b/run", "notes"]]
+    monkeypatch.setenv("BASH_FUNC_module%%", "() { :; }")
+    for cmd in ("env -i FOO=1 bash -c 'cat notes'", "sudo bash -c 'cat notes'", "bash -c 'cat notes'"):
+        assert ["cat", "notes"] in shell.read(cmd, "/w").programs, cmd

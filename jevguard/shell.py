@@ -1139,9 +1139,12 @@ def _known_entry(word: str, replaced: list[str]) -> None:
     """The name of an entry env or sudo puts in the environment of what it runs, or a word they may
     take for NAME=VALUE once it is filled in: "$a", a glob that matches a file named so, a word
     with what xargs -I puts its input in place of (replaced). One whose text is not known may be a
-    function bash imports (#69)."""
+    function bash imports (#69), and so is one named BASH_FUNC_...: env -S joins its quoted pieces
+    into such a name only after the words of the command were looked at (run)."""
     if not _as_written(word) or any(g in word for g in replaced):
         raise ValueError("an environment entry whose name is not known")
+    if _IMPORTS in word:
+        raise ValueError("an environment entry a shell takes for a function")
 
 
 def _sudo_entry(wrapper: str, word: str) -> bool:
@@ -1795,6 +1798,9 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             raise ValueError("a shell that reads its commands from a pipe")  # `echo 'rm ...' | bash`
         if program in _TAKES_COMMAND:
             shell_env = _reset(child()) if program == "su" else child()
+            if any(_IMPORTS in name and any(v is not None and v != os.environ.get(name) for v in values)
+                   for name, values in shell_env.items()):  # a function this shell imports from the command (#69)
+                raise ValueError("an environment entry a shell takes for a function")
             for i, arg in enumerate(text[1:], 1):
                 # the string after -c, and for a shell any argument with spaces in it: a script
                 # given as a here-document arrives that way. A shell of its own: what it sets stays there.
