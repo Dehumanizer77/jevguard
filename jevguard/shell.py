@@ -1781,9 +1781,19 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         out.program_sets.append(sets)
         charset = _set_operand(raw) if written and not fed else 0
         program = os.path.basename(raw[0])
+        # What ssh runs on the other host: its command, and the text of a here-document or
+        # here-string, which it sends there as input. ~, $HOME and /home/me in it are that host's
+        # home, so the home directory and those above it do not count there; what is in them
+        # does, as the host may be this one or share its home. Its options run here.
+        remote = _ssh_command_at(argv) if program == "ssh" else 0
+        home = canonical("~")
         for i, arg in enumerate(argv[1:], 1):
+            there = remote and (remote <= i <= len(operands) or raw[i - 1] == "<<<")
+            named: set[str] = set() if there else paths
             for form in _wider(arg, scope):
-                _note_paths(form, out.dirs, *(sets if i == charset else (paths, globs)))
+                _note_paths(form, out.dirs, *(sets if i == charset else (named, globs)))
+            if there:
+                paths.update(p for p in named if not under(home, p))
             if ">" in raw[i - 1] and set(raw[i - 1]) <= _REDIRECT_CHARS and not (
                     raw[i - 1].endswith("&") and (raw[i].isdigit() or raw[i] == "-")):  # 2>&1 writes no file
                 for target in expand_braces(raw[i]):
@@ -1919,6 +1929,40 @@ def _set_operand(raw: list[str]) -> int:
         if words[k - 1] == "--":
             break
     return k if k < len(words) - 1 else 0
+
+
+_SSH_VALUE_OPTS = set("BbcDEeFIiJLlmOoPpRSWw")  # ssh's options whose value is the rest of the word or the next one
+_SSH_FLAGS = set("46AaCfGgKkMNnqsTtVvXxYy")
+
+
+def _ssh_command_at(argv: list[str]) -> int:
+    """Where among ssh's words the command it runs on the other host begins (one past its last
+    word when it is given none), or 0 when that cannot be told: a word that is not one word as
+    written (_as_written), or an option this does not know. Options may stand before and after
+    the destination, as OpenSSH reads them in both places; the first other word after it begins
+    the command, and so does the word after `--`."""
+    words = _operands(argv)
+    k, host = 1, 0
+    while k < len(words):
+        word = words[k]
+        if not _as_written(word):
+            return 0
+        if word == "--":
+            k += 1 if host else 2  # ssh -- host command
+            return k if k <= len(words) else 0
+        if word.startswith("-") and len(word) > 1:
+            for j, letter in enumerate(word[1:], 1):
+                if letter in _SSH_VALUE_OPTS:
+                    k += j == len(word) - 1  # -o Opt=x, and -oOpt=x with the value in it
+                    break
+                if letter not in _SSH_FLAGS:
+                    return 0
+            k += 1
+        elif host:
+            return k
+        else:
+            host, k = k, k + 1
+    return k if host else 0
 
 
 def resolve(name: str, dirs: list[str]) -> list[str]:
