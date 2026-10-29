@@ -89,6 +89,11 @@ EOF"""
     # where the other host's commands start is theirs: this command's directory stays /work
     "ssh server.example 'cd ~ && ls'; touch .",
     "ssh server.example ls; touch \"$PWD\" build",
+    "trap 'touch .' EXIT; ssh server.example 'cd ~ && ls'",
+    "ssh server.example \"cd ~; trap 'ls' EXIT\"; touch build",
+    # what a program there that is not a shell reads from a pipe is data
+    "echo hi | ssh server.example 'cat > /srv/x'",
+    "tar c src | ssh server.example 'tar x -C /srv'",
 ])
 def test_the_home_named_in_what_ssh_runs_on_another_host_is_that_hosts(guard, command):
     assert ask_reason(guard, command) == "", command
@@ -131,6 +136,19 @@ def test_what_ssh_does_here_is_still_asked_about(guard, command):
     "ssh localhost <<'EOF'\ntouch ..\nEOF",
     "HOME=/tmp/x PWD=/tmp/x ssh localhost 'touch \"$HOME\" \"$PWD\"'",
     "cd /srv && ssh localhost 'touch .'",
+    # and what that shell leaves to run at its end runs there too
+    "ssh localhost \"trap 'touch .' EXIT\"",
+    "ssh localhost \"f() { touch .; }; trap f EXIT\"",
+    "ssh localhost \"cd Downloads; trap 'touch ..' EXIT\"",
+    "ssh localhost 'bash -s' <<< \"trap 'touch .' EXIT\"",
+    "ssh localhost <<'EOF'\ntrap 'touch \"$PWD\"' EXIT\ncd /srv\nEOF",
+    # also where the command's beginning is not certain: reading it only adds
+    "ssh localhost 'touch . *.log'",
+    "ssh localhost \"touch . $unknown\"",
+    "ssh -l $empty localhost 'touch .'",
+    # a shell there that reads its commands from a pipe: what they are cannot be read
+    "echo 'touch .' | ssh localhost",
+    "cat script.sh | ssh localhost 'bash -s'",
     # what ssh sends to a program that is not a shell is not read as commands: it counts as before
     f"ssh server.example python3 - <<< 'import os; os.utime(\"{HOME}\")'",
     f"ssh server.example 'bash script.sh' <<< '{HOME}'",
