@@ -3,9 +3,13 @@ were false alarms: the check for administration commands matched the word "jevgu
 anywhere within eighty characters, by a word like "gate" or "release". The package directory is
 called jevguard/ and has a gate.py in it."""
 
+import os
+
 import pytest
 
 from conftest import BENIGN
+
+HOME = os.path.expanduser("~")
 
 
 def ask_reason(guard, command, description="", cwd="/work", tool="Bash"):
@@ -59,6 +63,108 @@ def test_working_on_a_project_called_jevguard_is_not_changing_the_guard(guard, c
     "cat > notes.md <<'EOF'\nthen run jevguard install to finish\nEOF",
 ])
 def test_administration_commands_are_still_asked_about(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+# Asked about on 2026-10-27 as "ssh is given a text that mentions /home/me": the $HOME and ~ of
+# a script ssh runs on another host were filled in with this machine's.
+REMOTE_SCRIPT = r"""timeout 60 ssh -o BatchMode=yes server.example 'bash -s' <<'EOF' 2>&1 | cut -c1-230
+tmux list-panes -a -F "#{pane_pid}|#{pane_current_path}" 2>/dev/null | while IFS="|" read pid path; do
+  mp=$(tr "\0" "\n" < /proc/$pid/environ 2>/dev/null | sed -n "s/^FNM_MULTISHELL_PATH=//p")
+  echo "$pid cwd=${path/#$HOME/~} fnm=${mp:-none}"
+done
+EOF"""
+
+
+@pytest.mark.parametrize("command", [
+    REMOTE_SCRIPT,
+    "ssh server.example 'echo $HOME'",
+    f"ssh server.example 'ls {HOME} /home /'",
+    "ssh server.example 'du -sh $HOME'",
+    "ssh -qo BatchMode=yes server.example -v -- ls '$HOME'",
+    "ssh server.example <<< 'cd ~ && ls ${HOME}/..'",
+    "ssh server.example 'bash -s' <<< 'du -sh ~'",
+    "ssh -p 2222 -l deploy server.example 'echo $HOME'",
+    "ssh -l '' server.example 'echo $HOME'",  # a quoted "" is a word
+    # where the other host's commands start is theirs: this command's directory stays /work
+    "ssh server.example 'cd ~ && ls'; touch .",
+    "ssh server.example ls; touch \"$PWD\" build",
+    "trap 'touch .' EXIT; ssh server.example 'cd ~ && ls'",
+    "ssh server.example \"cd ~; trap 'ls' EXIT\"; touch build",
+    # what a program there that is not a shell reads from a pipe is data
+    "echo hi | ssh server.example 'cat > /srv/x'",
+    "tar c src | ssh server.example 'tar x -C /srv'",
+])
+def test_the_home_named_in_what_ssh_runs_on_another_host_is_that_hosts(guard, command):
+    assert ask_reason(guard, command) == "", command
+
+
+@pytest.mark.parametrize("command", [
+    # what is in that home still counts: the host may be this one, or share its home
+    "ssh server.example 'cat ~/.claude/settings.json'",
+    "ssh server.example <<< 'ls $HOME/.claude'",
+    # ssh's options and redirections take effect here
+    "ssh -o 'LocalCommand=ls $HOME' -o PermitLocalCommand=yes server.example",
+    "ssh -oLocalCommand='ls $HOME' -oPermitLocalCommand=yes server.example",
+    "ssh server.example -o 'LocalCommand=ls $HOME' -o PermitLocalCommand=yes true",
+    "ssh -E ~/.claude/settings.json server.example true",
+    "ssh server.example true > ~/.claude/settings.json",
+    # which word is the destination cannot be told: one may vanish or split (#72)
+    "ssh $opts server.example 'echo $HOME'",
+    "ssh -Z server.example 'echo $HOME'",
+    "empty=; ssh -F /dev/null -l $empty deploy server.example -o 'ProxyCommand=touch $HOME' true",
+    "ssh server.example $empty -oProxyCommand='touch $HOME' true",
+    "ssh -l deploy* server.example -o 'ProxyCommand=touch $HOME' true",
+    "ssh -l {deploy,x} server.example -o 'ProxyCommand=touch $HOME' true",
+    'ssh server.example "du -sh $HOME"',
+])
+def test_what_ssh_does_here_is_still_asked_about(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    # the host may be this one: a change to the home there is asked about as one here (#73)
+    "ssh localhost 'touch \"$HOME\"'",
+    "ssh server.example 'cd && touch .'",
+    "ssh server.example 'bash -s' <<< 'touch $HOME'",
+    "ssh server.example <<'EOF'\ntouch ~/..\nEOF",
+    "ssh server.example 'bash -c \"touch ~\"'",
+    # where it starts: in the home, with PWD set there, not in this command's directory (/work)
+    "ssh localhost 'echo \"$HOME\"; touch \"$PWD\"'",
+    "ssh localhost 'touch .'",
+    "ssh localhost 'bash -s' <<< 'touch \"$PWD\"'",
+    "ssh localhost <<'EOF'\ntouch ..\nEOF",
+    "HOME=/tmp/x PWD=/tmp/x ssh localhost 'touch \"$HOME\" \"$PWD\"'",
+    "cd /srv && ssh localhost 'touch .'",
+    # and what that shell leaves to run at its end runs there too
+    "ssh localhost \"trap 'touch .' EXIT\"",
+    "ssh localhost \"f() { touch .; }; trap f EXIT\"",
+    "ssh localhost \"cd Downloads; trap 'touch ..' EXIT\"",
+    "ssh localhost 'bash -s' <<< \"trap 'touch .' EXIT\"",
+    "ssh localhost <<'EOF'\ntrap 'touch \"$PWD\"' EXIT\ncd /srv\nEOF",
+    # also where the command's beginning is not certain: reading it only adds
+    "ssh localhost 'touch . *.log'",
+    "ssh localhost \"touch . $unknown\"",
+    "ssh -l $empty localhost 'touch .'",
+    # a shell there that reads its commands from a pipe: what they are cannot be read
+    "echo 'touch .' | ssh localhost",
+    "cat script.sh | ssh localhost 'bash -s'",
+    # what ssh sends to a program that is not a shell is not read as commands: it counts as before
+    f"ssh server.example python3 - <<< 'import os; os.utime(\"{HOME}\")'",
+    f"ssh server.example 'bash script.sh' <<< '{HOME}'",
+])
+def test_what_ssh_runs_on_another_host_is_read_as_if_it_ran_here(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    # bash sets $_ to ssh's last word: the home, though ssh is not asked about for it (#71)
+    f'ssh server.example {HOME}; read p <<< "$_"; touch "$p"',
+    'ssh server.example "$HOME"; read p <<< "$_"; touch "$p"',
+    # and what the other host prints may be this one's home
+    "p=$(ssh localhost 'echo $HOME'); touch \"$p\"",
+])
+def test_the_home_ssh_is_given_reaches_a_program_given_a_value_later(guard, command):
     assert ask_reason(guard, command) != "", command
 
 

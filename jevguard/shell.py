@@ -1346,12 +1346,28 @@ class _Frame:
 
 def read(cmd: str, cwd: str = "") -> Command:
     cmd = cmd.replace("\0", "").replace(_MARK, "").replace(_OPAQUE, "")
-    out = Command(cwd)
-    ctx = _Context(out)
     # The hook runs in the environment Claude Code gives its commands, so a variable set there
     # has the value the command saw (_values). Only what neither that nor the command itself sets is unknown.
-    env = _read(cmd, ctx, {"HOME": (os.path.expanduser("~"),), "PWD": (cwd,)}, 0)
+    out, env = _shell(cmd, cwd, {"HOME": (os.path.expanduser("~"),), "PWD": (cwd,)}, 0)
+    visible = _SINGLE_QUOTED.sub("''", _prepare(cmd))  # '$1' in an awk program is not a shell variable
+    used = {a or b for a, b in _VAR.findall(visible)}
+    unset = used - set(env) - set(os.environ) | used & {"_"}  # $_: never known (_values)
+    out.dynamic = bool(_DYNAMIC.search(visible) or unset)
+    return out
+
+
+def _shell(cmd: str, cwd: str, env: dict, depth: int, within: _Context | None = None) -> tuple[Command, dict]:
+    """cmd read as a shell of its own, started in cwd with the variables holding what env says:
+    what it runs, and what they may hold when it has ended. Its functions, its traps and the
+    directories it goes to are its own, and what it leaves to run at its end is read there.
+    within: the reading it is part of, whose limit on how much is read it shares."""
+    out = Command(cwd)
+    ctx = _Context(out)
+    ctx.work = within.work if within else 0
+    env = _read(cmd, ctx, env, depth)
     ctx.finish(env)
+    if within:
+        within.work = ctx.work
     if ctx.defined & set(_TR) or any(argv[0] == "alias" for argv in out.programs):
         # `tr() { rm -rf "$1"; }; tr / _`: the tr run is the command's own, and its words are
         # what that is given
@@ -1360,11 +1376,19 @@ def read(cmd: str, cwd: str = "") -> Command:
             globs += more_globs
             out.paths |= more
             out.globs += more_globs
-    visible = _SINGLE_QUOTED.sub("''", _prepare(cmd))  # '$1' in an awk program is not a shell variable
-    used = {a or b for a, b in _VAR.findall(visible)}
-    unset = used - set(env) - set(os.environ) | used & {"_"}  # $_: never known (_values)
-    out.dynamic = bool(_DYNAMIC.search(visible) or unset)
-    return out
+    return out, env
+
+
+def _add(out: Command, there: Command) -> None:
+    """What a shell of its own ran and named, added to the command that started it. Not the
+    directories it went to: they are not this command's."""
+    for mine, its in ((out.programs, there.programs), (out.program_dirs, there.program_dirs),
+                      (out.program_paths, there.program_paths), (out.program_globs, there.program_globs),
+                      (out.program_fed, there.program_fed), (out.program_sets, there.program_sets)):
+        mine.extend(its)
+    out.writes |= there.writes
+    out.paths |= there.paths
+    out.globs += there.globs
 
 
 def _read(cmd: str, ctx: _Context, env: dict, depth: int, inline: bool = True) -> dict:
@@ -1781,15 +1805,46 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         out.program_sets.append(sets)
         charset = _set_operand(raw) if written and not fed else 0
         program = os.path.basename(raw[0])
+        # What ssh runs on the other host: its command, and what it sends there to a shell that
+        # reads its commands from it (a here-document, a here-string). The host may be this one or
+        # share its home, so both are read as commands run here (#73), wherever the command
+        # appears to begin: that only adds to what is asked about. The home and the directories
+        # above it that they name do not make ssh itself a change, but the command still names
+        # them, for a program given a value later (#71). That only where the command's beginning
+        # is certain, each word being one word as written and none coming from elsewhere: one
+        # that vanishes moves the destination, and an option after it runs here (#72).
+        remote = _ssh_command_at(raw) if program == "ssh" else 0
+        sent = " ".join(text[remote:len(operands) + 1]) if remote else ""
+        here = max((i for i in range(2, len(raw)) if raw[i - 1] == "<<<"), default=0)
+        script = here if remote and _reads_commands(sent) else 0
+        if remote and piped and _reads_commands(sent) and not any(a in ("<", "<<<") for a in raw[len(operands) + 1:]):
+            raise ValueError("a shell that reads its commands from a pipe")  # `echo 'rm ...' | ssh host`
+        apart = remote if written and not fed else 0
+        home = canonical("~")
         for i, arg in enumerate(argv[1:], 1):
+            there = apart and (apart <= i <= len(operands) or i == script)
+            named: set[str] = set() if there else paths
             for form in _wider(arg, scope):
-                _note_paths(form, out.dirs, *(sets if i == charset else (paths, globs)))
+                _note_paths(form, out.dirs, *(sets if i == charset else (named, globs)))
+            if there:
+                out.paths |= named
+                paths.update(p for p in named if not under(home, p))
             if ">" in raw[i - 1] and set(raw[i - 1]) <= _REDIRECT_CHARS and not (
                     raw[i - 1].endswith("&") and (raw[i].isdigit() or raw[i] == "-")):  # 2>&1 writes no file
                 for target in expand_braces(raw[i]):
                     out.writes.update(resolve(target, out.dirs))
         out.paths |= paths
         out.globs += globs
+        if sent or script:
+            # Each runs in a shell of its own, which sshd starts in the home directory with HOME
+            # and PWD set to it, whatever they hold here. What it sets, the directories it goes
+            # to and the traps it leaves stay there, and are read there; what it runs and
+            # names is this command's.
+            if depth >= _DEPTH:
+                raise ValueError("shells inside shells deeper than can be read")
+            there = {**child(), "HOME": (home,), "PWD": (home,), "OLDPWD": (None,)}
+            for commands in ([sent] if sent else []) + ([text[script]] if script else []):
+                _add(out, _shell(commands, home, there, depth + 1, ctx)[0])
         if program == "cd":
             targets = [a for a in raw[1:] if not a.startswith("-")][:1] or \
                 [home for home in _values(scope, "HOME") if home is not None]
@@ -1919,6 +1974,62 @@ def _set_operand(raw: list[str]) -> int:
         if words[k - 1] == "--":
             break
     return k if k < len(words) - 1 else 0
+
+
+_SSH_VALUE_OPTS = set("BbcDEeFIiJLlmOoPpRSWw")  # ssh's options whose value is the rest of the word or the next one
+_SSH_FLAGS = set("46AaCfGgKkMNnqsTtVvXxYy")
+
+
+def _ssh_command_at(argv: list[str]) -> int:
+    """Where among ssh's words the command it runs on the other host begins (one past its last
+    word when it is given none), or 0 when that cannot be told: an option this does not know.
+    Options may stand before and after the destination, as OpenSSH reads them in both places;
+    the first other word after it begins the command, and so does the word after `--`. Only for
+    words that are each one word as written (_as_written): the reader keeps an empty value as
+    a word, and `-l $empty user host` would take user for the destination (#72)."""
+    words = _operands(argv)
+    k, host = 1, 0
+    while k < len(words):
+        word = words[k]
+        if word == "--":
+            k += 1 if host else 2  # ssh -- host command
+            return k if k <= len(words) else 0
+        if word.startswith("-") and len(word) > 1:
+            for j, letter in enumerate(word[1:], 1):
+                if letter in _SSH_VALUE_OPTS:
+                    k += j == len(word) - 1  # -o Opt=x, and -oOpt=x with the value in it
+                    break
+                if letter not in _SSH_FLAGS:
+                    return 0
+            k += 1
+        elif host:
+            return k
+        else:
+            host, k = k, k + 1
+    return k if host else 0
+
+
+def _reads_commands(command: str) -> bool:
+    """Whether what ssh runs on the other host takes its commands from its input: the login
+    shell when it is given no command, or a shell given neither -c nor a file (bash -s, sh).
+    For anything else what ssh sends is data, which is not read as commands."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if not words:
+        return True
+    if os.path.basename(words[0]) not in _SHELLS:
+        return False
+    reads = False
+    for word in words[1:]:
+        if word == "--" or not word.startswith("-"):  # a file, or with -s the arguments of what it reads
+            return reads
+        if not word.startswith("--"):
+            if "c" in word:
+                return False
+            reads = reads or "s" in word
+    return True
 
 
 def resolve(name: str, dirs: list[str]) -> list[str]:

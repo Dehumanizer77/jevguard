@@ -95,7 +95,20 @@ Two checks read the call itself and use no model:
   file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`),
   through a directory above it (`rm -rf ~/.claude`, `mv ~/.grok/hooks x`), or as the place a command writes to in
   any spelling (`curl -o/path`, `--output-dir` with `-O`, `cd` there and download,
-  `cp -t`, `dd of=`), and for commands run from inside the guard's directories. Reading a
+  `cp -t`, `dd of=`), and for commands run from inside the guard's directories. What `ssh`
+  runs on another host (its command, and a here-document or here-string it sends to a shell
+  there) is read as commands run here, as the host may be this one or share the home, and
+  starting where sshd starts them, in the home directory with `$PWD` set to it:
+  `ssh host 'touch ~'` and `ssh host 'touch .'` are held as `touch ~` is. It is read as a
+  shell of its own: what it leaves to run at its end (a trap) runs there too, and its `cd`
+  does not move the commands after `ssh`. A shell there that reads its commands from a pipe
+  (`echo ... | ssh host`) is held, as `echo ... | bash` is. The home directory and those above it named
+  there do not by themselves make `ssh` a change (`ssh host 'du -sh ~'`), a file in the home
+  still does (`ssh host 'cat ~/.claude/settings.json'`), and ssh's own options
+  (`-o LocalCommand=`, `-E`) and redirections are read as running here. The home and those above it
+  stop counting for `ssh` only where each of its words is one word as written (no variable,
+  glob or brace that may vanish or split); otherwise its words count as they are as well. What it sends to a program other than a shell
+  is data and counts as it is. Reading a
   settings file (`cat`, `jq`, `grep`) is not held; reading the guard's own directory is,
   because the API key is there. This applies in every session, whatever `gate` says. Switch
   off with `protect_guard: false`.
