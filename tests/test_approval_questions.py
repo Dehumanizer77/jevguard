@@ -212,9 +212,62 @@ LOCAL_SCRIPT = REMOTE_SCRIPT.replace("timeout 60 ssh -o BatchMode=yes server.exa
     "bash <<< 'ls $HOME /home'",
     "sh -c 'du -sh ~'",
     "bash -lc 'ls ~ $HOME'",
+    # every option comes before the script, also one after -c, and -o and -O take a value (#77, #78)
+    "bash -c -x 'echo $HOME'",
+    "bash -O extglob -c 'ls $HOME'",
+    "bash -eo pipefail -c 'du -sh ~'",
+    "bash --norc -c 'echo $HOME'",
+    # what it prints goes nowhere that runs it
+    "bash -c 'du -sh ~' | sort -h | head",
+    "bash -c 'ls $HOME' > /dev/null",
 ])
 def test_a_script_given_to_a_shell_here_is_read_as_its_commands(guard, command):
     assert ask_reason(guard, command) == "", command
+
+
+@pytest.mark.parametrize("command", [
+    # a script operand or -- ends the shell's options: the -c after it is the script's own (#77)
+    f"bash notes.sh -c {HOME}",
+    f"bash -- notes.sh -c {HOME}",
+    f"bash notes.sh -lc {HOME}",
+    f"bash -x notes.sh -c {HOME}",
+    f"sh - -c {HOME}",
+])
+def test_an_argument_after_a_script_is_the_scripts_and_not_a_command(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    # the home a script names counts for the shell or ssh that runs it whenever the script does more
+    # than read: it may write it into a file and run that (#78, #79), or hand it to a program
+    "bash -c 'echo touch $HOME > s.sh; bash -e s.sh'",
+    "bash -c 'echo touch $HOME > s.sh; bash -O extglob s.sh'",
+    "bash -c 'echo touch $HOME > s.sh; bash -o errexit s.sh'",
+    "bash -c 'echo touch $HOME | tee s.sh; bash s.sh'",
+    "bash -c 'echo touch $HOME | sed -n \"w s.sh\"; bash s.sh'",
+    "bash -c 'echo touch $HOME > s.sh; chmod +x s.sh; ./s.sh'",
+    "bash -c 'echo \"all:; touch $HOME\" > Makefile; make'",
+    "ssh localhost 'echo touch $HOME | tee s.sh; bash s.sh'",
+    "ssh localhost 'echo touch $HOME > s.sh; bash -e s.sh'",
+    # programs that run what they are given, though they look like they only read
+    "bash -c 'rg --pre \"touch $HOME\" x .'",
+    "bash -c 'sed -n \"1e touch $HOME\" /etc/hostname'",
+    "bash -c 'tmux list-panes -F \"#(touch $HOME)\"'",
+    "bash -c 'sort --compress-program=./x $HOME'",
+    # a value bash reads as arithmetic, where a subscript runs what is in it
+    "bash -c 'x=\"a[\\$(touch \\$HOME)]\"; test \"$x\" -eq 1'",
+    "bash -c 'x=\"a[\\$(touch \\$HOME)]\"; printf \"%d\" \"$x\"'",
+    # variables that programs and the shell take as instructions
+    "bash -xc 'PS4=\"\\$(touch \\$HOME)\"; ls'",
+    "bash -c 'LD_PRELOAD=./x.so ls $HOME'",
+    "BASH_ENV=./x.sh bash -c 'ls $HOME'",
+    # what the script prints, into a file or a program that does more than read
+    "bash -c 'echo touch $HOME' | tee s.sh",
+    "bash -c 'echo $HOME' | python3 -c 'import sys'",
+    "ssh server.example 'du -sh $HOME' > report.txt",
+])
+def test_the_home_a_script_names_counts_where_the_script_may_hand_it_on(guard, command):
+    assert ask_reason(guard, command) != "", command
 
 
 @pytest.mark.parametrize("command", [
@@ -241,9 +294,45 @@ def test_what_a_shell_runs_here_is_still_asked_about(guard, command):
     "bash -c 'source <(echo touch $HOME)'",
     "bash -c 'echo touch $HOME > s.sh; bash s.sh'",
     "ssh localhost 'source <(echo touch $HOME)'",
+    # whatever options the shell or interpreter is given before the file (#78)
+    "echo touch $HOME > s.sh; bash -e s.sh",
+    "echo touch $HOME > s.sh; bash -O extglob s.sh",
+    "echo touch $HOME > s.sh; bash -o errexit < s.sh",
+    f"echo 'import os; os.utime(\"{HOME}\")' > s.py && python3 -W ignore s.py",
+    # and whichever program wrote the file (#79)
+    "echo touch $HOME | tee s.sh; bash s.sh",
+    "echo touch $HOME | dd of=s.sh; bash s.sh",
+    "echo touch $HOME > a; cp a s.sh; bash s.sh",
+    # run by its path, or read from the pipe through a file name
+    "echo touch $HOME > s.sh; chmod +x s.sh; ./s.sh",
+    f"echo 'import os; os.utime(\"{HOME}\")' | python3 /dev/stdin",
 ])
 def test_a_script_the_command_makes_and_runs_is_given_what_the_command_names(guard, command):
     assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    "echo touch $HOME | bash -s -- -c",  # -c after -- is an argument: bash reads the pipe
+    "echo touch $HOME | bash /dev/stdin -c x",
+    "echo touch $HOME | bash -sc 'echo hi'",  # dash runs both
+    # also inside a part of the pipeline, where its input is the pipe's
+    "echo touch $HOME | (bash)",
+    "echo touch $HOME | { sh -s; }",
+    "echo touch $HOME | while read l; do bash; done",
+    "bash -c 'echo touch $HOME' | (bash)",
+    "ssh server.example 'echo touch $HOME' | (sh)",
+])
+def test_a_shell_that_reads_its_commands_from_a_pipe_is_asked_about(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    "find . -name '*.sh' | while read f; do bash \"$f\"; done",  # each script reads the pipe as data
+    "printf 'y\\n' | (cd sub && bash -c 'read a; echo $a')",
+    "git log --oneline | head -5",
+])
+def test_a_shell_that_reads_data_from_a_pipe_is_not_asked_about(guard, command):
+    assert ask_reason(guard, command) == "", command
 
 
 @pytest.mark.parametrize("command", [
