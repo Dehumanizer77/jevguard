@@ -805,18 +805,21 @@ def test_a_loop_is_read_with_what_its_passes_leave(guard):
 
 def _rm_in_bash(tmp_path, cmd) -> set:
     """What `rm -rf` is given when bash runs cmd, with rm swapped for a program that only writes
-    its arguments down. The reader has to see every one of them."""
-    stub, log, work = tmp_path / "bin" / "zap", tmp_path / "zap.log", tmp_path / "work"
+    its arguments down. The reader has to see every one of them. bash runs with a home of its
+    own in tmp_path, so that what slips past the swap cannot reach the real one."""
+    stub, log, work, home = tmp_path / "bin" / "zap", tmp_path / "zap.log", tmp_path / "work", tmp_path / "home"
     if not stub.exists():
         stub.parent.mkdir()
         stub.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a" >> "$ZAPLOG"; done\n')
         stub.chmod(0o755)
         work.mkdir()
+        home.mkdir()
     swapped = cmd.replace("rm -rf", "zap -rf")
     assert "rm " not in swapped, cmd
     log.unlink(missing_ok=True)
     subprocess.run(["bash", "-c", swapped], cwd=work, capture_output=True, timeout=10,
-                   env={**os.environ, "PATH": f"{stub.parent}:{os.environ['PATH']}", "ZAPLOG": str(log)})
+                   env={**os.environ, "HOME": str(home), "PATH": f"{stub.parent}:{os.environ['PATH']}",
+                        "ZAPLOG": str(log)})
     return set(log.read_text().split()) - {"-rf"} if log.exists() else set()
 
 
