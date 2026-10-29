@@ -115,6 +115,12 @@ class Command:
         # and what an argument that is a set of characters would name (tr's first, _set_operand):
         # kept apart, and named with the others only if the command may make a tr of its own
         self.program_sets: list[tuple[set[str], list[str]]] = []
+        self.program_closed: list[bool] = []  # it writes no file and runs nothing this does not read (_only_reads)
+        # the home and the directories above it that a script it runs as commands names: they count
+        # for it only where they may reach something it does not read (_closed)
+        self.program_carried: list[set[str]] = []
+        self.assigned: list[str] = []        # the names of the variables it sets, in turn
+        self.piping = False                  # a program in it is given its input through a pipe
         self.writes: set[str] = set()        # canonical targets of > >> &> redirections
         self.dirs: list[str] = [canonical(cwd)] if cwd else []  # the starting directory and every `cd` target
         self.paths: set[str] = set()         # canonical paths the command names
@@ -1099,15 +1105,16 @@ def _grows(after: dict, before: dict) -> bool:
 
 
 def _snapshot(out: Command) -> tuple:
-    return len(out.programs), len(out.globs), len(out.dirs), set(out.paths), set(out.writes)
+    return len(out.programs), len(out.globs), len(out.dirs), set(out.paths), set(out.writes), len(out.assigned)
 
 
 def _restore(out: Command, snapshot: tuple) -> None:
     """out as it was at the snapshot: what was read since is read again."""
-    programs, globs, dirs, paths, writes = snapshot
+    programs, globs, dirs, paths, writes, assigned = snapshot
     for each in (out.programs, out.program_dirs, out.program_paths, out.program_globs, out.program_fed,
-                 out.program_sets):
+                 out.program_sets, out.program_closed, out.program_carried):
         del each[programs:]
+    del out.assigned[assigned:]
     del out.globs[globs:]
     del out.dirs[dirs:]
     out.paths.clear()
@@ -1353,6 +1360,23 @@ def read(cmd: str, cwd: str = "") -> Command:
     used = {a or b for a, b in _VAR.findall(visible)}
     unset = used - set(env) - set(os.environ) | used & {"_"}  # $_: never known (_values)
     out.dynamic = bool(_DYNAMIC.search(visible) or unset)
+    # The home that a script a shell or ssh runs names does not make that shell a change only if
+    # the script cannot hand it to anything this does not read (_closed). A script made only of
+    # programs that read cannot; what it prints can, through a file the command writes or a pipe
+    # into a program that does not only read (`bash -c 'echo ...' | tee s.sh`): then it counts
+    # again, as it did before #70. Of the programs that may write a file, not those that only
+    # read (`ps -o comm=` names a column) nor the shells and ssh, whose -o and -O set options:
+    # what they write, they write with a redirection, which is in out.writes.
+    writers = Command()
+    writers.writes = out.writes
+    for argv, dirs, closed in zip(out.programs, out.program_dirs, out.program_closed):
+        if not closed and os.path.basename(argv[0]) not in _SHELLS | {"ssh"}:
+            writers.programs.append(argv)
+            writers.program_dirs.append(dirs)
+    quiet = not written_paths(writers) - _NOWHERE and not (out.piping and not all(out.program_closed))
+    for paths, carried, closed in zip(out.program_paths, out.program_carried, out.program_closed):
+        if not (closed and quiet):
+            paths |= carried
     return out
 
 
@@ -1384,8 +1408,11 @@ def _add(out: Command, there: Command) -> None:
     directories it went to: they are not this command's."""
     for mine, its in ((out.programs, there.programs), (out.program_dirs, there.program_dirs),
                       (out.program_paths, there.program_paths), (out.program_globs, there.program_globs),
-                      (out.program_fed, there.program_fed), (out.program_sets, there.program_sets)):
+                      (out.program_fed, there.program_fed), (out.program_sets, there.program_sets),
+                      (out.program_closed, there.program_closed), (out.program_carried, there.program_carried),
+                      (out.assigned, there.assigned)):
         mine.extend(its)
+    out.piping = out.piping or there.piping
     out.writes |= there.writes
     out.paths |= there.paths
     out.globs += there.globs
@@ -1414,6 +1441,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
     carry = None     # (a loop's first token, what its passes may leave): it is read again with that
     passes = 0
     piped = False    # the command being read is given its input by the one before it, through a pipe
+    inpipe = False   # or it is inside a part of a pipeline that is: `... | (bash)`, `... | while ...; do sh; done`
 
     def expand(word: str, env: dict) -> dict:
         """The word is expanded, with the variables holding what env says: what they hold after
@@ -1458,7 +1486,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
 
     def finish(f: _Frame, op: str) -> None:
         """The command f is reading ends at op."""
-        nonlocal piped
+        nonlocal piped, inpipe
         words, after, f.words, f.closed = f.words, f.closed, [], None
         if silent:
             f.head = False
@@ -1476,12 +1504,14 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 # NAME holds each word in turn; without `in`, each argument the shell was given
                 each = [a for argv in readings for a in argv[3:]] if words[2:3] == ["in"] else [None]
                 env = {**env, words[1]: tuple(dict.fromkeys(each)) or (None,)}
+                out.assigned.append(str(words[1]))
             if env is not env_in(f):
                 part(f, env, ";")
                 f.entry = f.env
             return
         if words:  # after a closed part, its redirections: `done > log`
             piped = f.pipe is not None
+            inpipe = any(frame.pipe is not None for frame in frames)
             left = simple(words, env_in(f) if after is None else after)
             after = left if after is None else after
         if after is not None:
@@ -1707,6 +1737,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         for word in assigns:  # then these in turn: after `a=1 b=$a`, b is 1, and in b=$(...) too (#55)
             name, values, scope = assign(word, scope, True)
             scope = {**scope, name: values}
+            out.assigned.append(name)
         # A redirection, bash expands after the assignments of a command without a program, dash before.
         late = _union(env, scope) if assigns and redirects else env
         for word in redirects:
@@ -1791,9 +1822,24 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         text = [a.replace(_LITERAL, "$") for a in argv]  # as a shell that reads it later has it
         raw = [a.replace(_OPAQUE, "") for a in text]
         operands = _operands(raw)[1:]
-        if piped and _INTERPRETER.fullmatch(os.path.basename(raw[0])) and \
+        program = os.path.basename(raw[0])
+        # its input is the pipe's, unless it is given another
+        from_pipe = piped or inpipe and not any(a in ("<", "<<<") for a in raw[len(operands) + 1:])
+        if from_pipe and _INTERPRETER.fullmatch(program) and \
                 all(a.startswith("-") and a not in ("-c", "-e", "-E", "-m", "-r") for a in operands):
             fed = True  # `echo '...' | python3`: its program, and the paths in it, come through the pipe
+        # What source, a shell or an interpreter runs may be a file the command made, as may a
+        # program run by its path: `source <(echo ...)`, `echo ... > s.sh; bash -e s.sh`,
+        # `... | tee s.py; python3 -W ignore s.py`, `./s.sh`. Then what it runs is the command's
+        # own, as with eval "$(...)". Any of its words may name the file, whatever its options
+        # mean, and any program that writes one may have made it (written_paths).
+        runs = program in (".", "source") or program in _SHELLS or bool(_INTERPRETER.fullmatch(program))
+        if runs or "/" in raw[0]:
+            files = set(resolve(raw[0], out.dirs)) if "/" in raw[0] else set()
+            if runs:
+                files.update(p for a in raw[1:] if a for p in resolve(a, out.dirs))
+            if (runs and any(_FROM_PIPE.fullmatch(a) for a in raw[1:])) or files & written_paths(out):
+                fed = True
         out.programs.append(raw)
         out.program_fed.append(fed)
         out.program_dirs.append(list(out.dirs))
@@ -1803,31 +1849,48 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         out.program_globs.append(globs)
         sets: tuple[set[str], list[str]] = (set(), [])
         out.program_sets.append(sets)
+        carried: set[str] = set()
+        out.program_carried.append(carried)
+        me = len(out.program_closed)
+        out.program_closed.append(program not in _SHELLS and program != "ssh" and _only_reads(raw, fed)
+                                  and _plain(child()))
+        out.piping = out.piping or from_pipe
         charset = _set_operand(raw) if written and not fed else 0
-        program = os.path.basename(raw[0])
         # What ssh runs on the other host: its command, and what it sends there to a shell that
         # reads its commands from it (a here-document, a here-string). The host may be this one or
         # share its home, so both are read as commands run here (#73), wherever the command
         # appears to begin: that only adds to what is asked about. The home and the directories
-        # above it that they name do not make ssh itself a change, but the command still names
-        # them, for a program given a value later (#71). That only where the command's beginning
-        # is certain, each word being one word as written and none coming from elsewhere: one
-        # that vanishes moves the destination, and an option after it runs here (#72).
+        # above it that they name are carried: they make ssh a change only where they may reach
+        # something this does not read (read()), but the command still names them, for a program
+        # given a value later (#71). That only where the command's beginning is certain, each word
+        # being one word as written and none coming from elsewhere: one that vanishes moves the
+        # destination, and an option after it runs here (#72).
         remote = _ssh_command_at(raw) if program == "ssh" else 0
         sent = " ".join(text[remote:len(operands) + 1]) if remote else ""
+        takes = _reads_commands(sent) if remote else False
         here = max((i for i in range(2, len(raw)) if raw[i - 1] == "<<<"), default=0)
-        script = here if remote and _reads_commands(sent) else 0
-        if remote and piped and _reads_commands(sent) and not any(a in ("<", "<<<") for a in raw[len(operands) + 1:]):
+        script = here if takes is not False else 0
+        if remote and from_pipe and takes is not False and not any(a in ("<", "<<<") for a in raw[len(operands) + 1:]):
             raise ValueError("a shell that reads its commands from a pipe")  # `echo 'rm ...' | ssh host`
         apart = remote if written and not fed else 0
+        # A script a shell here is given, in its -c string or as the input it reads its commands
+        # from, is read as commands as well (below), as if it stood in place of the shell: what
+        # it names is carried in the same way. Where it is depends on all of the shell's options
+        # (_shell_call): after `bash notes.sh -c`, -c is the script's (#77).
+        call = _shell_call(raw) if program in _SHELLS else None
+        scripts: set[int] = set()
+        if call and written and not fed:
+            scripts = {call[1]} if call[0] == "command" else \
+                {i for i in range(2, len(raw)) if raw[i - 1] == "<<<" and call[0] == "stdin"}
         home = canonical("~")
         for i, arg in enumerate(argv[1:], 1):
-            there = apart and (apart <= i <= len(operands) or i == script)
+            there = (apart and (apart <= i <= len(operands) or i == script)) or i in scripts
             named: set[str] = set() if there else paths
             for form in _wider(arg, scope):
                 _note_paths(form, out.dirs, *(sets if i == charset else (named, globs)))
             if there:
                 out.paths |= named
+                carried.update(p for p in named if under(home, p))
                 paths.update(p for p in named if not under(home, p))
             if ">" in raw[i - 1] and set(raw[i - 1]) <= _REDIRECT_CHARS and not (
                     raw[i - 1].endswith("&") and (raw[i].isdigit() or raw[i] == "-")):  # 2>&1 writes no file
@@ -1835,7 +1898,21 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                     out.writes.update(resolve(target, out.dirs))
         out.paths |= paths
         out.globs += globs
-        if sent or script:
+        # The command lines ssh, scp and sftp are given in -o options, and rsync its ssh in -e and
+        # RSYNC_RSH: RemoteCommand and --rsync-path run on the other host, the others here
+        # (ssh -o ProxyCommand='...').
+        options = _ssh_option_commands(text[:remote] if remote else text[:len(operands) + 1]) \
+            if program in ("ssh", "scp", "sftp") else []
+        if program == "rsync":
+            options = _rsync_commands(text[:len(operands) + 1]) + [
+                (v.replace(_LITERAL, "$"), False) for v in _values(child(), "RSYNC_RSH")
+                if v is not None and v != os.environ.get("RSYNC_RSH")]
+        for line in [line for line, away in options if not away]:
+            nest(line, child())
+        elsewhere = ([sent] if sent else []) + ([text[script]] if script else []) + \
+            [line for line, away in options if away]
+        closed = not any(not away for _, away in options) and _plain(child())
+        if elsewhere:
             # Each runs in a shell of its own, which sshd starts in the home directory with HOME
             # and PWD set to it, whatever they hold here. What it sets, the directories it goes
             # to and the traps it leaves stay there, and are read there; what it runs and
@@ -1843,24 +1920,44 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             if depth >= _DEPTH:
                 raise ValueError("shells inside shells deeper than can be read")
             there = {**child(), "HOME": (home,), "PWD": (home,), "OLDPWD": (None,)}
-            for commands in ([sent] if sent else []) + ([text[script]] if script else []):
-                _add(out, _shell(commands, home, there, depth + 1, ctx)[0])
+            for n, commands in enumerate(elsewhere):
+                part = _shell(commands, home, there, depth + 1, ctx)[0]
+                for k, each in enumerate(part.programs):
+                    # its traps are read there, and so is the script it sends a shell that reads
+                    # its commands from its input (`ssh host 'bash -s' <<'EOF'`)
+                    if each[0] == "trap" or (n == 0 and sent and script and takes and
+                                             os.path.basename(each[0]) in _SHELLS and _shell_call(each) == ("stdin", 0)):
+                        part.program_closed[k] = True
+                closed = closed and _closed(part.program_closed, part.assigned, commands)
+                _add(out, part)
+        if program == "ssh":
+            out.program_closed[me] = closed
         if program == "cd":
             targets = [a for a in raw[1:] if not a.startswith("-")][:1] or \
                 [home for home in _values(scope, "HOME") if home is not None]
             out.dirs.extend([canonical(t, d) for t in targets for d in out.dirs[:8]])
-        if program in _SHELLS and piped and not any(re.fullmatch(r"-\w*c", a) for a in raw[1:]):
-            raise ValueError("a shell that reads its commands from a pipe")  # `echo 'rm ...' | bash`
+        if program in _SHELLS and (piped and not (call and call[0] == "command") or
+                                   from_pipe and (call is None or call[0] == "stdin")):
+            raise ValueError("a shell that reads its commands from a pipe")  # `echo 'rm ...' | bash -s -- -c`, `| (bash)`
         if program in _TAKES_COMMAND:
             shell_env = _reset(child()) if program == "su" else child()
             if any(_IMPORTS in name and any(v is not None and v != os.environ.get(name) for v in values)
                    for name, values in shell_env.items()):  # a function this shell imports from the command (#69)
                 raise ValueError("an environment entry a shell takes for a function")
+            first, assigned = len(out.programs), len(out.assigned)
+            code = scripts | ({call[1]} if call and call[0] == "command" else set())
             for i, arg in enumerate(text[1:], 1):
-                # the string after -c, and for a shell any argument with spaces in it: a script
-                # given as a here-document arrives that way. A shell of its own: what it sets stays there.
-                if re.fullmatch(r"-\w*c", raw[i - 1]) or (program in _SHELLS and re.search(r"\s", arg)):
+                # its script, and where that cannot be told the string after anything like -c; for
+                # a shell also any argument with spaces in it: a script given as a here-document
+                # arrives that way. A shell of its own: what it sets stays there.
+                if i in code or (not call and re.fullmatch(r"-\w*c", raw[i - 1])) or \
+                        (program in _SHELLS and re.search(r"\s", arg)):
                     nest(arg, shell_env)
+            if program in _SHELLS:
+                # a trap it sets runs at the end of this command, outside what is read here: trap
+                # is not among the programs that only read
+                out.program_closed[me] = bool(scripts) and _plain(shell_env) and _closed(
+                    out.program_closed[first:], out.assigned[assigned:], *(text[i] for i in scripts))
         elif program == "eval":
             return nest(" ".join(text[1:]), scope)
         elif program == "find":
@@ -2009,27 +2106,206 @@ def _ssh_command_at(argv: list[str]) -> int:
     return k if host else 0
 
 
-def _reads_commands(command: str) -> bool:
+# ssh's options whose value is a command line, and whether it runs on the other host. The others
+# run here: ssh starts ProxyCommand and LocalCommand with the user's shell, KnownHostsCommand itself.
+_SSH_COMMAND_OPTIONS = {"proxycommand": False, "localcommand": False, "knownhostscommand": False,
+                        "remotecommand": True}
+
+
+def _ssh_option_commands(words: list[str]) -> list[tuple[str, bool]]:
+    """The command lines given to ssh, scp or sftp in -o options (-o Key=Value, -o 'Key Value',
+    -oKey=Value, -qo ...), with %d, which ssh fills in with the home, put in; and for each whether
+    it runs on the other host. A word that only looks like such an option is taken for one: that
+    adds to what is asked about."""
+    found = []
+    for k, word in enumerate(words[1:], 1):
+        if not word.startswith("-") or word.startswith("--") or "o" not in word:
+            continue
+        value = word[word.index("o") + 1:] or (words[k + 1] if k + 1 < len(words) else "")
+        option = re.match(r"\s*([A-Za-z]+)\s*(?:=\s*|\s+)(.*)", value, re.S)
+        if option and option.group(1).lower() in _SSH_COMMAND_OPTIONS:
+            line = re.sub(r"%(.)", lambda t: {"d": canonical("~"), "%": "%"}.get(t.group(1), t.group(0)),
+                          option.group(2))
+            found.append((line, _SSH_COMMAND_OPTIONS[option.group(1).lower()]))
+    return found
+
+
+def _rsync_commands(words: list[str]) -> list[tuple[str, bool]]:
+    """The command lines rsync is given: the shell it reaches the other host with (-e, --rsh),
+    which runs here, and the rsync it runs there (--rsync-path); for each whether it runs on the
+    other host. A word that only looks like such an option is taken for one."""
+    found = []
+    for k, word in enumerate(words[1:], 1):
+        following = words[k + 1] if k + 1 < len(words) else ""
+        name, eq, value = word.partition("=")
+        if name in ("--rsh", "--rsync-path"):
+            found.append((value if eq else following, name == "--rsync-path"))
+        elif word.startswith("-") and not word.startswith("--") and "e" in word:
+            found.append((word[word.index("e") + 1:] or following, False))
+    return found
+
+
+_FROM_PIPE = re.compile(r"/dev/(?:fd/\d+|stdin)|/proc/(?:self|\d+)/fd/\d+")  # `bash <(...)`, `| python3 /dev/stdin`
+_NOWHERE = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"}  # what is written there cannot be run
+
+# The options of sh, bash and dash that take no value and leave alone where the shell takes its
+# commands from. Not -i: an interactive shell first runs the commands in a file of its own.
+_SHELL_FLAGS = set("abefhklmnprtuvxBCDEHIPTV")
+_SHELL_LONG = {"--login", "--noediting", "--noprofile", "--norc", "--posix", "--restricted", "--verbose",
+               "--debugger", "--version", "--help", "--pretty-print", "--dump-strings", "--dump-po-strings"}
+
+
+def _shell_call(argv: list[str]) -> tuple[str, int] | None:
+    """Where a shell takes its commands from: ("command", k), the string that is its word k
+    (-c); ("stdin", 0), its input (-s, or no operand); ("file", k), the script its word k names.
+    None when that cannot be told: an option this does not know, -i and --rcfile (a file of its
+    own runs first), -c with -s (dash runs both). As bash and dash read them: every option before
+    the first operand counts, also one after -c (`bash -c -x 'cmd'`); -o and -O take the next
+    word (`bash -O extglob s.sh`); - and -- end the options, and the word after them is a script
+    even when it is -c (`bash -- notes.sh -c ~`, #77)."""
+    words = _operands(argv)
+    k, letters = 1, ""
+    while k < len(words):
+        word = words[k]
+        if word in ("-", "--"):
+            k += 1
+            break
+        if word in _SHELL_LONG:
+            k += 1
+            continue
+        if not re.fullmatch(r"[-+][A-Za-z]+", word):
+            if word[:1] in ("-", "+") and len(word) > 1:
+                return None
+            break
+        for j, letter in enumerate(word[1:], 1):
+            if letter in "oO":  # its value is the next word, and nothing may follow it in this one
+                if j < len(word) - 1 or k + 1 >= len(words):
+                    return None
+                k += 1
+            elif letter not in _SHELL_FLAGS and not (word[0] == "-" and letter in "cs"):
+                return None
+        letters += word[1:] if word[0] == "-" else ""
+        k += 1
+    if "c" in letters:
+        return None if "s" in letters or k >= len(words) else ("command", k)
+    return ("stdin", 0) if "s" in letters or k >= len(words) else ("file", k)
+
+
+def _reads_commands(command: str) -> bool | None:
     """Whether what ssh runs on the other host takes its commands from its input: the login
-    shell when it is given no command, or a shell given neither -c nor a file (bash -s, sh).
-    For anything else what ssh sends is data, which is not read as commands."""
+    shell when it is given no command, or a shell that reads them there (bash -s, sh). For
+    anything else what ssh sends is data, which is not read as commands. None when that cannot
+    be told: a shell whose options this does not know (_shell_call), one that is not the first
+    word (`sudo bash -s`), an interpreter, or words this cannot split."""
     try:
         words = shlex.split(command)
     except ValueError:
-        return False
+        return None
     if not words:
         return True
     if os.path.basename(words[0]) not in _SHELLS:
+        if any(os.path.basename(w) in _SHELLS or _INTERPRETER.fullmatch(os.path.basename(w)) for w in words):
+            return None
         return False
-    reads = False
-    for word in words[1:]:
-        if word == "--" or not word.startswith("-"):  # a file, or with -s the arguments of what it reads
-            return reads
-        if not word.startswith("--"):
-            if "c" in word:
+    call = _shell_call(words)
+    return None if call is None else call[0] == "stdin"
+
+
+# Programs that write no file and run nothing, whatever they are given: what a script may hold for
+# the home it names not to make the shell or ssh that runs it a change (_closed). Not test, [,
+# printf %d, read -t, exit, shift or return: bash reads the value they are given as arithmetic,
+# where a subscript runs what is in it (`x='a[$(...)]'; test "$x" -eq 1`). Not [[ for the same
+# reason, nor anything that runs a program or a file: find, xargs, rg (--pre), less, awk.
+_ONLY_READ = {"ls", "cat", "head", "tail", "grep", "egrep", "fgrep", "du", "df", "stat", "wc", "cut", "tr", "nl",
+              "od", "strings", "md5sum", "sha1sum", "sha256sum", "cmp", "diff", "jq", "realpath", "readlink",
+              "basename", "dirname", "which", "type", "id", "whoami", "uname", "ps", "who", "pwd", "cd", "echo",
+              "true", "false", ":"}
+_TMUX_READS = {"list-panes", "lsp", "list-windows", "lsw", "list-sessions", "ls", "list-clients", "lsc",
+               "display-message", "display", "show-options", "show", "show-window-options", "showw",
+               "show-environment", "showenv", "has-session", "has"}
+_SED_ADDRESS = r"(?:\d+(?:~\d+)?|\$|/(?:[^/\\\n]|\\.)*/[IM]?)"
+# one sed command that prints, deletes or substitutes: not e, w, W, r or R, nor the e and w flags of s
+_SED_COMMAND = re.compile(rf"\s*(?:{_SED_ADDRESS}(?:\s*,\s*{_SED_ADDRESS})?)?\s*!?\s*"
+                          r"(?:[pdnNgGhHxz=l]|[qQ]\d*|s([^\\\n\w\s])(?:(?!\1)[^\\\n]|\\.)*\1(?:(?!\1)[^\\\n]|\\.)*\1[gpiImM\d]*)"
+                          r"\s*(?:[;\n]|$)")
+# The variables a script may set, beside those with a lowercase letter in their name: the others
+# are the ones programs and the shell itself take as instructions (LD_PRELOAD, PATH, BASH_ENV, PS4).
+_PLAIN = {"IFS", "HOME", "PWD", "OLDPWD", "LANG", "LANGUAGE", "TZ", "TERM", "COLUMNS", "LINES", "NO_COLOR"}
+# where bash reads a value as arithmetic or a name, or sets one, inside a word: [[, $((, $[,
+# a subscript, ${x:offset}, ${x:=y}, ${!x}, ${x@P}
+_EVALUATES = re.compile(r"\[|\(\(|\$\{[^}]*(?:[!@=]|:[^-+?])|\bselect\b")
+
+
+def _only_reads(raw: list[str], fed: bool) -> bool:
+    """Whether the program writes no file and runs nothing, given these words (_ONLY_READ). fed:
+    some of them are not known."""
+    if "/" in raw[0] and os.path.dirname(raw[0]) not in ("/bin", "/usr/bin"):
+        return False  # ./ls is not ls
+    program, words = os.path.basename(raw[0]), _operands(raw)[1:]
+    if program == "printf":  # a format of %s alone: %d reads its value as arithmetic, -v sets a variable
+        words = words[1:] if words[:1] == ["--"] else words
+        return bool(words) and not words[0].startswith("-") and "$" not in words[0] and \
+            not re.search(r"%(?!%|[-+ #0]*\d*(?:\.\d*)?[sqb])", words[0])
+    if program == "read":  # into variables a program does not take instructions from, with no number
+        return not fed and all(re.fullmatch(r"-[rse]+|[a-z_]\w*", w) and _plain_name(w) for w in words if w != "IFS")
+    if program == "sort":  # -o writes, --compress-program runs a program
+        return not any(w.startswith(("--o", "--co")) or re.fullmatch(r"-[^-]*o.*", w) for w in words)
+    if program == "sed":
+        return _sed_reads(words)
+    if program == "tmux":  # #(...) in a format runs a command, and `;` begins another tmux command
+        k = 0
+        while k < len(words) and words[k] in ("-L", "-S", "-2", "-u"):
+            k += 2 if words[k] in ("-L", "-S") else 1
+        return k < len(words) and words[k] in _TMUX_READS and not any("#(" in w or w.endswith(";") for w in words)
+    return program in _ONLY_READ
+
+
+def _sed_reads(words: list[str]) -> bool:
+    """Whether sed is given only options that change nothing and scripts that only print, delete
+    and substitute (_SED_COMMAND): no -i, no script file, no e or w."""
+    scripts, operands, k = [], [], 0
+    while k < len(words):
+        word = words[k]
+        if word in ("-e", "--expression") or re.fullmatch(r"-[nErsuz]+e", word):
+            if k + 1 >= len(words):
                 return False
-            reads = reads or "s" in word
-    return True
+            scripts.append(words[k + 1])
+            k += 1
+        elif word.startswith("--expression="):
+            scripts.append(word.partition("=")[2])
+        elif re.fullmatch(r"-[nErsuz]+", word) or word in ("--quiet", "--silent", "--regexp-extended", "--separate",
+                                                          "--unbuffered", "--null-data", "--posix", "--sandbox"):
+            pass
+        elif word.startswith("-") and word != "-":
+            return False
+        else:
+            operands.append(word)
+        k += 1
+    for script in scripts or operands[:1]:
+        at = 0
+        while at < len(script):
+            match = _SED_COMMAND.match(script, at)
+            if not match or match.end() == at:
+                return False
+            at = match.end()
+    return bool(scripts or operands)
+
+
+def _plain_name(name: str) -> bool:
+    return bool(re.search(r"[a-z]", name)) or name in _PLAIN or name.startswith("LC_")
+
+
+def _plain(env: dict) -> bool:
+    """Whether every variable in env is one a program does not take instructions from (_PLAIN)."""
+    return all(_plain_name(name) for name in env if re.fullmatch(r"[A-Za-z_]\w*", name))
+
+
+def _closed(closed: list[bool], assigned: list[str], *texts: str) -> bool:
+    """Whether a script, read as commands, cannot hand what it names to anything this does not
+    read: every program in it only reads (_only_reads), it sets no variable programs take
+    instructions from, and its text has nothing bash reads as arithmetic (_EVALUATES)."""
+    return all(closed) and all(_plain_name(name) for name in assigned) and \
+        not any(_EVALUATES.search(text) for text in texts)
 
 
 def resolve(name: str, dirs: list[str]) -> list[str]:

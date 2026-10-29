@@ -108,10 +108,40 @@ Two checks read the call itself and use no model:
   (`-o LocalCommand=`, `-E`) and redirections are read as running here. The home and those above it
   stop counting for `ssh` only where each of its words is one word as written (no variable,
   glob or brace that may vanish or split); otherwise its words count as they are as well. What it sends to a program other than a shell
-  is data and counts as it is. Reading a
+  is data and counts as it is. The command lines that ssh, scp and sftp are given in `-o`
+  options, and rsync in `-e`, `--rsh` and `RSYNC_RSH`, are read as commands run here
+  (`ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, with `%d` as the home); `RemoteCommand`
+  and `--rsync-path` as commands run on the other host. A script given to a shell here
+  (`bash -c '...'`, `bash -s <<'EOF'`) is read as the commands typed in its place, and the home
+  and those above it that it names do not by themselves make the shell a change. A script the
+  command makes and runs (`source <(...)`, `echo ... > s.sh; bash s.sh`) is taken to be given
+  every path the command names. Reading a
   settings file (`cat`, `jq`, `grep`) is not held; reading the guard's own directory is,
   because the API key is there. This applies in every session, whatever `gate` says. Switch
   off with `protect_guard: false`.
+
+That holds only for a script that only reads (#77-#79). The home and the directories above it
+that a script given to a shell or sent with ssh names stop counting for that shell or ssh only
+when nothing in the command can hand them on (`_closed` and the end of `read()` in `shell.py`):
+- every program in the script writes no file and runs nothing, whatever it is given: `ls`,
+  `cat`, `du`, `echo`, `grep`, `ps`, `sed` with a script that only prints, deletes and
+  substitutes, `sort` without `-o` or `--compress-program`, `tmux list-panes` without `#(...)`,
+  and the like. Not `test`, `[`, `printf %d` or `read -t`: bash reads the value they are given
+  as arithmetic, where a subscript runs what is in it;
+- the script sets no variable whose name has no lowercase letter (`PATH`, `LD_PRELOAD`,
+  `BASH_ENV`, `PS4`), apart from `IFS`, `LANG`, `LC_*`, `TZ` and `TERM`, and has no `[`, `((`,
+  `${x:offset}`, `${x:=y}`, `${!x}` or `${x@P}`;
+- the whole command writes no file outside `/dev/null` and pipes nothing into a program that
+  does more than read.
+
+Anything else is asked about as it was before #70, `ssh host 'du -sh $HOME' > report.txt` included.
+Which word is a shell's script is read from all of its options, as bash and dash read them
+(`_shell_call`): `bash -c -x 'cmd'` and `bash -O extglob s.sh` are told apart, and after a script
+name or `--` a `-c` is the script's argument (`bash notes.sh -c ~`). A script the command makes is
+found by any word of the program that runs it, whatever its options, and among the files any
+program writes (`written_paths`: redirections, `tee`, `cp`, `dd`, ...), also when it is run by its
+path (`./s.sh`) or read through `/dev/stdin`. A shell that reads its commands from a
+pipe is held also inside a part of the pipeline (`... | (bash)`, `... | while read l; do sh; done`).
 
   The same goes for the file tools, by every file the call changes: a patch (Codex's
   `apply_patch`, Hermes' `patch`) is read for the files named in it, and one that cannot be
