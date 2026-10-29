@@ -80,10 +80,12 @@ EOF"""
     REMOTE_SCRIPT,
     "ssh server.example 'echo $HOME'",
     f"ssh server.example 'ls {HOME} /home /'",
-    'ssh server.example "du -sh $HOME"',
-    "ssh -qo BatchMode=yes server.example -v -- ls $HOME",
+    "ssh server.example 'du -sh $HOME'",
+    "ssh -qo BatchMode=yes server.example -v -- ls '$HOME'",
     "ssh server.example <<< 'cd ~ && ls ${HOME}/..'",
+    "ssh server.example 'bash -s' <<< 'du -sh ~'",
     "ssh -p 2222 -l deploy server.example 'echo $HOME'",
+    "ssh -l '' server.example 'echo $HOME'",  # a quoted "" is a word
 ])
 def test_the_home_named_in_what_ssh_runs_on_another_host_is_that_hosts(guard, command):
     assert ask_reason(guard, command) == "", command
@@ -99,11 +101,42 @@ def test_the_home_named_in_what_ssh_runs_on_another_host_is_that_hosts(guard, co
     "ssh server.example -o 'LocalCommand=ls $HOME' -o PermitLocalCommand=yes true",
     "ssh -E ~/.claude/settings.json server.example true",
     "ssh server.example true > ~/.claude/settings.json",
-    # which word is the destination cannot be told
+    # which word is the destination cannot be told: one may vanish or split (#72)
     "ssh $opts server.example 'echo $HOME'",
     "ssh -Z server.example 'echo $HOME'",
+    "empty=; ssh -F /dev/null -l $empty deploy server.example -o 'ProxyCommand=touch $HOME' true",
+    "ssh server.example $empty -oProxyCommand='touch $HOME' true",
+    "ssh -l deploy* server.example -o 'ProxyCommand=touch $HOME' true",
+    "ssh -l {deploy,x} server.example -o 'ProxyCommand=touch $HOME' true",
+    'ssh server.example "du -sh $HOME"',
 ])
 def test_what_ssh_does_here_is_still_asked_about(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    # the host may be this one: a change to the home there is asked about as one here (#73)
+    "ssh localhost 'touch \"$HOME\"'",
+    "ssh server.example 'cd && touch .'",
+    "ssh server.example 'bash -s' <<< 'touch $HOME'",
+    "ssh server.example <<'EOF'\ntouch ~/..\nEOF",
+    "ssh server.example 'bash -c \"touch ~\"'",
+    # what ssh sends to a program that is not a shell is not read as commands: it counts as before
+    f"ssh server.example python3 - <<< 'import os; os.utime(\"{HOME}\")'",
+    f"ssh server.example 'bash script.sh' <<< '{HOME}'",
+])
+def test_what_ssh_runs_on_another_host_is_read_as_if_it_ran_here(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    # bash sets $_ to ssh's last word: the home, though ssh is not asked about for it (#71)
+    f'ssh server.example {HOME}; read p <<< "$_"; touch "$p"',
+    'ssh server.example "$HOME"; read p <<< "$_"; touch "$p"',
+    # and what the other host prints may be this one's home
+    "p=$(ssh localhost 'echo $HOME'); touch \"$p\"",
+])
+def test_the_home_ssh_is_given_reaches_a_program_given_a_value_later(guard, command):
     assert ask_reason(guard, command) != "", command
 
 

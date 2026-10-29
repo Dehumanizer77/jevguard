@@ -1781,18 +1781,25 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         out.program_sets.append(sets)
         charset = _set_operand(raw) if written and not fed else 0
         program = os.path.basename(raw[0])
-        # What ssh runs on the other host: its command, and the text of a here-document or
-        # here-string, which it sends there as input. ~, $HOME and /home/me in it are that host's
-        # home, so the home directory and those above it do not count there; what is in them
-        # does, as the host may be this one or share its home. Its options run here.
-        remote = _ssh_command_at(argv) if program == "ssh" else 0
+        # What ssh runs on the other host: its command, and what it sends there to a shell that
+        # reads its commands from it (a here-document, a here-string). The host may be this one or
+        # share its home, so both are read as commands run here (#73). The home and the
+        # directories above it that they name do not make ssh itself a change, but the command
+        # still names them, for a program given a value later (#71). Only where each word is one
+        # word as written: one that vanishes moves the destination, and an option after it runs
+        # here (#72). Its options run here.
+        remote = _ssh_command_at(raw) if program == "ssh" and written and not fed else 0
+        sent = " ".join(text[remote:len(operands) + 1]) if remote else ""
+        script = max((i for i in range(2, len(raw)) if raw[i - 1] == "<<<"), default=0) \
+            if remote and _reads_commands(sent) else 0
         home = canonical("~")
         for i, arg in enumerate(argv[1:], 1):
-            there = remote and (remote <= i <= len(operands) or raw[i - 1] == "<<<")
+            there = remote and (remote <= i <= len(operands) or i == script)
             named: set[str] = set() if there else paths
             for form in _wider(arg, scope):
                 _note_paths(form, out.dirs, *(sets if i == charset else (named, globs)))
             if there:
+                out.paths |= named
                 paths.update(p for p in named if not under(home, p))
             if ">" in raw[i - 1] and set(raw[i - 1]) <= _REDIRECT_CHARS and not (
                     raw[i - 1].endswith("&") and (raw[i].isdigit() or raw[i] == "-")):  # 2>&1 writes no file
@@ -1800,6 +1807,8 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                     out.writes.update(resolve(target, out.dirs))
         out.paths |= paths
         out.globs += globs
+        for commands in ([sent] if sent else []) + ([text[script]] if script else []):
+            nest(commands, child())
         if program == "cd":
             targets = [a for a in raw[1:] if not a.startswith("-")][:1] or \
                 [home for home in _values(scope, "HOME") if home is not None]
@@ -1937,16 +1946,15 @@ _SSH_FLAGS = set("46AaCfGgKkMNnqsTtVvXxYy")
 
 def _ssh_command_at(argv: list[str]) -> int:
     """Where among ssh's words the command it runs on the other host begins (one past its last
-    word when it is given none), or 0 when that cannot be told: a word that is not one word as
-    written (_as_written), or an option this does not know. Options may stand before and after
-    the destination, as OpenSSH reads them in both places; the first other word after it begins
-    the command, and so does the word after `--`."""
+    word when it is given none), or 0 when that cannot be told: an option this does not know.
+    Options may stand before and after the destination, as OpenSSH reads them in both places;
+    the first other word after it begins the command, and so does the word after `--`. Only for
+    words that are each one word as written (_as_written): the reader keeps an empty value as
+    a word, and `-l $empty user host` would take user for the destination (#72)."""
     words = _operands(argv)
     k, host = 1, 0
     while k < len(words):
         word = words[k]
-        if not _as_written(word):
-            return 0
         if word == "--":
             k += 1 if host else 2  # ssh -- host command
             return k if k <= len(words) else 0
@@ -1963,6 +1971,29 @@ def _ssh_command_at(argv: list[str]) -> int:
         else:
             host, k = k, k + 1
     return k if host else 0
+
+
+def _reads_commands(command: str) -> bool:
+    """Whether what ssh runs on the other host takes its commands from its input: the login
+    shell when it is given no command, or a shell given neither -c nor a file (bash -s, sh).
+    For anything else what ssh sends is data, which is not read as commands."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if not words:
+        return True
+    if os.path.basename(words[0]) not in _SHELLS:
+        return False
+    reads = False
+    for word in words[1:]:
+        if word == "--" or not word.startswith("-"):  # a file, or with -s the arguments of what it reads
+            return reads
+        if not word.startswith("--"):
+            if "c" in word:
+                return False
+            reads = reads or "s" in word
+    return True
 
 
 def resolve(name: str, dirs: list[str]) -> list[str]:
