@@ -97,8 +97,9 @@ Two checks read the call itself and use no model:
   any spelling (`curl -o/path`, `--output-dir` with `-O`, `cd` there and download,
   `cp -t`, `dd of=`), and for commands run from inside the guard's directories. What `ssh`
   runs on another host (its command, and a here-document or here-string it sends to a shell
-  there) is read as commands run here, as the host may be this one or share the home:
-  `ssh host 'touch ~'` is held as `touch ~` is. The home directory and those above it named
+  there) is read as commands run here, as the host may be this one or share the home, and
+  starting where sshd starts them, in the home directory with `$PWD` set to it:
+  `ssh host 'touch ~'` and `ssh host 'touch .'` are held as `touch ~` is. The home directory and those above it named
   there do not by themselves make `ssh` a change (`ssh host 'du -sh ~'`), a file in the home
   still does (`ssh host 'cat ~/.claude/settings.json'`), and ssh's own options
   (`-o LocalCommand=`, `-E`) and redirections are read as running here. This holds only where

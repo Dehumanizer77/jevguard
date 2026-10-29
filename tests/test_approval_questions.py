@@ -86,6 +86,9 @@ EOF"""
     "ssh server.example 'bash -s' <<< 'du -sh ~'",
     "ssh -p 2222 -l deploy server.example 'echo $HOME'",
     "ssh -l '' server.example 'echo $HOME'",  # a quoted "" is a word
+    # where the other host's commands start is theirs: this command's directory stays /work
+    "ssh server.example 'cd ~ && ls'; touch .",
+    "ssh server.example ls; touch \"$PWD\" build",
 ])
 def test_the_home_named_in_what_ssh_runs_on_another_host_is_that_hosts(guard, command):
     assert ask_reason(guard, command) == "", command
@@ -121,6 +124,13 @@ def test_what_ssh_does_here_is_still_asked_about(guard, command):
     "ssh server.example 'bash -s' <<< 'touch $HOME'",
     "ssh server.example <<'EOF'\ntouch ~/..\nEOF",
     "ssh server.example 'bash -c \"touch ~\"'",
+    # where it starts: in the home, with PWD set there, not in this command's directory (/work)
+    "ssh localhost 'echo \"$HOME\"; touch \"$PWD\"'",
+    "ssh localhost 'touch .'",
+    "ssh localhost 'bash -s' <<< 'touch \"$PWD\"'",
+    "ssh localhost <<'EOF'\ntouch ..\nEOF",
+    "HOME=/tmp/x PWD=/tmp/x ssh localhost 'touch \"$HOME\" \"$PWD\"'",
+    "cd /srv && ssh localhost 'touch .'",
     # what ssh sends to a program that is not a shell is not read as commands: it counts as before
     f"ssh server.example python3 - <<< 'import os; os.utime(\"{HOME}\")'",
     f"ssh server.example 'bash script.sh' <<< '{HOME}'",

@@ -1807,8 +1807,16 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                     out.writes.update(resolve(target, out.dirs))
         out.paths |= paths
         out.globs += globs
-        for commands in ([sent] if sent else []) + ([text[script]] if script else []):
-            nest(commands, child())
+        if sent or script:
+            # sshd starts them in the home directory, and sets HOME and PWD to it, whatever they
+            # hold here. A cd among them stays there.
+            here = out.dirs[:]
+            out.dirs[:] = [home]
+            try:
+                for commands in ([sent] if sent else []) + ([text[script]] if script else []):
+                    nest(commands, {**child(), "HOME": (home,), "PWD": (home,), "OLDPWD": (None,)})
+            finally:
+                out.dirs[:] = here
         if program == "cd":
             targets = [a for a in raw[1:] if not a.startswith("-")][:1] or \
                 [home for home in _values(scope, "HOME") if home is not None]
