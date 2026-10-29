@@ -1150,3 +1150,97 @@ def test_a_function_bash_takes_from_its_environment_cannot_be_read(guard, tmp_pa
     monkeypatch.setenv("BASH_FUNC_module%%", "() { :; }")
     for cmd in ("env -i FOO=1 bash -c 'cat notes'", "sudo bash -c 'cat notes'", "bash -c 'cat notes'"):
         assert ["cat", "notes"] in shell.read(cmd, "/w").programs, cmd
+
+
+def _seen_in_bash(tmp_path, cmd) -> set:
+    """The arguments bash gives the program `seen` in cmd, one tuple for each time it runs it:
+    `seen` only writes them down. bash runs with a home of its own in tmp_path."""
+    stub, log, work, home = tmp_path / "bin" / "seen", tmp_path / "seen.log", tmp_path / "work", tmp_path / "home"
+    if not stub.exists():
+        stub.parent.mkdir()
+        stub.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\037" "$a" >> "$SEENLOG"; done\n'
+                        'printf "\\n" >> "$SEENLOG"\n')
+        stub.chmod(0o755)
+        work.mkdir()
+        home.mkdir()
+    log.unlink(missing_ok=True)
+    subprocess.run(["bash", "-c", cmd], cwd=work, capture_output=True, timeout=10,
+                   env={**os.environ, "HOME": str(home), "PATH": f"{stub.parent}:{os.environ['PATH']}",
+                        "SEENLOG": str(log), "LC_ALL": "C.UTF-8"})
+    lines = log.read_text().split("\n")[:-1] if log.exists() else []
+    return {tuple(line.split("\x1f")[:-1]) for line in lines}
+
+
+def _seen_by_reader(cmd) -> set:
+    """The arguments the reader gives `seen` in cmd, in each reading of it where all of them are
+    known: a loop's body is also read with its variable as it may be before the loop."""
+    return {tuple(shell._operands(argv)[1:]) for argv in shell.read(cmd, "/work").programs
+            if argv[0] == "seen" and not any("$" in a for a in argv)}
+
+
+def test_a_known_value_is_split_where_the_shell_splits_it(guard, tmp_path):
+    """#74: a known value put in where its $ is in no quotes was one word. The shell splits it at
+    the characters of IFS, so `p='.claude notes'; rm -rf $p` removes .claude, and nothing was
+    asked. Now the reader splits it as bash does: spaces, tabs and newlines run together and make
+    no word at either end; another character of IFS ends a word, an empty one too; an empty IFS
+    splits nothing; a quoted $p, case WORD, [[ ]], a here-string and an assignment to export are
+    not split. Each case is checked against what bash gives a program that only writes its
+    arguments down."""
+    for cmd in ("p='.claude notes'; seen $p", "p='notes .claude'; seen $p", "IFS=:; p=notes:.claude; seen $p",
+                "p=$'.claude\\tnotes\\n'; seen $p", "IFS=': '; p='a : b'; seen $p", "IFS=:; p=':a::b:'; seen $p",
+                "IFS=' :'; p=' :a'; seen $p", "p='a  b '; seen x$p", "p='a b'; q=c; seen $q$p",
+                "p='a b'; seen ${p}", "p='a b'; seen ${p:-x}", "p=; seen $p x", "p=; seen \"\"$p",
+                "p='a b'; seen \"$p\"", "IFS=; p='a b'; seen $p", "IFS=:; p='a b'; seen $p",
+                "p='a b'; for f in $p; do seen \"$f\"; done", "p='seen a'; $p b",
+                "p='a b'; case $p in 'a b') seen yes;; esac", "p='a b'; [[ $p == 'a b' ]] && seen yes",
+                "p='a b'; seen <<< $p", "p='a b'; export q=$p; seen \"$q\""):
+        assert _seen_by_reader(cmd) == _seen_in_bash(tmp_path, cmd), cmd
+    for cmd in ("p='.claude notes'; touch $p", "p='notes .claude'; touch $p", "IFS=:; p=notes:.claude; touch $p",
+                "p='a .claude'; touch x$p", "p='.claude notes'; for f in $p; do touch \"$f\"; done",
+                "p='.claude notes'; a=($p); touch \"${a[@]}\"", "p='touch .claude'; $p",
+                "p='.claude notes'; echo $p | xargs touch"):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("p='.claude notes'; touch \"$p\"", "IFS=; p='.claude notes'; touch $p",
+                "IFS=:; p='.claude notes'; touch $p", "p='.claude notes'; echo $p"):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_a_value_split_at_characters_that_are_not_known_cannot_be_read(guard):
+    """#74: where IFS holds what is not known, which words a value makes cannot be told: so after
+    IFS=$(...), and after anything that may set any variable (eval of what is not known, a
+    sourced file), for a known value put in where its $ is in no quotes."""
+    for cmd in ("IFS=$(printf :); p=notes:.claude; touch $p", 'eval "$(cat f)"; p=notes:.claude; touch $p',
+                "source ./vars; p=notes:.claude; touch $p", "read IFS < f; p=notes:.claude; touch $p"):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ('eval "$(cat f)"; p=notes; touch "$p"', "IFS=$(printf :); touch notes"):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_a_parameter_operator_gives_what_bash_gives_or_cannot_be_read(guard, tmp_path):
+    """#75: ${p/x/&} was read with Python's re.sub, and its & as a &: bash 5.2 puts the text the
+    pattern matched in its place (patsub_replacement, on by default), so `p=.claude; rm -rf
+    "${p/.claude/&}"` removes .claude. The same kind of difference was in the patterns, read with
+    fnmatch: [^x], [[:upper:]], an extended glob; in case changes and offsets past ASCII; and in a
+    $q in the pattern. Now a & is read both ways; patterns, case changes and offsets are read as
+    bash reads them, and where the result of a known value cannot be told the command cannot be
+    read. Each case is checked against bash."""
+    for cmd in ('p=.claude; seen "${p/.claude/&}"', 'p=aXbXc; seen "${p//X/&&}" "${p/X*/[&]}"',
+                'p=.claude; r="&"; seen "${p/.claude/$r}"', 'p=abc; seen "${p/#/X}" "${p/%/X}" "${p/}" "${p//}" "${p/b}"',
+                'p=abcb; seen "${p/b*/X}" "${p//b/X}" "${p/%b*/X}" "${p/#a?/X}"',
+                'p=a-b]c; seen "${p//[]]/X}" "${p//[a-]/Y}" "${p//[!a-c]/Z}"', 'p="a[b"; seen "${p//[/X}"',
+                'p=x.claude; seen "${p#[x]}" "${p#[^y]}" "${p#*[.]}" "${p##*[!a-z]}" "${p%[a-z]*}" "${p%%[a-z]*}"',
+                'p=X.claude; seen "${p#[[:upper:]]}"', 'p=a.b; seen "${p//[[:punct:]]/X}" "${p//[[:alpha:]]/Y}"',
+                'p=x.claude; q=x; seen ${p#$q}', 'p=abcdef; seen "${p:2}" "${p: -2}" "${p:1:-1}" "${p:(-3):2}" "${p:9}"',
+                'p=abcdef; seen "${p^}" "${p^^}" "${p^^[a-c]}" "${p^[b]}"', 'p=ABC; seen "${p,}" "${p,,}" "${p,,[!A]}"'):
+        assert _seen_in_bash(tmp_path, cmd) <= _seen_by_reader(cmd), cmd
+    for cmd in ('p=.claude; touch "${p/.claude/&}"', "p=.claude; touch ${p//.claude/&}",
+                "p=x.claude; touch ${p#[x]}", "p=x.claude; touch ${p#[^y]}", "p=X.claude; touch ${p#[[:upper:]]}",
+                "p=x.claude; q=x; touch ${p#$q}", "p=x.claude; touch ${p:1}", "p=.cLAUDE; touch ${p,,[A-Z]}"):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("shopt -s extglob; p=a.claude; touch ${p#@(a|b)}", "p=x.claude; touch ${p#$unknown}",
+                "p=.CLAUDE/SETTİNGS.JSON; touch ${p,,}", "p=$'\\u00e9.claude'; touch ${p:1}",
+                "p=a/.claude; touch ${p//a\\//}", 'p=.claude; touch "${p/.claude/\'&\'}"'):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ('p=x; touch "${p/x/&y}"', "p=build; touch ${p/build/dist}", "f=report.txt; touch ${f%.txt}.md",
+                "touch ${PWD#$HOME/}.log", 'b=$(git branch --show-current); touch "${b//\\//-}.log"'):
+        assert _reason(guard, cmd) == "", cmd
