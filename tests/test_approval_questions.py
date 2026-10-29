@@ -168,6 +168,95 @@ def test_the_home_ssh_is_given_reaches_a_program_given_a_value_later(guard, comm
     assert ask_reason(guard, command) != "", command
 
 
+@pytest.mark.parametrize("command", [
+    # run here: ssh starts them with the user's shell, in this command's directory
+    "ssh -o ProxyCommand='touch ~' server.example",
+    "ssh -oLocalCommand='touch ~' -oPermitLocalCommand=yes server.example",
+    "ssh -qo KnownHostsCommand='touch ~' server.example",
+    "ssh -o 'LocalCommand touch %d' -o PermitLocalCommand=yes server.example",  # %d: the home
+    "cd ~ && ssh -o ProxyCommand='touch .' server.example",
+    "scp -o ProxyCommand='touch ~' notes.txt server.example:notes.txt",
+    "sftp -o ProxyCommand='touch ~' server.example",
+    "rsync -a -e \"ssh -o ProxyCommand='touch ~'\" src server.example:dst",
+    "rsync -a --rsh=\"ssh -o ProxyCommand='touch ~'\" src server.example:dst",
+    "RSYNC_RSH=\"ssh -o ProxyCommand='touch ~'\" rsync -a src server.example:dst",
+    # run on the other host, which starts in the home
+    "ssh -o RemoteCommand='touch ~' localhost",
+    "ssh -o 'RemoteCommand touch .' localhost",
+    "ssh -o remotecommand='touch .' localhost",
+    "rsync -a --rsync-path='touch .; rsync' src localhost:dst",
+])
+def test_command_lines_given_in_ssh_and_rsync_options_are_read_as_commands(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    "ssh -o ProxyCommand='nc %h %p' server.example",
+    "ssh -o ProxyCommand='ssh -W %h:%p jump.example' server.example",
+    "ssh -o 'ProxyCommand touch .' server.example",  # here, in /work
+    "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null server.example uptime",
+    "scp -o BatchMode=yes notes.txt server.example:notes.txt",
+    "rsync -a -e 'ssh -p 2222' src server.example:dst",
+])
+def test_ordinary_ssh_and_rsync_options_are_not_asked_about(guard, command):
+    assert ask_reason(guard, command) == "", command
+
+
+LOCAL_SCRIPT = REMOTE_SCRIPT.replace("timeout 60 ssh -o BatchMode=yes server.example 'bash -s'", "bash -s")
+
+
+@pytest.mark.parametrize("command", [
+    # read as commands, as if typed in place of the shell: the home they name is not the shell's change
+    LOCAL_SCRIPT,
+    "bash -c 'echo $HOME'",
+    "bash <<< 'ls $HOME /home'",
+    "sh -c 'du -sh ~'",
+    "bash -lc 'ls ~ $HOME'",
+])
+def test_a_script_given_to_a_shell_here_is_read_as_its_commands(guard, command):
+    assert ask_reason(guard, command) == "", command
+
+
+@pytest.mark.parametrize("command", [
+    "bash -c 'touch $HOME'",
+    "sh <<< 'touch ~'",
+    "bash -c 'cd; touch .'",
+    "bash -c 'cat ~/.claude/settings.json'",  # a file in the home still counts for the shell
+    f"bash notes.sh <<< '{HOME}'",  # what a script reads is data, not commands
+    "bash $opts -c 'echo $HOME'",  # which word is the script cannot be told
+])
+def test_what_a_shell_runs_here_is_still_asked_about(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    # a script the command makes, in a <(...) or a file it writes, is given what the command names
+    "source <(echo touch $HOME)",
+    ". <(echo touch $HOME)",
+    "bash <(echo touch $HOME)",
+    "echo touch $HOME > s.sh; bash s.sh",
+    "echo touch $HOME > s.sh; sh < s.sh",
+    f"echo 'import os; os.utime(\"{HOME}\")' > s.py && python3 s.py",
+    # and so wrapped in a shell or sent to another host, where only the shell's own words counted
+    "bash -c 'source <(echo touch $HOME)'",
+    "bash -c 'echo touch $HOME > s.sh; bash s.sh'",
+    "ssh localhost 'source <(echo touch $HOME)'",
+])
+def test_a_script_the_command_makes_and_runs_is_given_what_the_command_names(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
+@pytest.mark.parametrize("command", [
+    "diff <(sort a) <(sort b)",
+    "cat > s.sh <<'EOF'\nset -e\nmake build\nEOF\nbash s.sh",
+    "bash scripts/test.sh",
+    "source .venv/bin/activate && pytest",
+    "python3 -m pytest tests -q",
+])
+def test_scripts_that_name_nothing_of_the_guard_are_not_asked_about(guard, command):
+    assert ask_reason(guard, command) == "", command
+
+
 def test_the_question_says_what_the_agent_claims_the_call_is_for(guard):
     reason = ask_reason(guard, "jevguard mode log", description="Switch the guard to log mode as you asked")
     assert 'Claude describes the call as: "Switch the guard to log mode as you asked"' in reason

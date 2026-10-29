@@ -108,7 +108,14 @@ Two checks read the call itself and use no model:
   (`-o LocalCommand=`, `-E`) and redirections are read as running here. The home and those above it
   stop counting for `ssh` only where each of its words is one word as written (no variable,
   glob or brace that may vanish or split); otherwise its words count as they are as well. What it sends to a program other than a shell
-  is data and counts as it is. Reading a
+  is data and counts as it is. The command lines that ssh, scp and sftp are given in `-o`
+  options, and rsync in `-e`, `--rsh` and `RSYNC_RSH`, are read as commands run here
+  (`ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, with `%d` as the home); `RemoteCommand`
+  and `--rsync-path` as commands run on the other host. A script given to a shell here
+  (`bash -c '...'`, `bash -s <<'EOF'`) is read as the commands typed in its place, and the home
+  and those above it that it names do not by themselves make the shell a change. A script the
+  command makes and runs (`source <(...)`, `echo ... > s.sh; bash s.sh`) is taken to be given
+  every path the command names. Reading a
   settings file (`cat`, `jq`, `grep`) is not held; reading the guard's own directory is,
   because the API key is there. This applies in every session, whatever `gate` says. Switch
   off with `protect_guard: false`.

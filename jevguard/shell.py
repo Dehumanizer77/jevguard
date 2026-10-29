@@ -1794,6 +1794,9 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         if piped and _INTERPRETER.fullmatch(os.path.basename(raw[0])) and \
                 all(a.startswith("-") and a not in ("-c", "-e", "-E", "-m", "-r") for a in operands):
             fed = True  # `echo '...' | python3`: its program, and the paths in it, come through the pipe
+        made = _script_file(raw)
+        if made and (raw[made] == "/dev/fd/63" or set(resolve(raw[made], out.dirs)) & out.writes):
+            fed = True  # `source <(echo ...)`, `echo ... > s.sh; bash s.sh`: what it runs, the command made
         out.programs.append(raw)
         out.program_fed.append(fed)
         out.program_dirs.append(list(out.dirs))
@@ -1820,9 +1823,16 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         if remote and piped and _reads_commands(sent) and not any(a in ("<", "<<<") for a in raw[len(operands) + 1:]):
             raise ValueError("a shell that reads its commands from a pipe")  # `echo 'rm ...' | ssh host`
         apart = remote if written and not fed else 0
+        # A script a shell here is given, in its -c string or as the input it reads its commands
+        # from, is read as commands as well (below), as if it stood in place of the shell: in the
+        # same way the home and the directories above it that it names do not make the shell
+        # itself a change.
+        reads = program in _SHELLS and written and not fed and _reads_commands(shlex.join(raw[:len(operands) + 1]))
+        scripts = {i for i in range(2, len(raw)) if program in _SHELLS and written and not fed and (
+            (re.fullmatch(r"-\w*c", raw[i - 1]) and i <= len(operands)) or (raw[i - 1] == "<<<" and reads))}
         home = canonical("~")
         for i, arg in enumerate(argv[1:], 1):
-            there = apart and (apart <= i <= len(operands) or i == script)
+            there = (apart and (apart <= i <= len(operands) or i == script)) or i in scripts
             named: set[str] = set() if there else paths
             for form in _wider(arg, scope):
                 _note_paths(form, out.dirs, *(sets if i == charset else (named, globs)))
@@ -1835,7 +1845,20 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                     out.writes.update(resolve(target, out.dirs))
         out.paths |= paths
         out.globs += globs
-        if sent or script:
+        # The command lines ssh, scp and sftp are given in -o options, and rsync its ssh in -e and
+        # RSYNC_RSH: RemoteCommand and --rsync-path run on the other host, the others here
+        # (ssh -o ProxyCommand='...').
+        options = _ssh_option_commands(text[:remote] if remote else text[:len(operands) + 1]) \
+            if program in ("ssh", "scp", "sftp") else []
+        if program == "rsync":
+            options = _rsync_commands(text[:len(operands) + 1]) + [
+                (v.replace(_LITERAL, "$"), False) for v in _values(child(), "RSYNC_RSH")
+                if v is not None and v != os.environ.get("RSYNC_RSH")]
+        for line in [line for line, away in options if not away]:
+            nest(line, child())
+        elsewhere = ([sent] if sent else []) + ([text[script]] if script else []) + \
+            [line for line, away in options if away]
+        if elsewhere:
             # Each runs in a shell of its own, which sshd starts in the home directory with HOME
             # and PWD set to it, whatever they hold here. What it sets, the directories it goes
             # to and the traps it leaves stay there, and are read there; what it runs and
@@ -1843,7 +1866,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             if depth >= _DEPTH:
                 raise ValueError("shells inside shells deeper than can be read")
             there = {**child(), "HOME": (home,), "PWD": (home,), "OLDPWD": (None,)}
-            for commands in ([sent] if sent else []) + ([text[script]] if script else []):
+            for commands in elsewhere:
                 _add(out, _shell(commands, home, there, depth + 1, ctx)[0])
         if program == "cd":
             targets = [a for a in raw[1:] if not a.startswith("-")][:1] or \
@@ -2007,6 +2030,67 @@ def _ssh_command_at(argv: list[str]) -> int:
         else:
             host, k = k, k + 1
     return k if host else 0
+
+
+# ssh's options whose value is a command line, and whether it runs on the other host. The others
+# run here: ssh starts ProxyCommand and LocalCommand with the user's shell, KnownHostsCommand itself.
+_SSH_COMMAND_OPTIONS = {"proxycommand": False, "localcommand": False, "knownhostscommand": False,
+                        "remotecommand": True}
+
+
+def _ssh_option_commands(words: list[str]) -> list[tuple[str, bool]]:
+    """The command lines given to ssh, scp or sftp in -o options (-o Key=Value, -o 'Key Value',
+    -oKey=Value, -qo ...), with %d, which ssh fills in with the home, put in; and for each whether
+    it runs on the other host. A word that only looks like such an option is taken for one: that
+    adds to what is asked about."""
+    found = []
+    for k, word in enumerate(words[1:], 1):
+        if not word.startswith("-") or word.startswith("--") or "o" not in word:
+            continue
+        value = word[word.index("o") + 1:] or (words[k + 1] if k + 1 < len(words) else "")
+        option = re.match(r"\s*([A-Za-z]+)\s*(?:=\s*|\s+)(.*)", value, re.S)
+        if option and option.group(1).lower() in _SSH_COMMAND_OPTIONS:
+            line = re.sub(r"%(.)", lambda t: {"d": canonical("~"), "%": "%"}.get(t.group(1), t.group(0)),
+                          option.group(2))
+            found.append((line, _SSH_COMMAND_OPTIONS[option.group(1).lower()]))
+    return found
+
+
+def _rsync_commands(words: list[str]) -> list[tuple[str, bool]]:
+    """The command lines rsync is given: the shell it reaches the other host with (-e, --rsh),
+    which runs here, and the rsync it runs there (--rsync-path); for each whether it runs on the
+    other host. A word that only looks like such an option is taken for one."""
+    found = []
+    for k, word in enumerate(words[1:], 1):
+        following = words[k + 1] if k + 1 < len(words) else ""
+        name, eq, value = word.partition("=")
+        if name in ("--rsh", "--rsync-path"):
+            found.append((value if eq else following, name == "--rsync-path"))
+        elif word.startswith("-") and not word.startswith("--") and "e" in word:
+            found.append((word[word.index("e") + 1:] or following, False))
+    return found
+
+
+def _script_file(raw: list[str]) -> int:
+    """Where among a program's words the file is that it runs as commands, or 0: what source and
+    . read, and what a shell or an interpreter runs when it is given no -c, -e or -m: its first
+    operand, or else what it reads from a < redirection."""
+    program = os.path.basename(raw[0])
+    words = _operands(raw)
+    if program in (".", "source"):
+        return 1 if len(words) > 1 else 0
+    if program not in _SHELLS and not _INTERPRETER.fullmatch(program):
+        return 0
+    for k, word in enumerate(words[1:], 1):
+        if word in ("-c", "-e", "-E", "-m", "-r") or (program in _SHELLS and re.fullmatch(r"-[^-]*c[^-]*", word)):
+            return 0  # its commands are in its words
+        if word == "--" and k + 1 < len(words):
+            return k + 1
+        if word in ("-", "--") or (program in _SHELLS and re.fullmatch(r"-[^-]*s[^-]*", word)):
+            break  # they come from its input
+        if not word.startswith("-"):
+            return k
+    return next((k + 1 for k in range(len(words), len(raw) - 1) if raw[k] == "<"), 0)
 
 
 def _reads_commands(command: str) -> bool:
