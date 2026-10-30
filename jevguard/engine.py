@@ -245,13 +245,18 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
             return Decision("replace", notice({"verdict": "unavailable", "reasons": ["firewall unreachable"]}))
         return None
 
-    key = config.read_key(cfg)
-    blocked_by = "no API key" if not key else store.scanner_available(cfg)
+    # In a system installation the key is the service's: it says whether there is one, and scores.
+    remote = getattr(cfg, "service", None) is not None
+    key = None if remote else config.read_key(cfg)
+    try:
+        blocked_by = "no API key" if key == "" else store.scanner_available(cfg)
+    except OSError as exc:  # the service could not be asked
+        blocked_by = f"jevguard service unavailable: {exc}"
     if blocked_by:
         return unavailable(blocked_by)
-    from . import scanner  # the scoring client and extraction code: loaded only when something is scanned
+    from . import scanner, service  # the scoring client and extraction code: loaded only when something is scanned
     t0 = time.perf_counter()
-    sc = scanner.Scanner(cfg, key)
+    sc = service.Scanner(cfg) if remote else scanner.Scanner(cfg, key)
     verdict, err = sc.scan(text, images)
     ms = round((time.perf_counter() - t0) * 1000)
     # The scan has returned. From here on there is the verdict, the owner's policy for it, and

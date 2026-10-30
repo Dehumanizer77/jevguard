@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+from . import system
+
 DEFAULTS = {
     # "log": scan and record, change nothing. "block": withhold results that score as an injection.
     "mode": "log",
@@ -72,7 +74,11 @@ _OWN_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?:\*|[A-Za-z0-9._-]+)")  # no
 
 
 def root() -> tuple[Path, Path]:
-    """(config dir, state dir). JEVGUARD_HOME moves both under one directory (tests)."""
+    """(config dir, state dir). JEVGUARD_HOME moves both under one directory (tests). In a system
+    installation they are fixed, and nothing in the environment moves them: the agent's user sets
+    the environment the hook runs in."""
+    if system.settings() is not None:
+        return system.CONFIG_DIR, system.STATE_DIR
     home = os.environ.get("JEVGUARD_HOME")
     if home:
         return Path(home) / "config", Path(home) / "state"
@@ -80,7 +86,17 @@ def root() -> tuple[Path, Path]:
 
 
 def load() -> SimpleNamespace:
+    installed = system.settings()
+    if installed is not None:
+        return _load(system.CONFIG_DIR, system.STATE_DIR, installed)
     cfg_dir, state_dir = root()
+    return _load(cfg_dir, state_dir, None)
+
+
+def _load(cfg_dir: Path, state_dir: Path, installed: dict | None) -> SimpleNamespace:
+    """installed: the system installation (system.settings()), or None for one in a user's home.
+    In a system installation every process but the service's own and root's is a hook (or the
+    owner's command without sudo), and uses the guard's state through the service (cfg.service)."""
     values = dict(DEFAULTS)
     path = cfg_dir / "config.json"
     if path.exists():
@@ -103,7 +119,14 @@ def load() -> SimpleNamespace:
             raise ValueError(f'{path}: own_repos takes "owner/name" or "owner/*", not {repo!r}')
     cfg = SimpleNamespace(**values)
     cfg.config_dir, cfg.state_dir, cfg.config_file = cfg_dir, state_dir, path
-    if os.environ.get("JEVGUARD_HOME") and values["key_file"] == DEFAULTS["key_file"]:
+    cfg.system, cfg.service = installed, None
+    home = None if installed else os.environ.get("JEVGUARD_HOME")
+    if installed:
+        cfg.key_file = str(cfg_dir / "typesafe.key")
+        if os.geteuid() not in (0, _service_uid()):
+            from .service import Client
+            cfg.service = Client(timeout=cfg.deadline + 15)
+    elif home and values["key_file"] == DEFAULTS["key_file"]:
         cfg.key_file = str(cfg_dir / "typesafe.key")
     cfg.key_file = os.path.expanduser(cfg.key_file)
     cfg.quarantine_dir = state_dir / "quarantine"
@@ -113,12 +136,19 @@ def load() -> SimpleNamespace:
     cfg.usage_file = state_dir / "usage.json"
     # Released originals are handed to the agent as files. They live outside the state directory
     # on purpose: that one is closed to Claude Code's file tools, this one has to be readable.
-    home = os.environ.get("JEVGUARD_HOME")
-    cfg.released_dir = Path(home) / "released" if home else state_dir.with_name(state_dir.name + "-released")
+    cfg.released_dir = (system.RELEASED_DIR if installed else Path(home) / "released" if home
+                        else state_dir.with_name(state_dir.name + "-released"))
     # Which files there the owner's release command wrote, and what was in them. Kept in the
     # closed state directory: a file counts as released only while it matches this record.
     cfg.released_manifest = state_dir / "released-files.json"
     return cfg
+
+
+def _service_uid() -> int | None:
+    try:
+        return system.service_ids()[0]
+    except KeyError:
+        return None
 
 
 def read_key(cfg) -> str:

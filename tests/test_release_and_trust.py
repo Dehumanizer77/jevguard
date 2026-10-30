@@ -265,11 +265,11 @@ def at_once(monkeypatch, first, second) -> dict:
     paused, go, moved, errors = threading.Event(), threading.Event(), threading.Event(), {}
     write, flock = store._write_private, fcntl.flock
 
-    def write_private(path, data):
+    def write_private(path, data, *mode):
         if threading.current_thread().name == "first" and not paused.is_set():
             paused.set()
             go.wait(10)
-        write(path, data)
+        write(path, data, *mode)
 
     def lock(fd, op):
         if threading.current_thread().name == "second":

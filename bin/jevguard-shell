@@ -5,8 +5,13 @@
 #
 # Every shell command depends on this file. It does as little as can be done here and runs the
 # line as it is whenever something is not as expected. If it ever stands in the way, take the
-# CLAUDE_CODE_SHELL_PREFIX line out of ~/.claude/settings.json and start Claude Code again.
-case "${SHELL##*/}" in bash|zsh) shell=$SHELL ;; *) shell=/bin/bash ;; esac
+# CLAUDE_CODE_SHELL_PREFIX line out of ~/.claude/settings.json (or, in a system installation,
+# /etc/claude-code/managed-settings.json) and start Claude Code again.
+#
+# The user's shell only where it is one of the system's (/etc/shells): the agent's user can set
+# SHELL in the environment Claude Code gives its commands and its hooks, to a program of its own.
+shell=/bin/bash
+case "${SHELL##*/}" in bash|zsh) if /usr/bin/grep -qxF -- "$SHELL" /etc/shells 2>/dev/null; then shell=$SHELL; fi ;; esac
 [ "$#" -eq 1 ] || exec "$@"
 case "$1" in
   *" eval "*)   # a tool's command; a hook's has no eval around it

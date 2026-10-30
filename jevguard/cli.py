@@ -62,7 +62,9 @@ def _hook_entry(sync: bool) -> dict:
 
 
 def _ours(group: dict) -> bool:
-    return any(h.get("command") == HOOK for h in group.get("hooks", []))
+    """A group with this code's hook in it: as `install` writes it, or with the agent named, as
+    a system installation writes it (system.claude_settings)."""
+    return any(h.get("command") in (HOOK, f"{HOOK} --agent claude") for h in group.get("hooks", []))
 
 
 def installed(settings_path: Path) -> bool:
@@ -99,6 +101,15 @@ def _read_deny_rules(cfg) -> list[str]:
     return [rule(cfg.config_dir), rule(cfg.state_dir)]
 
 
+def hook_plan(cfg) -> dict:
+    """Claude Code's events the guard's hook is set on: event -> (matchers, waited for, wanted).
+    A hook that may answer (replace a result, ask for approval) has to be waited for."""
+    return {"PostToolUse": (_POST, cfg.mode == "block", True),
+            "PostToolUseFailure": (_POST, cfg.mode == "block", True),  # a failed call: scanned and logged; see agents/claude.py
+            "PreToolUse": (_PRE, cfg.gate.startswith("ask") or cfg.protect_guard,
+                           cfg.gate != "off" or cfg.protect_guard)}
+
+
 def install(cfg, settings_path: Path, remove: bool = False) -> str:
     settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
     before = json.dumps(settings, sort_keys=True)
@@ -129,12 +140,7 @@ def install(cfg, settings_path: Path, remove: bool = False) -> str:
         if not env:
             settings.pop("env", None)
     hooks = settings.setdefault("hooks", {})
-    # A hook that may answer (replace a result, ask for approval) has to be waited for.
-    plan = {"PostToolUse": (_POST, cfg.mode == "block", True),
-            "PostToolUseFailure": (_POST, cfg.mode == "block", True),  # a failed call: scanned and logged; see agents/claude.py
-            "PreToolUse": (_PRE, cfg.gate.startswith("ask") or cfg.protect_guard,
-                           cfg.gate != "off" or cfg.protect_guard)}
-    for event, (matchers, sync, wanted) in plan.items():
+    for event, (matchers, sync, wanted) in hook_plan(cfg).items():
         # only the guard's own hook is taken out: a group may hold the owner's hooks beside it
         groups = [g for g in (agent_setup.without(g, lambda h: h.get("command") == HOOK) for g in hooks.get(event, []))
                   if g is not None]
@@ -175,8 +181,7 @@ def cmd_own(cfg, a) -> int:
             return 1
         repos = [*user.get("own_repos", []), *(r for r in a.repos if r not in user.get("own_repos", []))]
     user["own_repos"] = repos
-    cfg.config_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    cfg.config_file.write_text(json.dumps(user, indent=2) + "\n")
+    _save_settings(cfg, user)
     print("own repositories: " + (", ".join(repos) or "none"))
     if a.cmd == "own":
         print(f"what one `gh` command naming such a repository returns is withheld from {cfg.own_repos_block} up "
@@ -198,8 +203,7 @@ def cmd_trust(cfg, a) -> int:
     if a.cmd == "trust":
         sources.append(prefix)
     user["trusted_sources"] = sources
-    cfg.config_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    cfg.config_file.write_text(json.dumps(user, indent=2) + "\n")
+    _save_settings(cfg, user)
     print("trusted sources:" if sources else "trusted sources: none")
     for s in sources:
         print(" ", s)
@@ -209,14 +213,27 @@ def cmd_trust(cfg, a) -> int:
     return 0
 
 
+def _save_settings(cfg, user: dict) -> None:
+    """Write config.json. In a system installation it is root's, and every user reads it: the
+    hooks run as the agent's user."""
+    if cfg.system:
+        from . import system
+        system._write(cfg.config_file, json.dumps(user, indent=2) + "\n", 0o644)
+        return
+    cfg.config_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cfg.config_file.write_text(json.dumps(user, indent=2) + "\n")
+
+
 def _set(cfg, settings_path: Path, key: str, value: str) -> None:
     user = json.loads(cfg.config_file.read_text()) if cfg.config_file.exists() else {}
     user[key] = value
-    cfg.config_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    cfg.config_file.write_text(json.dumps(user, indent=2) + "\n")
+    _save_settings(cfg, user)
     cfg = config.load()
     print(f"{key} = {value}")
-    if installed(settings_path):
+    if cfg.system:
+        from . import system
+        system.update_agents(cfg, cfg.system.get("agents", ["claude"]))
+    elif installed(settings_path):
         print(install(cfg, settings_path))
     else:
         print("hooks are not installed (run: jevguard install)")
@@ -255,8 +272,12 @@ def cmd_status(cfg, a) -> int:
             except re.error as exc:
                 print(f"WARNING: {setting} holds {pattern!r}, which is not a pattern ({exc}). The guard fails on it at every "
                       "call, and each of those is then handled as on_error says")
-    others = [name for name in agent_setup.AGENTS if name != "claude" and agent_setup.installed(name)]
-    print("installed for other agents: " + (", ".join(others) or "none"))
+    if cfg.system:
+        print(f"system installation: code in {cfg.system.get('code')}, for the agents "
+              f"{', '.join(cfg.system.get('agents', []))}; owners (uid) {cfg.system.get('users')}")
+    else:
+        others = [name for name in agent_setup.AGENTS if name != "claude" and agent_setup.installed(name)]
+        print("installed for other agents: " + (", ".join(others) or "none"))
     print(f"API key: {'present' if key else 'MISSING'} ({cfg.key_file})")
     print(f"scan local content: {cfg.scan_local}   private hosts: {cfg.scan_private_hosts}   "
           f"track clones: {cfg.track_clones}")
@@ -620,8 +641,34 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("repos", nargs="+")
     p = sub.add_parser("disown", help="take repositories off that list")
     p.add_argument("repos", nargs="+")
+    p = sub.add_parser("setup-system", help="install the guard for the system, out of the agent's reach (as root, "
+                                            "from code only root can write; see the README)")
+    p.add_argument("--user", required=True, help="the user the agents run as")
+    p.add_argument("--agent", action="append", choices=["claude", "codex"],
+                   help="an agent whose system settings get the hooks (claude, codex); claude when not given")
+    sub.add_parser("remove-system", help="take the guard out of the agents' system settings and stop its service "
+                                         "(as root); settings and state stay")
     a = ap.parse_args(argv)
+    if a.cmd in ("setup-system", "remove-system"):
+        from . import system
+        return system.setup(a.user, sorted(set(a.agent or ["claude"]))) if a.cmd == "setup-system" else system.remove()
     cfg = config.load()
+    if cfg.system:
+        # A system installation: what the owner changes or reads of the guard is root's and the
+        # service's, and these commands are run with sudo. What reads or writes the guard's state
+        # goes on as the service's user, so that the files stay the service's.
+        from . import system
+        if os.geteuid() != 0:
+            print(f"the guard is installed for the system: run `sudo jevguard {a.cmd} ...`", file=sys.stderr)
+            return 1
+        if a.cmd in ("install", "uninstall"):
+            print("the guard is installed for the system, and the hooks are in the agents' system settings: "
+                  "use `sudo jevguard setup-system` or `remove-system`", file=sys.stderr)
+            return 1
+        a.settings = system.CLAUDE_MANAGED
+        if a.cmd not in ("mode", "gate", "trust", "untrust", "own", "disown"):
+            system.become_service_user()
+            cfg = config.load()
     if a.cmd in ("mode", "gate"):
         _set(cfg, a.settings, a.cmd, a.value)
         return 0

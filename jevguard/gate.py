@@ -46,6 +46,13 @@ _STARTUP = re.compile(r"(?:^|/)(?:\.ssh(?:/|$)|\.claude/(?:hooks(?:/|$)|CLAUDE\.
 _SETTINGS = re.compile(r"(?:^|/)(?:\.claude/settings[^/]*\.json|\.grok/(?:hooks/[^/]+\.json|disabled-hooks|[^/]+\.toml)|"
                        r"\.copilot/(?:hooks/[^/]+\.json|config\.json)|\.cursor/hooks\.json|"
                        r"\.codex/(?:hooks\.json|config\.toml)|\.hermes/(?:config\.yaml|plugins/jevguard(?:/.*)?))$")
+# The system settings that run the guard for every user, in a system installation (system.py):
+# Claude Code's managed settings, Codex's requirements, the guard's own settings and its service.
+_SYSTEM_SETTINGS = re.compile(r"^/etc/(?:claude-code/managed-settings\.(?:json|d(?:/.*)?)|"
+                              r"codex/(?:requirements|managed_config)\.toml|jevguard(?:/.*)?|"
+                              r"systemd/system/jevguard\.(?:socket|service))$")
+_SYSTEM_FILES = ("/etc/claude-code/managed-settings.json", "/etc/codex/requirements.toml", "/etc/jevguard/system.json",
+                 "/etc/systemd/system/jevguard.socket", "/etc/systemd/system/jevguard.service")
 # The same files as the last parts of a path, in the home directory or in a project. Used for what
 # a pattern alone cannot say: which directories hold one (`rm -rf ~/.cursor`, `mv .grok/hooks x`)
 # and which globs can reach one (`rm ~/.codex/*.json`).
@@ -364,11 +371,11 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
     released = canonical(str(cfg.released_dir))
     # What must not be removed from above either: the guard's directories and, for every agent,
     # the file in the user's home that its hooks are set in.
-    hook_files = [canonical(os.path.join("~", *tail)) for tail in _HOOK_FILES]
+    hook_files = [canonical(os.path.join("~", *tail)) for tail in _HOOK_FILES] + list(_SYSTEM_FILES)
     targets = roots + [released] + hook_files
 
     def protected(path: str) -> bool:
-        return bool(_SETTINGS.search(path)) or any(under(path, r) for r in [*roots, released])
+        return bool(_SETTINGS.search(path) or _SYSTEM_SETTINGS.match(path)) or any(under(path, r) for r in [*roots, released])
 
     def above(path: str) -> bool:
         return any(path != t and under(t, path) for t in targets) or _holds_hooks(path)
@@ -471,7 +478,8 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
             return f"`{program}` {_names(argv, hit, given)} {_show(hit)}, {kind(hit)}"
         if _reads_only(argv):
             continue  # cat .claude/settings.json, cat a released original, ls ~: looking is not a change
-        hit = next((p for p in sorted(paths) if _SETTINGS.search(p) or under(p, released)), None) or \
+        hit = next((p for p in sorted(paths) if _SETTINGS.search(p) or _SYSTEM_SETTINGS.match(p) or under(p, released)),
+                   None) or \
             next((g for g in globs if _settings_glob(g) or any(shell.glob_reaches(g, t) for t in [released, *hook_files])), None)
         if hit:
             return f"`{program}` {_names(argv, hit, given)} {_show(hit)}, {kind(hit)}"
