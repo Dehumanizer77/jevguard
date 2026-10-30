@@ -1378,3 +1378,49 @@ def test_the_root_a_read_or_a_split_gives_is_a_path_the_command_names(guard, tmp
                 "awk '{print $1 / $2}' data | while read r; do touch \"$r.out\"; done",
                 "printf 'a\\tb\\n' | while read x y; do touch \"$x\"; done"):
         assert _reason(guard, cmd) == "", cmd
+
+
+def test_what_a_command_prints_is_read_as_bash_prints_it(guard, tmp_path):
+    """#74 (comment on 83ec9cf): in a %b argument and in echo -e, \\c ends all output, so
+    `read a < <(printf "%b" "/\\cfoo")` gives a /, and neither the text nor what _printed made of
+    it ended there. The same class, also on main: no shell value holds a NUL (`.cl\\0aude` is
+    .claude); read without -r takes a backslash off (`\\/` is /); read -n and -N take part of a
+    line; and printf's format joins and cuts its arguments (`%s%s`, `%.7s`, `%c`), also into a
+    variable (-v) or $(...), which takes the line breaks off the end. Now what printf prints is
+    worked out as bash prints it (_printf), and what a variable may be given of printed text
+    (_received) is a path the command names, whole and in words. read -n and -N cannot be read."""
+    quote = lambda args: " ".join("'" + a.replace("'", "'\\''") + "'" for a in args)  # noqa: E731
+    for args in (["%s%s\\n", ".cl", "aude"], ["%.7s", ".claudeX"], ["%c%c", "/x", ".y"], ["%5.1s|", "/x"],
+                 ["%-3s|", "/"], ["%b", "\\0056claude"], ["%b", "\\101"], ["%b%s", "/\\c", "x"], ["a%sb", "x", "y", "z"],
+                 ["%d|%s", "x", "/"], ["%x|%o|%#o|%i|%05.1f", "255", "8", "8", "010", "2.25"], ["%q|", "a b"],
+                 ["\\057"], ["%%s"], ["%*s|", "3", "/"], ["%.*s|", "1", "/x"], ["%s\\c|", "/", "x"], ["%z|", "x"],
+                 ["-v", "v", "%s"], ["--", "%s", "/"]):
+        assert _seen_in_bash(tmp_path, f'seen "$(printf {quote(args)})"') == \
+            {(shell._printf(args)[0].rstrip("\n"),)}, args
+    for cmd, given in (('read a < <(printf "%b" "/\\cfoo"); seen "$a"', "/"),
+                       ('read a < <(echo -e "/\\cfoo"); seen "$a"', "/"),
+                       ("read a < <(printf '%b' '/\\\\cfoo'); seen \"$a\"", "/cfoo"),
+                       ("read a < <(echo -e '/\\\\cfoo'); seen \"$a\"", "/cfoo"),
+                       ("printf '.cl\\0aude\\n' | { read a; seen \"$a\"; }", ".claude"),
+                       ("read a <<< '.cl\\aude'; seen \"$a\"", ".claude"), ("read a <<< '\\/'; seen \"$a\"", "/"),
+                       ("read -N 7 a <<< .claudeX; seen \"$a\"", ".claude"), ("seen \"$(printf '/\\0x')\"", "/x")):
+        assert _seen_in_bash(tmp_path, cmd) == {(given,)}, cmd
+    for cmd in ('read a < <(printf "%b" "/\\cfoo"); tar -xf fixture.tar -C "$a"',
+                'read a < <(echo -e "/\\cfoo"); tar -xf fixture.tar -C "$a"',
+                'read a < <(printf "%b" "/\\cfoo"); touch "$a"', "touch \"$(printf '%b' '/\\cfoo')\"",
+                "touch \"$(printf '%c' /x)\"", "touch \"$(echo -e '/\\n\\n')\"", "touch \"$(printf '\\057')\"",
+                "printf '%b x\\n' '/\\c' | { read a; touch \"$a\"; }", "read a <<< '\\/'; touch \"$a\"",
+                "printf '/\\0x' | { read -d '' a; touch \"$a\"; }"):
+        assert "names /," in _reason(guard, cmd), cmd
+    for cmd in ("printf -v x '%s%s' .cl aude; touch \"$x\"", "touch \"$(printf '%.7s' .claudeX)\"",
+                "printf '%s%s\\n' .cl aude | while read a; do touch \"$a\"; done", "touch \"$(printf '.cl\\0aude')\"",
+                "printf '.cl\\0aude\\n' | { read a; touch \"$a\"; }", "read a <<< '.cl\\aude'; touch \"$a\""):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("read -n 1 a <<< /x; touch \"$a\"", "read -N 7 a <<< .claudeX; touch \"$a\""):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ("read a < <(printf '%b' '/\\\\cfoo'); tar -xf fixture.tar -C \"$a\"",
+                "read a < <(echo -e '/\\\\cfoo'); tar -xf fixture.tar -C \"$a\"",
+                "read -r a < <(printf '%s\\n' 'x\\/'); touch \"$a\"", "touch \"$(printf '/\\0x')\"",
+                "find . -print0 | while IFS= read -r -d '' f; do touch \"$f.bak\"; done",
+                "touch \"$(printf '%s.log' notes)\"", "for f in *.md; do printf '%-20s %5d\\n' \"$f\" 3; done; touch \"$out\""):
+        assert _reason(guard, cmd) == "", cmd

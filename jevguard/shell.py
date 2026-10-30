@@ -15,6 +15,7 @@ import math
 import os
 import re
 import shlex
+import time
 
 _REDIRECT_CHARS = set("<>&|")
 # Programs that only run another program: the command after them is what counts. For each, the
@@ -1238,31 +1239,165 @@ def _ifs(env: dict) -> tuple:
 
 
 _NAME_CHAR = re.compile(r"[A-Za-z0-9._~/+@%-]")  # what _pieces takes for part of a file name
-# A backslash escape as printf reads it in its format (\056), and as echo -e and %b do (\0056)
-_ESCAPES = (re.compile(r"\\(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|(.))", re.S),
-            re.compile(r"\\(?:0([0-7]{0,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|(.))", re.S))
+_HEX_ESCAPE = r"|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|(.))"
+# A backslash escape as bash reads it in printf's format (\056), in a %b argument (\0056, \056)
+# and in echo -e (\0056 only)
+_ESCAPES = {"format": re.compile(r"\\(?:([0-7]{1,3})" + _HEX_ESCAPE, re.S),
+            "%b": re.compile(r"\\(?:(0[0-7]{0,3}|[1-7][0-7]{0,2})" + _HEX_ESCAPE, re.S),
+            "echo": re.compile(r"\\(?:(0[0-7]{0,3})" + _HEX_ESCAPE, re.S)}
 _ESCAPED = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
             "\\": "\\", "'": "'", '"': '"', "?": "?"}
 
 
-def _printed(text: str) -> list[str]:
-    """text, and where it has a backslash, what printf and echo -e print of it: \\n is a line
-    break, \\056 and \\x2e a dot (`printf 'x\\n.claude\\n' | while read a`)."""
-    def char(m: re.Match) -> str:
+def _unescape(text: str, escape: re.Pattern, cut: bool = False) -> str:
+    """text with the backslash escapes of one of _ESCAPES turned into the characters they
+    stand for. cut: up to the first \\c, after which %b and echo -e print nothing."""
+    out, at = [], 0
+    for m in escape.finditer(text):
+        out.append(text[at:m.start()])
+        at = m.end()
         octal, hexa, short, long, other = m.groups()
+        if other == "c" and cut:
+            return "".join(out)
         if other is not None:
-            return _ESCAPED.get(other, m.group())
+            out.append(_ESCAPED.get(other, m.group()))
+            continue
         try:
-            return chr(int(octal or "0", 8) if octal is not None else int(hexa or short or long, 16))
+            out.append(chr(int(octal, 8) if octal is not None else int(hexa or short or long, 16)))
         except (ValueError, OverflowError):
-            return m.group()
-    return list(dict.fromkeys([text, *(e.sub(char, text) for e in _ESCAPES if "\\" in text)]))
+            out.append(m.group())
+    return "".join(out) + text[at:]
 
 
-def _pieces(text: str, breaks: set[str] | frozenset = frozenset()) -> list[str]:
+def _received(text: str) -> list[str]:
+    """What a variable may be given of printed text: no shell value holds a NUL, so read and
+    $(...) leave it out (`.cl\\0aude` is .claude); and read without -r takes a backslash off
+    the character after it, and with a line break off both (`\\/` is /, #74)."""
+    forms = [text, re.sub(r"\\(.)", lambda m: "" if m.group(1) == "\n" else m.group(1), text, flags=re.S)] \
+        if "\\" in text else [text]
+    return list(dict.fromkeys(f for form in forms for f in (form, form.replace("\0", ""))))
+
+
+def _printed(text: str) -> list[str]:
+    """What a variable may be given of a text the command prints (_received): the text, and
+    where it has a backslash, what printf and echo -e print of it (\\n is a line break, \\056 a
+    dot), also up to a \\c, where they stop (`printf %b '/\\cfoo'` prints /, #74)."""
+    forms = [text] + [_unescape(text, e, cut) for e in _ESCAPES.values() for cut in (False, True)] \
+        if "\\" in text else [text]
+    return list(dict.fromkeys(f for form in dict.fromkeys(forms) for f in _received(form)))
+
+
+_PRINTF = re.compile(r"(%%)|%([-+ #0]*)(\*|[0-9]*)(?:\.(\*|[0-9]*))?[hjlLtz]*(\([^)]*\))?(.?)"
+                     r"|(\\(?:[0-7]{1,3}|x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|.)?)|([^%\\]+)", re.S)
+
+
+def _printf(args: list[str]) -> list[str]:
+    """What printf prints given args, as bash 5.2 prints it: its format with the escapes in it,
+    each directive given the next argument, and the format again while arguments are left
+    (`printf '%s%s\\n' .cl aude` prints .claude). %b reads escapes as echo -e does, and a \\c
+    there ends all output; %c and a precision print part of an argument (`%.1s` of /x is /). A
+    number that cannot be read is 0, a time is now, an invalid directive ends the output. Where
+    the format has \\c, also what coreutils printf prints, which ends there."""
+    while args[:1] and args[0].startswith("-v"):  # -v NAME: printed into a variable
+        args = args[1 if len(args[0]) > 2 else 2:]
+    args = args[args[:1] == ["--"]:]
+    if not args:
+        return []
+    outs = []
+    for stop in (False, True) if "\\c" in args[0] else (False,):
+        out, left, size, done = [], list(args[1:]), 0, False
+
+        def take() -> str:
+            return left.pop(0) if left else ""
+        while not done:
+            before = len(left)
+            for m in _PRINTF.finditer(args[0]):
+                percent, flags, width, precision, when, conv, escape, text = m.groups()
+                if percent or text is not None:
+                    out.append(text or "%")
+                    continue
+                if escape is not None:
+                    if escape == "\\c" and stop:
+                        done = True
+                        break
+                    out.append(_unescape(escape, _ESCAPES["format"]))
+                    continue
+                if not conv or conv not in "sbqQcdiouxXeEfFgGaAT" or (when is not None) != (conv == "T"):
+                    done = True  # bash: an invalid format character, and nothing more is printed
+                    break
+                w = _number(take(), False) if width == "*" else int(width or 0)
+                p = (_number(take(), False) if precision == "*" else int(precision or 0)) \
+                    if precision is not None else None
+                flags += "-" * (w < 0)
+                w, p = min(abs(w), 4096), None if p is None or p < 0 else min(p, 4096)
+                if conv in "sqQc":
+                    s = take()
+                    s = s[:1] if conv == "c" else re.sub(r"([^A-Za-z0-9_./:@%+,=-])", r"\\\1", s) \
+                        if conv in "qQ" else s
+                elif conv == "b":
+                    arg = take()
+                    s = _unescape(arg, _ESCAPES["%b"], cut=True)
+                    done = s != _unescape(arg, _ESCAPES["%b"])  # a \c: nothing more is printed
+                elif conv == "T":
+                    take()
+                    try:
+                        s = time.strftime(when[1:-1] or "%X")
+                    except ValueError:
+                        s = when[1:-1]
+                else:
+                    s = _number_text(flags, w, p, conv, _number(take(), conv in "eEfFgGaA"))
+                if p is not None and conv in "sbqQT":
+                    s = s[:p]
+                if conv not in "diouxXeEfFgGaA":
+                    s = s.ljust(w) if "-" in flags else s.rjust(w)
+                out.append(s)
+                size += len(s)
+                if size > 100_000:
+                    raise ValueError("printf prints more than can be read")
+                if done:
+                    break
+            done = done or not left or len(left) == before
+        outs.append("".join(out))
+    return list(dict.fromkeys(outs))
+
+
+def _number(arg: str, real: bool) -> int | float:
+    """The number printf reads in arg: a character's code after a quote, an integer in C's
+    bases (0x1f, 017), or a real number. 0 where it reads none."""
+    s = arg.lstrip()
+    if s[:1] in ("'", '"'):
+        return ord(s[1]) if len(s) > 1 else 0
+    m = re.match(r"[-+]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?|inf|nan)", s, re.I) if real else \
+        re.match(r"[-+]?(?:0[xX][0-9A-Fa-f]+|0[0-7]*|[1-9][0-9]*)", s)
+    if not m:
+        return 0.0 if real else 0
+    if real:
+        return float(m.group())
+    digits = m.group().lstrip("+-")
+    value = int(digits, 16) if digits[:2] in ("0x", "0X") else int(digits, 8) if digits[0] == "0" else int(digits)
+    return -value if m.group().startswith("-") else value
+
+
+def _number_text(flags: str, width: int, precision: int | None, conv: str, value: int | float) -> str:
+    """value as printf's directive % flags width .precision conv prints it."""
+    try:
+        if conv in "aA":
+            text = float(value).hex()
+            return text.upper() if conv == "A" else text
+        if conv in "ouxX" and value < 0:
+            value += 1 << 64
+        spec = "%" + flags + (str(width) if width else "") + ("." + str(precision) if precision is not None else "")
+        text = (spec + {"i": "d", "u": "d"}.get(conv, conv)) % value
+        return text.replace("0o", "0", 1) if conv == "o" else text
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
+def _pieces(text: str, breaks: set[str] | frozenset = frozenset(), forms: list[str] | None = None) -> list[str]:
     """The words text may be split into where what IFS holds is not known here: at spaces and at
     any character that is not part of a file name. Nothing where it has none of them. The same
-    of what printf and echo -e print of it (_printed).
+    of each of forms, by default what a variable may be given where the text is printed
+    (_printed); of what printf has printed, what a variable may be given of it (_received).
 
     breaks: characters the command may also split at (Command.breaks). There a word is cut too,
     and what follows each one is a word as well: read gives its last variable the rest of the
@@ -1275,7 +1410,7 @@ def _pieces(text: str, breaks: set[str] | frozenset = frozenset()) -> list[str]:
     edge = "[" + "".join(re.escape(ch) for ch in sorted(breaks)) + "]" if breaks else None
     root = re.compile(rf"(?:\A|(?<={edge}))[ \t]*(/+)[ \t]*(?={edge}|\Z)" if edge else r"\A[ \t]*(/+)[ \t]*\Z")
     pieces, roots, count = [], [], 0
-    for form in _printed(text):
+    for form in _printed(text) if forms is None else forms:
         for run in re.split(r"[^A-Za-z0-9._~/+@%-]+", form):
             pieces.append(run)
             cuts = [i for i, ch in enumerate(run) if ch in breaks]
@@ -1606,10 +1741,18 @@ def read(cmd: str, cwd: str = "") -> Command:
     # read, mapfile and readarray give variables words of what they read, which may be any text
     # the command prints: each word it may be split into is a path the command names (#74). So
     # are the words a value not known may be split into at IFS (`touch $(echo '.claude x')`).
-    if out.breaks or any(os.path.basename(argv[0]) in ("read", "mapfile", "readarray") for argv in out.programs):
-        for argv, dirs in zip(list(out.programs), list(out.program_dirs)):
-            for piece in {p for a in argv[1:] for p in _pieces(a, out.breaks)}:
-                _note_paths(piece, dirs, out.paths, out.globs)
+    # What a program prints may differ from its words: escapes, a \c, a NUL (_printed), and
+    # printf's format, which joins or cuts them (_printf). The whole of each, without the line
+    # breaks $(...) takes off its end, is a path the command names too (`"$(printf '%b' '/\c')"`).
+    splits = out.breaks or any(os.path.basename(argv[0]) in ("read", "mapfile", "readarray") for argv in out.programs)
+    for argv, dirs in zip(list(out.programs), list(out.program_dirs)):
+        texts = [(a, _printed(a)) for a in argv[1:]]
+        texts += [(p, _received(p)) for p in (_printf(argv[1:]) if os.path.basename(argv[0]) == "printf" else [])]
+        named = {f.rstrip("\n") for text, forms in texts for f in forms} - set(argv[1:]) - {""}
+        if splits:
+            named |= {p for text, forms in texts for p in _pieces(text, out.breaks, forms)}
+        for piece in named:
+            _note_paths(piece, dirs, out.paths, out.globs)
     # The home that a script a shell or ssh runs names does not make that shell a change only if
     # the script cannot hand it to anything this does not read (_closed). A script made only of
     # programs that read cannot; what it prints can, through a file the command writes or a pipe
@@ -1936,8 +2079,10 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 if letter in valued.get(program, ""):
                     if letter in naming.get(program, ""):
                         named.append(a[j:] or (args[k] if k < len(args) else ""))
-                    if letter == "d" and program in ("read", "mapfile", "readarray"):
-                        ends.append(a[j:] or (args[k] if k < len(args) else ""))
+                    if letter == "d" and program in ("read", "mapfile", "readarray"):  # -d '': at a NUL
+                        ends.append(a[j:] or (args[k] if k < len(args) else "") or "\0")
+                    if letter in "nN" and program == "read":  # read -n 1 a <<< /x gives /
+                        raise ValueError("a read of a number of characters, which may end anywhere")
                     k += not a[j:]
                     break
         for chars in ifs + ends:
