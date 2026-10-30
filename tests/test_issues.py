@@ -1281,3 +1281,55 @@ def test_the_words_a_value_may_be_split_into_are_paths_the_command_names(guard, 
     for cmd in ("msg='a / b'; touch \"$out\"", "read a <<< 'x / y'; touch \"$a\"",
                 "git commit -m 'fix s//x/ in the parser'; touch \"$out\"", "p='notes x'; touch \"$p\""):
         assert _reason(guard, cmd) == "", cmd
+
+
+def test_the_elements_of_an_array_are_put_in_as_bash_puts_them_or_cannot_be_read(guard, tmp_path):
+    """#86: the reader put in each value an array may hold on its own, wherever its ${a[@]} or
+    ${a[*]} stood. bash joins the elements of a quoted ${a[*]}, and of any of them where it makes
+    no words (an assignment, [[ ]], case), at the first character of IFS: with IFS empty,
+    .cl au de is .claude, which none of them names. Beside other text only the first and the last
+    element take it: `a=(x .claude); touch "y${a[@]}"` touches .claude, and the reader, which had
+    the values of a since 45e8045, read y.claude and asked nothing, where main asked."""
+    assert _seen_in_bash(tmp_path, 'IFS=; a=(.cl au de); seen "${a[*]}"') == {(".claude",)}
+    assert _seen_in_bash(tmp_path, 'a=(x .claude); seen "y${a[@]}"') == {("yx", ".claude")}
+    assert _seen_in_bash(tmp_path, 'IFS=; set -- .cl aude; seen "$*"') == {(".claude",)}
+    # each element a word of its own, the expansion the whole word: each word bash gives is read
+    for cmd in ('a=(x "y z"); seen "${a[@]}"', 'a=(x "y z"); seen ${a[@]}', 'a=(x "y z"); seen ${a[*]}',
+                'IFS=; a=(x "y z"); seen ${a[*]}', 'IFS=:; a=(x "y:z"); seen ${a[@]}',
+                'a=(x y); for f in "${a[@]}"; do seen "$f"; done'):
+        assert set().union(*_seen_in_bash(tmp_path, cmd)) <= set().union(*_seen_by_reader(cmd)), cmd
+    for cmd in ('IFS=; a=(.cl au de); touch "${a[*]}"', 'a=(.cl au de); IFS=; touch "${a[*]}"',
+                'IFS=-; a=(.cl aude); touch "${a[*]}"', 'a=(x .claude); touch "y${a[@]}"',
+                'a=(.claude x); touch "${a[@]}y"', 'a=(.claude x); touch y${a[*]}',
+                'IFS=; a=(.cl aude); x=${a[*]}; touch "$x"', 'a=(.cl aude); IFS=; x="${a[@]}"; touch "$x"',
+                # the arguments, and an array that is not known: what they are joined at is named nowhere
+                'IFS=; set -- .cl aude; touch "$*"', 'f() { IFS=; touch "$*"; }; f .cl aude',
+                'IFS=; a=($(cat list)); touch "${a[*]}"'):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ('IFS=; a=(.claude); touch ${a[*]}', 'a=(.claude); touch "${a[*]}"', 'a=(.claude x); touch "${a[@]}"'):
+        assert ".claude" in _reason(guard, cmd), cmd
+    # joined at a space, two elements hold one, and no path does
+    for cmd in ('a=(x y); touch "${a[@]}"', 'a=(x y); echo "files: ${a[*]}"', 'a=(x y); msg="${a[*]}"; touch notes',
+                'files=(a b); for f in "${files[@]}"; do touch "$f.log"; done', 'touch "$@"', 'echo "$*" > notes'):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_a_read_splits_at_the_characters_it_is_given(guard, tmp_path):
+    """#74 (comment on 45e8045): the words of what a command may read were cut only where a
+    character is not part of a file name. IFS may hold one: `IFS=x read a b <<< notesx.claude`
+    gives b .claude, which no text in the command names. Now every character of a file name that
+    a read splits at (IFS as it runs, read -d, mapfile -d), or a value not known is split at, cuts
+    the texts of the command too, and what follows each cut is a word as well (read gives its last
+    variable the rest of the line). Where they are not known, the command cannot be read."""
+    assert _seen_in_bash(tmp_path, 'IFS=x read a b <<< "notesx.claude"; seen "$b"') == {(".claude",)}
+    assert _seen_in_bash(tmp_path, 'IFS=. read a b <<< "a..claude"; seen "$b"') == {(".claude",)}
+    for cmd in ('IFS=x read a b <<< "notesx.claude"; touch "$b"',
+                'IFS=x; printf "%s\\n" "notesx.claude" | while read a b; do touch "$b"; done',
+                'IFS=. read a b <<< "a..claude"; touch "$b"', 'read -d x a <<< ".claudexnotes"; touch "$a"',
+                'mapfile -t -d x a <<< "notesx.claude"; touch "${a[1]}"', 'IFS=x; touch $(echo notesx.claude)'):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ('IFS=$(printf x) read a b <<< "notesx.claude"; touch "$b"', 'read -d "$d" a <<< x; touch "$a"'):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ("IFS=: read a b <<< 'x:y'; touch \"$b\"", 'while IFS= read -r l; do touch "$l"; done < list.txt',
+                'IFS=. read -r major minor <<< "1.2"; touch "v$major"', 'IFS=- read -ra parts <<< "a-b"; touch "${parts[0]}"'):
+        assert _reason(guard, cmd) == "", cmd

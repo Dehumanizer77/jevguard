@@ -121,6 +121,9 @@ class Command:
         self.program_carried: list[set[str]] = []
         self.assigned: list[str] = []        # the names of the variables it sets, in turn
         self.piping = False                  # a program in it is given its input through a pipe
+        # the characters of a file name that read, or the splitting of a value not known, may
+        # end a word at (IFS=x, read -d x): words of its texts cut there are paths it names (_pieces)
+        self.breaks: set[str] = set()
         self.writes: set[str] = set()        # canonical targets of > >> &> redirections
         self.dirs: list[str] = [canonical(cwd)] if cwd else []  # the starting directory and every `cd` target
         self.paths: set[str] = set()         # canonical paths the command names
@@ -984,7 +987,7 @@ def _assigned(word: str, env: dict, runs: list[str]) -> dict:
             if given and bang:
                 return _unknown(env)
             if given:
-                values = tuple(r[0] for r in _readings([given.group(1)], env))
+                values = tuple(r[0] for r in _readings([given.group(1)], env, split=False))
                 if re.search(r"['\"\\{}" + _LITERAL + "]", re.sub(r"\$\{[^{}]*\}", "", given.group(1))):
                     values += (None,)
                 env = {**env, name: _merge(_values(env, name), values)}
@@ -1092,7 +1095,37 @@ def _pattern(pattern: str) -> str:
     return "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
 
 
-def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split: bool = True) -> list[list[str]]:
+# ${a[@]}, ${a[*]}, ${!a[@]}, and the arguments: $@, $*, ${@...}, ${*...}
+_ELEMENTS = re.compile(r"\$\{!?([A-Za-z_][A-Za-z0-9_]*)\[([@*])\]|\$\{?([@*])")
+
+
+def _elements(word: str, env: dict, bare: frozenset, apart: bool) -> None:
+    """Raises where the elements of an array or the arguments are put in in a way this does not
+    read (#86). In a word that is one of a command's (apart), "${a[@]}" and ${a[*]} make each
+    element a word of its own: _readings reads each value a may hold, which is right where the
+    expansion is the whole word. Beside other text only the first and the last element take it
+    (`a=(x .claude); touch "y${a[@]}"` touches yx and .claude). Quoted ${a[*]}, and any of them
+    where the shell makes no words (an assignment, [[ ]], case, a redirection), is one word: the
+    elements joined at the first character of IFS, which makes a path of pieces that each name
+    nothing (`IFS=; a=(.cl aude); touch "${a[*]}"` touches .claude). That this reads only where IFS
+    begins with a space, a tab or a newline: two elements joined then hold one, and no path does.
+    For the arguments and an array that is not known it holds as well: what they are joined at
+    is not named anywhere in the command."""
+    for m in _ELEMENTS.finditer(word):
+        joined = not apart or ("*" in (m.group(2) or m.group(3)) and m.start() not in bare)
+        if joined:
+            if not all(ifs is not None and ifs[:1] in (" ", "\t", "\n") for ifs in _ifs(env)):
+                raise ValueError("elements joined at a character that is not a space (IFS)")
+            continue
+        known = m.group(1) and not word.startswith("${!", m.start()) and \
+            any(v is not None and _OPAQUE not in v for v in _values(env, m.group(1)))
+        whole = _EXPANSION.match(word, m.start())
+        if known and not (m.start() == 0 and whole and whole.end() == len(word)):
+            raise ValueError("the elements of an array put in beside other text")
+
+
+def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split: bool = True,
+              breaks: set[str] | None = None) -> list[list[str]]:
     """The words with the values of their variables put in, once for each combination of the
     values they may hold; envs gives each word an env of its own. Past _READINGS what the command
     is given cannot be told. A $ in single quotes (_LITERAL) is not filled in: it is text, and a
@@ -1105,19 +1138,24 @@ def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split
 
     A known value put in where the $ was in no quotes is split at the characters of IFS, as the
     shell splits it (_fields, #74): `p='.claude notes'; rm -rf $p` removes .claude. Not where the
-    shell does not split (split=False: case WORD, [[ ]]), in the word of a redirection, nor in an
-    assignment to export and the like. And where a replacement has a & in it, once as bash 5.2
-    reads it, the text the pattern matched, and once as older shells do (#75)."""
+    shell does not split (split=False: case WORD, [[ ]], the value of an assignment), in the word
+    of a redirection, nor in an assignment to export and the like. And where a replacement has a &
+    in it, once as bash 5.2 reads it, the text the pattern matched, and once as older shells do
+    (#75). The elements of an array, and the arguments, as _elements says (#86).
+
+    breaks: where given, the characters of a file name in IFS where a word has something in no
+    quotes the shell splits are added to it: a value not known is cut there (Command.breaks)."""
     envs = envs or [env] * len(words)
     declaring = bool(words) and str(words[0]) in _DECLARE
     splits = []
     for k, word in enumerate(words):
         before = words[k - 1] if k else ""
-        if not split or (getattr(before, "op", False) and _REDIRECTION.fullmatch(before)) or \
-                (declaring and _ASSIGN_WORD.match(word)):
-            splits.append(frozenset())
-        else:
-            splits.append(getattr(word, "bare", frozenset()))
+        apart = split and not (getattr(before, "op", False) and _REDIRECTION.fullmatch(before)) and \
+            not (declaring and _ASSIGN_WORD.match(word))
+        splits.append(getattr(word, "bare", frozenset()) if apart else frozenset())
+        _elements(word, envs[k], splits[-1], apart)
+        if breaks is not None and (splits[-1] or apart and _RUN.search(word)):
+            breaks.update(ch for ifs in _ifs(envs[k]) for ch in ifs or "" if _NAME_CHAR.match(ch))
     held: dict[tuple, tuple] = {}
     for word, e, bare in zip(words, envs, splits):
         for m in _EXPANSION.finditer(word):
@@ -1199,11 +1237,28 @@ def _ifs(env: dict) -> tuple:
     return tuple(dict.fromkeys(None if v is None or _OPAQUE in v else v for v in _values(env, "IFS")))
 
 
-def _pieces(text: str) -> list[str]:
+_NAME_CHAR = re.compile(r"[A-Za-z0-9._~/+@%-]")  # what _pieces takes for part of a file name
+
+
+def _pieces(text: str, breaks: set[str] | frozenset = frozenset()) -> list[str]:
     """The words text may be split into where what IFS holds is not known here: at spaces and at
     any character that is not part of a file name. Nothing where it has none of them. Not a lone
-    / (`a / b`, `s//x/`): in a text it is division or syntax far more often than the root."""
-    pieces = [p for p in re.split(r"[^A-Za-z0-9._~/+@%-]+", text) if p and p.strip("/")]
+    / (`a / b`, `s//x/`): in a text it is division or syntax far more often than the root.
+
+    breaks: characters of a file name the command may also split at (Command.breaks). There a
+    word is cut too, and what follows each one is a word as well: read gives its last variable
+    the rest of the line (`IFS=x read a b <<< notesx.claude` gives b .claude, #74)."""
+    pieces, count = [], 0
+    for run in re.split(r"[^A-Za-z0-9._~/+@%-]+", text):
+        pieces.append(run)
+        cuts = [i for i, ch in enumerate(run) if ch in breaks]
+        count += len(cuts)
+        if count > 2000:
+            raise ValueError("a text split at more places than can be read")
+        if cuts:
+            pieces += re.split("[" + "".join(re.escape(ch) for ch in breaks) + "]", run)
+            pieces += [run[i + 1:] for i in cuts]
+    pieces = [p for p in dict.fromkeys(pieces) if p and p.strip("/")]
     return [] if pieces == [text] else pieces
 
 
@@ -1521,10 +1576,11 @@ def read(cmd: str, cwd: str = "") -> Command:
     unset = used - set(env) - set(os.environ) | used & {"_"}  # $_: never known (_values)
     out.dynamic = bool(_DYNAMIC.search(visible) or unset)
     # read, mapfile and readarray give variables words of what they read, which may be any text
-    # the command prints: each word it may be split into is a path the command names (#74)
-    if any(os.path.basename(argv[0]) in ("read", "mapfile", "readarray") for argv in out.programs):
+    # the command prints: each word it may be split into is a path the command names (#74). So
+    # are the words a value not known may be split into at a character of a file name in IFS.
+    if out.breaks or any(os.path.basename(argv[0]) in ("read", "mapfile", "readarray") for argv in out.programs):
         for argv, dirs in zip(list(out.programs), list(out.program_dirs)):
-            for piece in {p for a in argv[1:] for p in _pieces(a)}:
+            for piece in {p for a in argv[1:] for p in _pieces(a, out.breaks)}:
                 _note_paths(piece, dirs, out.paths, out.globs)
     # The home that a script a shell or ssh runs names does not make that shell a change only if
     # the script cannot hand it to anything this does not read (_closed). A script made only of
@@ -1579,6 +1635,7 @@ def _add(out: Command, there: Command) -> None:
                       (out.assigned, there.assigned)):
         mine.extend(its)
     out.piping = out.piping or there.piping
+    out.breaks |= there.breaks
     out.writes |= there.writes
     out.paths |= there.paths
     out.globs += there.globs
@@ -1662,7 +1719,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             env = env_in(f)
             for word in words:
                 env = expand(word, env)
-            readings = _readings(words, env, split=words[0] != "case")  # case WORD is not split
+            readings = _readings(words, env, split=words[0] != "case", breaks=out.breaks)  # case WORD is not split
             for argv in readings:
                 for arg in argv[1:2] if argv[0] == "case" else argv[3:]:  # case WORD in, for NAME in WORDS
                     _note_paths(arg.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
@@ -1773,7 +1830,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         else:
             if expanding:
                 env = expand(value, env)
-            values = tuple(dict.fromkeys(r[0] for r in _readings([value], env)))
+            values = tuple(dict.fromkeys(r[0] for r in _readings([value], env, split=False)))
         for v in values:
             for piece in [v, *_pieces(v)]:  # and each word the shell may split it into (#74)
                 _note_paths(piece.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
@@ -1826,14 +1883,18 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 env = {**env, m.group(1): _merge(_values(env, m.group(1)), (m.group(4),))}
         return env
 
-    def sets(argv: list[str], env: dict) -> dict:
+    def sets(argv: list[str], env: dict, scope: dict) -> dict:
         """read, mapfile, getopts, printf -v, wait -p, unset: variables given values the command
-        does not show. A name that is not known (`read "$x"`) may be any variable's."""
+        does not show. A name that is not known (`read "$x"`) may be any variable's. Where read
+        ends a value, at the characters of IFS as it runs (scope) and at the delimiter of -d, a
+        word of what it reads ends: those of a file name are among out.breaks (#74). Where they
+        are not known, which words it gives cannot be told."""
         program, args = argv[0], _operands(argv)[1:]
         if program in ("mapfile", "readarray") and any(a.startswith("-") and "C" in a for a in args):
             raise ValueError("a callback the shell runs")
         valued = {"read": "adinNptu", "mapfile": "dnOsuc", "readarray": "dnOsuc", "printf": "v", "wait": "p"}
         naming = {"read": "a", "printf": "v", "wait": "p"}  # options whose value is a variable
+        ends = list(_ifs(scope)) if program == "read" else []
         named, operands, k = [], [], 0
         while k < len(args):
             a, k = args[k], k + 1
@@ -1846,8 +1907,14 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 if letter in valued.get(program, ""):
                     if letter in naming.get(program, ""):
                         named.append(a[j:] or (args[k] if k < len(args) else ""))
+                    if letter == "d" and program in ("read", "mapfile", "readarray"):
+                        ends.append(a[j:] or (args[k] if k < len(args) else ""))
                     k += not a[j:]
                     break
+        for chars in ends:
+            if chars is None or "$" in chars or _OPAQUE in chars:
+                raise ValueError("a read that ends words at characters that are not known")
+            out.breaks.update(ch for ch in chars if _NAME_CHAR.match(ch))
         if program == "read":
             names = named + operands or ["REPLY"]
         elif program in ("mapfile", "readarray"):
@@ -1924,7 +1991,8 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             return made[0]
         written = all(_as_written(w) for w in command)
         return _union(*[run(argv, env, scope, child, declared, bool(assigns), written)
-                        for argv in _readings(command + redirects, env, envs, split=command[0] != "[[")])
+                        for argv in _readings(command + redirects, env, envs, split=command[0] != "[[",
+                                              breaks=out.breaks)])
 
     def run(argv: list[str], start: dict, scope: dict, child, declared: dict | None, prefixed: bool,
             written: bool = False) -> dict:
@@ -1943,7 +2011,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         if name in _DECLARE:
             after = declared_as_run(builtin, after)
         elif name in _SETS:
-            after = sets(builtin, after)
+            after = sets(builtin, after, scope)
         elif name in _LEAVES:
             leave(name)
         elif name == "trap":
