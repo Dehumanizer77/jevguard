@@ -121,8 +121,8 @@ class Command:
         self.program_carried: list[set[str]] = []
         self.assigned: list[str] = []        # the names of the variables it sets, in turn
         self.piping = False                  # a program in it is given its input through a pipe
-        # the characters of a file name that read, or the splitting of a value not known, may
-        # end a word at (IFS=x, read -d x): words of its texts cut there are paths it names (_pieces)
+        # the characters that read, or the splitting of a value not known, may end a word at
+        # (IFS, read -d x, a line break): words of its texts cut there are paths it names (_pieces)
         self.breaks: set[str] = set()
         self.writes: set[str] = set()        # canonical targets of > >> &> redirections
         self.dirs: list[str] = [canonical(cwd)] if cwd else []  # the starting directory and every `cd` target
@@ -1143,8 +1143,8 @@ def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split
     in it, once as bash 5.2 reads it, the text the pattern matched, and once as older shells do
     (#75). The elements of an array, and the arguments, as _elements says (#86).
 
-    breaks: where given, the characters of a file name in IFS where a word has something in no
-    quotes the shell splits are added to it: a value not known is cut there (Command.breaks)."""
+    breaks: where given, the characters of IFS where a word has something in no quotes the shell
+    splits are added to it: a value not known is cut there (Command.breaks)."""
     envs = envs or [env] * len(words)
     declaring = bool(words) and str(words[0]) in _DECLARE
     splits = []
@@ -1155,7 +1155,7 @@ def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split
         splits.append(getattr(word, "bare", frozenset()) if apart else frozenset())
         _elements(word, envs[k], splits[-1], apart)
         if breaks is not None and (splits[-1] or apart and _RUN.search(word)):
-            breaks.update(ch for ifs in _ifs(envs[k]) for ch in ifs or "" if _NAME_CHAR.match(ch))
+            breaks.update(ch for ifs in _ifs(envs[k]) for ch in ifs or "")
     held: dict[tuple, tuple] = {}
     for word, e, bare in zip(words, envs, splits):
         for m in _EXPANSION.finditer(word):
@@ -1238,27 +1238,55 @@ def _ifs(env: dict) -> tuple:
 
 
 _NAME_CHAR = re.compile(r"[A-Za-z0-9._~/+@%-]")  # what _pieces takes for part of a file name
+# A backslash escape as printf reads it in its format (\056), and as echo -e and %b do (\0056)
+_ESCAPES = (re.compile(r"\\(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|(.))", re.S),
+            re.compile(r"\\(?:0([0-7]{0,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|(.))", re.S))
+_ESCAPED = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+            "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _printed(text: str) -> list[str]:
+    """text, and where it has a backslash, what printf and echo -e print of it: \\n is a line
+    break, \\056 and \\x2e a dot (`printf 'x\\n.claude\\n' | while read a`)."""
+    def char(m: re.Match) -> str:
+        octal, hexa, short, long, other = m.groups()
+        if other is not None:
+            return _ESCAPED.get(other, m.group())
+        try:
+            return chr(int(octal or "0", 8) if octal is not None else int(hexa or short or long, 16))
+        except (ValueError, OverflowError):
+            return m.group()
+    return list(dict.fromkeys([text, *(e.sub(char, text) for e in _ESCAPES if "\\" in text)]))
 
 
 def _pieces(text: str, breaks: set[str] | frozenset = frozenset()) -> list[str]:
     """The words text may be split into where what IFS holds is not known here: at spaces and at
-    any character that is not part of a file name. Nothing where it has none of them. Not a lone
-    / (`a / b`, `s//x/`): in a text it is division or syntax far more often than the root.
+    any character that is not part of a file name. Nothing where it has none of them. The same
+    of what printf and echo -e print of it (_printed).
 
-    breaks: characters of a file name the command may also split at (Command.breaks). There a
-    word is cut too, and what follows each one is a word as well: read gives its last variable
-    the rest of the line (`IFS=x read a b <<< notesx.claude` gives b .claude, #74)."""
-    pieces, count = [], 0
-    for run in re.split(r"[^A-Za-z0-9._~/+@%-]+", text):
-        pieces.append(run)
-        cuts = [i for i, ch in enumerate(run) if ch in breaks]
-        count += len(cuts)
-        if count > 2000:
-            raise ValueError("a text split at more places than can be read")
-        if cuts:
-            pieces += re.split("[" + "".join(re.escape(ch) for ch in breaks) + "]", run)
-            pieces += [run[i + 1:] for i in cuts]
-    pieces = [p for p in dict.fromkeys(pieces) if p and p.strip("/")]
+    breaks: characters the command may also split at (Command.breaks). There a word is cut too,
+    and what follows each one is a word as well: read gives its last variable the rest of the
+    line (`IFS=x read a b <<< notesx.claude` gives b .claude, #74).
+
+    Only slashes are a word where the start or the end of the text or one of the breaks is on
+    each side, past the spaces and tabs read takes off: that is the root a read or a split gives
+    (`IFS=x read a b <<< notesx/`, `read a b <<< 'x /'`). Not elsewhere (`read a <<< 'x / y'`,
+    `s|/|-|`): no read or split the command runs gives it there."""
+    edge = "[" + "".join(re.escape(ch) for ch in sorted(breaks)) + "]" if breaks else None
+    root = re.compile(rf"(?:\A|(?<={edge}))[ \t]*(/+)[ \t]*(?={edge}|\Z)" if edge else r"\A[ \t]*(/+)[ \t]*\Z")
+    pieces, roots, count = [], [], 0
+    for form in _printed(text):
+        for run in re.split(r"[^A-Za-z0-9._~/+@%-]+", form):
+            pieces.append(run)
+            cuts = [i for i, ch in enumerate(run) if ch in breaks]
+            count += len(cuts)
+            if count > 2000:
+                raise ValueError("a text split at more places than can be read")
+            if cuts:
+                pieces += re.split(edge, run)
+                pieces += [run[i + 1:] for i in cuts]
+        roots += [m.group(1) for m in root.finditer(form)]
+    pieces = list(dict.fromkeys([p for p in pieces if p.strip("/")] + roots))
     return [] if pieces == [text] else pieces
 
 
@@ -1577,7 +1605,7 @@ def read(cmd: str, cwd: str = "") -> Command:
     out.dynamic = bool(_DYNAMIC.search(visible) or unset)
     # read, mapfile and readarray give variables words of what they read, which may be any text
     # the command prints: each word it may be split into is a path the command names (#74). So
-    # are the words a value not known may be split into at a character of a file name in IFS.
+    # are the words a value not known may be split into at IFS (`touch $(echo '.claude x')`).
     if out.breaks or any(os.path.basename(argv[0]) in ("read", "mapfile", "readarray") for argv in out.programs):
         for argv, dirs in zip(list(out.programs), list(out.program_dirs)):
             for piece in {p for a in argv[1:] for p in _pieces(a, out.breaks)}:
@@ -1886,15 +1914,16 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
     def sets(argv: list[str], env: dict, scope: dict) -> dict:
         """read, mapfile, getopts, printf -v, wait -p, unset: variables given values the command
         does not show. A name that is not known (`read "$x"`) may be any variable's. Where read
-        ends a value, at the characters of IFS as it runs (scope) and at the delimiter of -d, a
-        word of what it reads ends: those of a file name are among out.breaks (#74). Where they
-        are not known, which words it gives cannot be told."""
+        ends a value, at the characters of IFS as it runs (scope), at a line break or the
+        delimiter of -d, a word of what it reads ends: they are among out.breaks (#74). Where
+        they are not known, which words it gives cannot be told."""
         program, args = argv[0], _operands(argv)[1:]
         if program in ("mapfile", "readarray") and any(a.startswith("-") and "C" in a for a in args):
             raise ValueError("a callback the shell runs")
         valued = {"read": "adinNptu", "mapfile": "dnOsuc", "readarray": "dnOsuc", "printf": "v", "wait": "p"}
         naming = {"read": "a", "printf": "v", "wait": "p"}  # options whose value is a variable
-        ends = list(_ifs(scope)) if program == "read" else []
+        ifs = list(_ifs(scope)) if program == "read" else []
+        ends = ["\n"] if program in ("read", "mapfile", "readarray") else []
         named, operands, k = [], [], 0
         while k < len(args):
             a, k = args[k], k + 1
@@ -1911,10 +1940,15 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                         ends.append(a[j:] or (args[k] if k < len(args) else ""))
                     k += not a[j:]
                     break
-        for chars in ends:
+        for chars in ifs + ends:
             if chars is None or "$" in chars or _OPAQUE in chars:
                 raise ValueError("a read that ends words at characters that are not known")
-            out.breaks.update(ch for ch in chars if _NAME_CHAR.match(ch))
+        # A read into one name does not split the line: it takes off the spaces, tabs and
+        # newlines of IFS at either end, and one other character of IFS at the end (`IFS=x read
+        # a <<< /x` gives /). Into more, or an array, it splits at each character of IFS.
+        words = bool(named) or len(operands) > 1 or any("$" in a or _OPAQUE in a for a in operands)
+        out.breaks.update(ch for chars in ends for ch in chars)
+        out.breaks.update(ch for chars in ifs for ch in chars if words or ch not in " \t\n")
         if program == "read":
             names = named + operands or ["REPLY"]
         elif program in ("mapfile", "readarray"):

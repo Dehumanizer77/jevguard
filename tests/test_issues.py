@@ -1269,7 +1269,8 @@ def test_the_words_a_value_may_be_split_into_are_paths_the_command_names(guard, 
     """#74: where a value is not known here, a program given it is given every path the command
     names; and a value's words were not among them where it sat in a longer text: an assignment
     with spaces in it, a here-string, what echo prints into `| while read`. Now each word such a
-    text may be split into is a path the command names, except a lone / (division, s//x/). And a
+    text may be split into is a path the command names, except a lone / that no read or split
+    the command runs ends a word beside (division, s//x/; see the test of the root below). And a
     name ends at the first character bash does not take for one: Python's \\w took é for one."""
     cmd = "p='.claude '; seen $pé"
     assert _seen_by_reader(cmd) == _seen_in_bash(tmp_path, cmd), cmd
@@ -1332,4 +1333,48 @@ def test_a_read_splits_at_the_characters_it_is_given(guard, tmp_path):
         assert "could not be read" in _reason(guard, cmd), cmd
     for cmd in ("IFS=: read a b <<< 'x:y'; touch \"$b\"", 'while IFS= read -r l; do touch "$l"; done < list.txt',
                 'IFS=. read -r major minor <<< "1.2"; touch "v$major"', 'IFS=- read -ra parts <<< "a-b"; touch "${parts[0]}"'):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_the_root_a_read_or_a_split_gives_is_a_path_the_command_names(guard, tmp_path):
+    """#74 (comment on dfcb6de): _pieces left out a word of only slashes, which in a text is
+    division or syntax far more often than the root. But where a read or a split ends a word on
+    each side of it, it is the root: `IFS=x read a b <<< notesx/` gives b /, and tar -C "$b"
+    extracts there. Now it is a path the command names where each side of it is the start or the
+    end of the text or a character the command splits at (Command.breaks), past the spaces and
+    tabs read takes off. A read into one name splits at no space: `read a <<< 'x / y'` gives none.
+    The same was missed, on main too, for the words a value not known is split into at the
+    spaces of IFS (`touch $(echo '.claude x')`), and for what printf and echo -e print of a
+    backslash escape (`printf 'x\\n.claude\\n' | while read a`)."""
+    for cmd in ('IFS=x read a b <<< notesx/; seen "$b"', 'read -d x a <<< /xrest; seen "$a"',
+                "read a b <<< 'notes /'; seen \"$b\"", "IFS=: read a b <<< 'notes:/'; seen \"$b\"",
+                'IFS=x read a <<< /x; seen "$a"', "read a <<< ' / '; seen \"$a\"",
+                "printf 'notes\\n/\\n' | while read a; do seen \"$a\"; done", "seen $(echo '/ notes')"):
+        assert "/" in set().union(*_seen_in_bash(tmp_path, cmd)), cmd
+    for cmd in ("seen $(echo '.claude x')", "printf 'x\\n.claude\\n' | while read a; do seen \"$a\"; done",
+                "echo -e 'x\\n.claude' | while read a; do seen \"$a\"; done",
+                "printf '\\056claude\\n' | while read a; do seen \"$a\"; done"):
+        assert ".claude" in set().union(*_seen_in_bash(tmp_path, cmd)), cmd
+    assert _seen_in_bash(tmp_path, "read a <<< 'x / y'; seen \"$a\"") == {("x / y",)}
+    for cmd in ('IFS=x read a b <<< notesx/; tar -xf fixture.tar -C "$b"',
+                'read -d x a <<< /xrest; tar -xf fixture.tar -C "$a"',
+                'IFS=x read a b <<< notesx/; touch "$b"', 'read -d x a <<< /xrest; touch "$a"',
+                "read a b <<< 'notes /'; touch \"$b\"", "IFS=: read a b <<< 'notes:/'; touch \"$b\"",
+                'IFS=x read a <<< /x; touch "$a"', "read a <<< ' / '; touch \"$a\"",
+                "printf 'notes\\n/\\n' | while read a; do touch \"$a\"; done", "touch $(echo '/ notes')",
+                'IFS=x read a b <<< notesx//; touch "$b"', 'mapfile -t -d x a <<< notesx/; touch "${a[1]}"',
+                "read -a a <<< 'x /'; touch \"${a[1]}\"", "read -d , a <<< '/,x'; touch \"$a\"",
+                "echo 'notes /' | while read a b; do touch \"$b\"; done", "IFS=x; touch $(echo /xnotes)",
+                "msg='a / b'; read x y z <<< \"$msg\"; touch \"$y\"", "read a <<< 'x / y'; touch $a",
+                "while read a b; do touch \"$b\"; done <<END\nnotes /\nEND"):
+        assert "names /," in _reason(guard, cmd), cmd
+    for cmd in ("touch $(echo '.claude x')", "printf 'x\\n.claude\\n' | while read a; do touch \"$a\"; done",
+                "echo -e 'x\\n.claude' | while read a; do touch \"$a\"; done",
+                "printf '\\056claude\\n' | while read a; do touch \"$a\"; done"):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("read a <<< 'x / y'; touch \"$a\"", "msg='a / b'; touch \"$out\"",
+                "find . -name '*.txt' | while read f; do sed -i 's|/|-|g' \"$f\"; done",
+                "find . -name '*.txt' | while read f; do echo \"$f / $n\"; mv \"$f\" done/; done",
+                "awk '{print $1 / $2}' data | while read r; do touch \"$r.out\"; done",
+                "printf 'a\\tb\\n' | while read x y; do touch \"$x\"; done"):
         assert _reason(guard, cmd) == "", cmd
