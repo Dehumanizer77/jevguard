@@ -346,24 +346,18 @@ def test_scripts_that_name_nothing_of_the_guard_are_not_asked_about(guard, comma
     assert ask_reason(guard, command) == "", command
 
 
-# Asked about on 2026-10-29 as "python3 is given a text that mentions /, a directory that holds the
-# guard's files": a test case in a script, `${p//a\\//}`, was read as an expansion the shell left
-# in, and what follows its last / as an argument of its own. In a text a lone / or ~ names nothing.
-@pytest.mark.parametrize("command", [
-    "python3 - <<'EOF'\ncases = ['p=a/b; touch ${p//a\\\\//}']\nEOF",
-    "python3 -c 'print(\"${x:-/}\", \"${x:-~}\", \"${x/a/~}\")'",
-    "git commit -m 'Read ${p:-/} and ${p//x/~} as bash reads them'",
-    "gh pr create --title x --body 'In `${p//x//}` the third / starts what is put in'",
-])
-def test_a_lone_slash_in_an_expansion_inside_a_script_names_no_directory(guard, command):
-    assert ask_reason(guard, command) == "", command
-
-
+# What a ${...} may give is a path also inside a script: the script may hand it to a shell, which
+# puts in ~ or / where x is not set (#85). A lone / or ~ there is asked about too.
 @pytest.mark.parametrize("command", [
     # an argument of its own: the expansion is the shell's
     "touch ${x:-/}",
     "touch \"${x:-~}\"",
     "touch ${x/a/~}",
+    # inside a script that hands it to a shell
+    "python3 -c 'import os; os.system(\"tar -xf fixture.tar -C ${x:-~}\")'",
+    "python3 -c 'import os; os.system(\"touch ${x:-~}\")'",
+    "python3 -c 'import os; os.system(\"touch ${x:-/}\")'",
+    "python3 - <<'EOF'\nimport os\nos.system('tar -xf fixture.tar -C ${x:-~}')\nEOF",
     # a path in it, inside a text
     "python3 -c 'import os; os.utime(\"${x:-~/.claude}\")'",
     "python3 -c 'import os; os.utime(\"${x/a/~/.claude/settings.json}\")'",
@@ -371,6 +365,14 @@ def test_a_lone_slash_in_an_expansion_inside_a_script_names_no_directory(guard, 
 ])
 def test_a_path_in_an_expansion_is_still_asked_about(guard, command):
     assert ask_reason(guard, command) != "", command
+
+
+def test_the_question_says_the_directory_is_above_the_guards_files(guard):
+    # It said "a directory that holds the guard's files", which read as if / had them in it.
+    reason = ask_reason(guard, "touch ${x:-/}")
+    assert "a directory above the guard's files or an agent's hooks" in reason and "holds" not in reason
+    reason = ask_reason(guard, "python3 -c 'import os; os.system(\"touch ${x:-/}\")'")
+    assert "a text that mentions /, a directory above the guard's files" in reason
 
 
 def test_the_question_says_what_the_agent_claims_the_call_is_for(guard):
