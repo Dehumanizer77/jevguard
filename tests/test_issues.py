@@ -1185,7 +1185,8 @@ def test_a_known_value_is_split_where_the_shell_splits_it(guard, tmp_path):
     no word at either end; another character of IFS ends a word, an empty one too; an empty IFS
     splits nothing; a quoted $p, case WORD, [[ ]], a here-string and an assignment to export are
     not split. Each case is checked against what bash gives a program that only writes its
-    arguments down."""
+    arguments down. Nor did a quote or a backslash end a variable's name once the quotes were taken
+    away: `p='.claude '; touch $p""x` was read as $px."""
     for cmd in ("p='.claude notes'; seen $p", "p='notes .claude'; seen $p", "IFS=:; p=notes:.claude; seen $p",
                 "p=$'.claude\\tnotes\\n'; seen $p", "IFS=': '; p='a : b'; seen $p", "IFS=:; p=':a::b:'; seen $p",
                 "IFS=' :'; p=' :a'; seen $p", "p='a  b '; seen x$p", "p='a b'; q=c; seen $q$p",
@@ -1193,12 +1194,15 @@ def test_a_known_value_is_split_where_the_shell_splits_it(guard, tmp_path):
                 "p='a b'; seen \"$p\"", "IFS=; p='a b'; seen $p", "IFS=:; p='a b'; seen $p",
                 "p='a b'; for f in $p; do seen \"$f\"; done", "p='seen a'; $p b",
                 "p='a b'; case $p in 'a b') seen yes;; esac", "p='a b'; [[ $p == 'a b' ]] && seen yes",
-                "p='a b'; seen <<< $p", "p='a b'; export q=$p; seen \"$q\""):
+                "p='a b'; seen <<< $p", "p='a b'; export q=$p; seen \"$q\"",
+                # a quote or a backslash ends the name: $p""x is $p and x, not $px
+                "p='.claude '; seen $p\"\"x", "p=.clau; seen \"$p\"de $p''de \"$p\"\"de\" $p\\de \"${p}\"de",
+                "p='a b'; seen \"\"$p\"\" ''$p''"):
         assert _seen_by_reader(cmd) == _seen_in_bash(tmp_path, cmd), cmd
     for cmd in ("p='.claude notes'; touch $p", "p='notes .claude'; touch $p", "IFS=:; p=notes:.claude; touch $p",
                 "p='a .claude'; touch x$p", "p='.claude notes'; for f in $p; do touch \"$f\"; done",
                 "p='.claude notes'; a=($p); touch \"${a[@]}\"", "p='touch .claude'; $p",
-                "p='.claude notes'; echo $p | xargs touch"):
+                "p='.claude notes'; echo $p | xargs touch", "p='.claude '; touch $p\"\"x", 'p=.clau; touch "$p"de'):
         assert ".claude" in _reason(guard, cmd), cmd
     for cmd in ("p='.claude notes'; touch \"$p\"", "IFS=; p='.claude notes'; touch $p",
                 "IFS=:; p='.claude notes'; touch $p", "p='.claude notes'; echo $p"):
@@ -1217,30 +1221,63 @@ def test_a_value_split_at_characters_that_are_not_known_cannot_be_read(guard):
 
 
 def test_a_parameter_operator_gives_what_bash_gives_or_cannot_be_read(guard, tmp_path):
-    """#75: ${p/x/&} was read with Python's re.sub, and its & as a &: bash 5.2 puts the text the
-    pattern matched in its place (patsub_replacement, on by default), so `p=.claude; rm -rf
-    "${p/.claude/&}"` removes .claude. The same kind of difference was in the patterns, read with
-    fnmatch: [^x], [[:upper:]], an extended glob; in case changes and offsets past ASCII; and in a
-    $q in the pattern. Now a & is read both ways; patterns, case changes and offsets are read as
-    bash reads them, and where the result of a known value cannot be told the command cannot be
-    read. Each case is checked against bash."""
-    for cmd in ('p=.claude; seen "${p/.claude/&}"', 'p=aXbXc; seen "${p//X/&&}" "${p/X*/[&]}"',
+    """#75, #81, #82, #83: the reader worked out ${p<op>x} with Python's semantics, which differ from
+    bash's: a & in the replacement (bash 5.2 puts the matched text there), a & or a / that a
+    variable puts in the word, a global replacement of *, an offset of 010 (eight to bash), an
+    offset further back than the start, [^x] and classes, extended globs, case changes past
+    ASCII. Each gave a known value bash does not give, with the real target named nowhere else.
+    Now it works out only plain forms, each checked here against bash: a prefix or suffix of *,
+    ? and other characters taken off, a replacement of text without them (a & read both ways,
+    the pattern ending where the word as written has its /), a case change of all or the first
+    character, decimal offsets. Anything else of a known value cannot be read, nor can ${!p},
+    ${p@L} and the like of one; the subscript of ${a[@]} gives each value the variable holds."""
+    for cmd in ('p=.claude; seen "${p/.claude/&}"', 'p=abc; seen "${p//b/&&}" "${p/#a/[&]}" "${p/%c/<&>}"',
                 'p=.claude; r="&"; seen "${p/.claude/$r}"', 'p=abc; seen "${p/#/X}" "${p/%/X}" "${p/}" "${p//}" "${p/b}"',
-                'p=abcb; seen "${p/b*/X}" "${p//b/X}" "${p/%b*/X}" "${p/#a?/X}"',
-                'p=a-b]c; seen "${p//[]]/X}" "${p//[a-]/Y}" "${p//[!a-c]/Z}"', 'p="a[b"; seen "${p//[/X}"',
-                'p=x.claude; seen "${p#[x]}" "${p#[^y]}" "${p#*[.]}" "${p##*[!a-z]}" "${p%[a-z]*}" "${p%%[a-z]*}"',
-                'p=X.claude; seen "${p#[[:upper:]]}"', 'p=a.b; seen "${p//[[:punct:]]/X}" "${p//[[:alpha:]]/Y}"',
-                'p=x.claude; q=x; seen ${p#$q}', 'p=abcdef; seen "${p:2}" "${p: -2}" "${p:1:-1}" "${p:(-3):2}" "${p:9}"',
-                'p=abcdef; seen "${p^}" "${p^^}" "${p^^[a-c]}" "${p^[b]}"', 'p=ABC; seen "${p,}" "${p,,}" "${p,,[!A]}"'):
+                'p=; seen "${p//x/Y}" "${p/#/Y}" "${p/%/Y}"',
+                'p=abcabc; seen "${p//ab/X}" "${p/ab/X}" "${p/#ab/X}" "${p/%bc/X}" "${p/#bc/X}" "${p/%ab/X}"',
+                'p=aaa; seen "${p//aa/X}" "${p/%aa/X}"', 'p=.clx/aude; q=x/; seen ${p/$q/} "${p//$q/}" "${p/#.cl$q/.cl}"',
+                'shopt -u patsub_replacement; p=x; r="&claude"; q=${p/x/$r}; seen ".${q/&/}"',
+                'p=x.claude; seen "${p#?}" "${p#*.}" "${p##*.}" "${p%.*}" "${p%%.*}" "${p%?}"', 'p=x.claude; q=x; seen ${p#$q}',
+                'p=abcdef; seen "${p:2}" "${p: -2}" "${p:1:-1}" "${p:(-3):2}" "${p:9}" "${p: -9}" "${p:0:0}" "${p: -0}"',
+                'p=abcdef; seen "${p^}" "${p^^}"', 'p=ABC; seen "${p,}" "${p,,}"',
+                'h=/srv/x; seen "${h[0]}" "${h:-$x}"'):
         assert _seen_in_bash(tmp_path, cmd) <= _seen_by_reader(cmd), cmd
+    # an array's values are read one at a time: each word bash gives is among them
+    cmd = 'a=(.claude notes); seen "${a[1]}" "${a[@]%s}"'
+    assert set().union(*_seen_in_bash(tmp_path, cmd)) <= set().union(*_seen_by_reader(cmd)), cmd
     for cmd in ('p=.claude; touch "${p/.claude/&}"', "p=.claude; touch ${p//.claude/&}",
-                "p=x.claude; touch ${p#[x]}", "p=x.claude; touch ${p#[^y]}", "p=X.claude; touch ${p#[[:upper:]]}",
-                "p=x.claude; q=x; touch ${p#$q}", "p=x.claude; touch ${p:1}", "p=.cLAUDE; touch ${p,,[A-Z]}"):
-        assert ".claude" in _reason(guard, cmd), cmd
-    for cmd in ("shopt -s extglob; p=a.claude; touch ${p#@(a|b)}", "p=x.claude; touch ${p#$unknown}",
-                "p=.CLAUDE/SETTİNGS.JSON; touch ${p,,}", "p=$'\\u00e9.claude'; touch ${p:1}",
-                "p=a/.claude; touch ${p//a\\//}", 'p=.claude; touch "${p/.claude/\'&\'}"'):
+                "shopt -u patsub_replacement\np=x\nr='&claude'\nq=${p/x/$r}\ntouch .${q/&/}",
+                "p=.clx/aude; q=x/; touch ${p/$q/}", "p=x.claude; q=x; touch ${p#$q}", "p=x.claude; touch ${p:1}",
+                "p=.cLAUDE; touch ${p,,}", "touch ${HOME:-$x}", "touch ${HOME:-${x}}", 'touch "${HOME[@]}"'):
+        assert "`touch` is given" in _reason(guard, cmd), cmd
+    for cmd in ("p=x; touch .${p//*/claude}", "p=x; touch .${p//*/claude}/settings.json",
+                "p=abcdefgh.claude; touch ${p:010}", "p=.copilotXX; touch ${p:0:010}", "p=x.claude; touch ${p:0x1}",
+                "p=x.claude; touch ${p#[x]}", "p=x.claude; touch ${p#[^y]}", "p=.cLAUDE; touch ${p,,[A-Z]}",
+                "shopt -s extglob; p=a.claude; touch ${p#@(a|b)}", "p=x.claude; touch ${p#$unknown}",
+                "p=.CLAUDE/SETT\u0130NGS.JSON; touch ${p,,}", "p=$'\\u00e9.claude'; touch ${p:1}",
+                "p=a/.claude; touch ${p//a\\//}", 'p=.claude; touch "${p/.claude/\'&\'}"', "p=abc; touch ${p:2:-2}",
+                "p=HOME; touch ${!p}", "touch ${HOME@L}", "p=.claude; touch ${p@Q}", "touch ${HOME:-${x:-${y}}}",
+                'a=(x.claude); touch "${a[@]:1}"'):
         assert "could not be read" in _reason(guard, cmd), cmd
     for cmd in ('p=x; touch "${p/x/&y}"', "p=build; touch ${p/build/dist}", "f=report.txt; touch ${f%.txt}.md",
-                "touch ${PWD#$HOME/}.log", 'b=$(git branch --show-current); touch "${b//\\//-}.log"'):
+                "touch ${PWD#$HOME/}.log", 'touch "${PWD##*/}.log"', 'b=$(git branch --show-current); touch "${b//\\//-}.log"',
+                'files=(a b); for f in "${files[@]}"; do touch "$f.log"; done', "touch ${#HOME}"):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_the_words_a_value_may_be_split_into_are_paths_the_command_names(guard, tmp_path):
+    """#74: where a value is not known here, a program given it is given every path the command
+    names; and a value's words were not among them where it sat in a longer text: an assignment
+    with spaces in it, a here-string, what echo prints into `| while read`. Now each word such a
+    text may be split into is a path the command names, except a lone / (division, s//x/). And a
+    name ends at the first character bash does not take for one: Python's \\w took é for one."""
+    cmd = "p='.claude '; seen $pé"
+    assert _seen_by_reader(cmd) == _seen_in_bash(tmp_path, cmd), cmd
+    for cmd in ("p='.claude '; touch $pé", "read a b <<< '.claude x'; touch $a",
+                "IFS=: read a b <<< '.claude:x'; touch $a", "echo '.claude x' | while read a b; do touch \"$a\"; done",
+                "printf '%s\\n' 'x .claude' | while read a b; do touch \"$b\"; done",
+                "p='.claude x'; read a b <<< \"$p\"; touch $a"):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("msg='a / b'; touch \"$out\"", "read a <<< 'x / y'; touch \"$a\"",
+                "git commit -m 'fix s//x/ in the parser'; touch \"$out\"", "p='notes x'; touch \"$p\""):
         assert _reason(guard, cmd) == "", cmd

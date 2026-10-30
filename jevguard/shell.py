@@ -30,10 +30,10 @@ _TAKES_COMMAND = _SHELLS | {"su", "script"}
 # Programs that take their program from stdin when they are given none: through a pipe, that is
 # what the command before them prints.
 _INTERPRETER = re.compile(r"(?:python|pypy|perl|ruby|node|nodejs|php|lua|tclsh|Rscript)[\d.]*")
-_ASSIGN = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S)
-_VAR = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+_ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.S)
+_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 # \0 is a $ quoted against expansion (_LITERAL): text, which a shell may expand later (_wider)
-_LITERAL_VAR = re.compile(r"\0(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+_LITERAL_VAR = re.compile(r"\0(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 _SINGLE_QUOTED = re.compile(r"'[^']*'")
 # Which files these read is decided when they run: substitution, xargs, find, eval, sourced files.
 _DYNAMIC = re.compile(r"\$\(|`|<\(|(?:^|[\s;|&(])(?:xargs|eval|source|find)\s|(?:^|[;|&(])\s*\.\s+\S")
@@ -338,7 +338,7 @@ def _heredoc(cmd: str, i: int, strip: bool, marker: str, quoted: bool) -> tuple[
     raise ValueError("a here-document that no line ends")
 
 
-_PARAMETER = re.compile(r"\$(?:[A-Za-z_]\w*|[0-9@*#?$!-])")
+_PARAMETER = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
 
 
 def _expanded(text: str) -> str:
@@ -664,12 +664,12 @@ _SHELL_OPS = sorted({"&&", "||", ";;&", ";;", ";&", "|&", ";", "&", "|", "(", ")
                      "<>", "<&", ">&", ">>", ">|", "&>>", "&>", "<", ">"}, key=len, reverse=True)
 # Those that join or end commands. The others are redirections, and part of the command they are in.
 _LIST_OPS = {"&&", "||", ";;&", ";;", ";&", "|&", ";", "&", "|", "(", ")"}
-_FD = re.compile(r"\d+|\{[A-Za-z_]\w*\}")              # 2>, {fd}>: the descriptor a redirection is for
+_FD = re.compile(r"\d+|\{[A-Za-z_][A-Za-z0-9_]*\}")              # 2>, {fd}>: the descriptor a redirection is for
 _REDIRECTION = re.compile(r"[<>&]*[<>][<>&|]*")
-_ARRAY = re.compile(r"[A-Za-z_]\w*\+?=")                 # NAME=( ... ), NAME+=( ... )
+_ARRAY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")                 # NAME=( ... ), NAME+=( ... )
 # An assignment as written: its name, any [index] and the = outside quotes. `'p=x'` and `p\=x` are programs.
-_ASSIGN_WORD = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
-_ASSIGN_PARTS = re.compile(r"([A-Za-z_]\w*)(\[[^\]]*\])?(\+?)=(.*)", re.S)
+_ASSIGN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+_ASSIGN_PARTS = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+?)=(.*)", re.S)
 
 
 class _Token(str):
@@ -716,15 +716,26 @@ def _unquote(raw: str, bare: list[int] | None = None) -> str:
                     out.append(_LITERAL if nxt == "$" else "" if nxt == "\n" else nxt)
                     i += 2
                 else:
-                    out.append(raw[i])
-                    i += 1
+                    i = _unquoted_char(raw, i, out)
             i += 1
         else:
             if ch == "$" and bare is not None:
                 bare.append(sum(map(len, out)))
-            out.append(ch)
-            i += 1
+            i = _unquoted_char(raw, i, out)
     return "".join(out)
+
+
+def _unquoted_char(raw: str, i: int, out: list[str]) -> int:
+    """The character at i, put on out, and where the next one is. A $NAME that a quote or a
+    backslash ends, and that a character of a name follows once they are gone, is put as ${NAME}:
+    else `"$p"de` and `$p''de` would be $pde, a variable of another name (#74)."""
+    name = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)['\"\\]+[A-Za-z0-9_]", raw[i:])
+    if name:
+        name = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)", raw[i:])
+        out.append("${" + name.group(1) + "}")
+        return i + name.end()
+    out.append(raw[i])
+    return i + 1
 
 
 def _bare_token(raw: str, **how) -> _Token:
@@ -910,9 +921,11 @@ def _cleared(env: dict) -> dict:
     return {name: (None,) for name in {*env, *os.environ}}
 
 
-# $NAME, ${NAME}, and ${NAME} with an operator after the name: ${p:-x}, ${p%/*}, ${p//a/b}, ${p:1:2}
-_EXPANSION = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|\{([A-Za-z_]\w*)"
-                        r"(:?[-=+?]|##?|%%?|/[/#%]?|\^\^?|,,?|:)([^{}]*)\})")
+# $NAME, ${NAME}, and ${NAME} with an operator after the name: ${p:-x}, ${p%/*}, ${p//a/b}, ${p:1:2},
+# and a ${...} in the word after it: ${p:=${q:-x}}. A subscript, ${a[@]}, stands for each value.
+_EXPANSION = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]{}]*\])?\}|([A-Za-z_][A-Za-z0-9_]*)"
+                        r"|\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]{}]*\])?"
+                        r"(:?[-=+?]|##?|%%?|/[/#%]?|\^\^?|,,?|:)((?:[^{}]|\$\{[^{}]*\})*)\})")
 
 
 _LEFT = re.compile(r"\$(?=\{|[0-9@*#?$!-])")
@@ -921,8 +934,8 @@ _LEFT = re.compile(r"\$(?=\{|[0-9@*#?$!-])")
 _UNSET = object()
 
 
-_ARITHMETIC_SETS = re.compile(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?(?:<<|>>|[-+*/%&^|])?=(?!=)"
-                              r"|(?:\+\+|--)\s*([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?(?:\+\+|--)")
+_ARITHMETIC_SETS = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?(?:<<|>>|[-+*/%&^|])?=(?!=)"
+                              r"|(?:\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?(?:\+\+|--)")
 _NUMBER = re.compile(r"\s*[-+]?\d*\s*")
 
 
@@ -937,7 +950,7 @@ def _arithmetic(text: str, env: dict) -> dict:
     for reading, in _readings([text], env):
         if re.search(r"[$`\x00]", reading):
             return _unknown(env)
-        names = set(re.findall(r"[A-Za-z_]\w*", re.sub(r"\b\d[\w#@]*", "", reading)))
+        names = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", re.sub(r"\b\d[\w#@]*", "", reading)))
         if any(v is None or not _NUMBER.fullmatch(v) for name in names for v in _values(env, name)):
             return _unknown(env)
         assigned |= {a or b or c for a, b, c in _ARITHMETIC_SETS.findall(reading)}
@@ -960,7 +973,7 @@ def _assigned(word: str, env: dict, runs: list[str]) -> dict:
         while end < len(word) and (depth or word[end] != "}"):
             depth += 1 if word.startswith("${", end) else -1 if word[end] == "}" else 0
             end += 1
-        m = re.fullmatch(r"(!?)([A-Za-z_]\w*)(?:\[([^\]]*)\])?(.*)", word[i + 2:end], re.S)
+        m = re.fullmatch(r"(!?)([A-Za-z_][A-Za-z0-9_]*)(?:\[([^\]]*)\])?(.*)", word[i + 2:end], re.S)
         if m:
             bang, name, index, rest = m.groups()
             if index and index not in ("@", "*"):
@@ -995,133 +1008,88 @@ def _builtin(argv: list[str]) -> list[str]:
     return argv
 
 
-def _param(value: str | None, op: str, arg: str, ampersand: bool = True) -> str | None:
-    """What ${NAME<op><arg>} gives for a NAME that holds value (None: not set). None where that
-    cannot be told and may be what NAME or arg holds: the word then stays as it is written, and
-    counts as fed from elsewhere. Where it is a part or a change of a known value, which the
-    command names nowhere else, only bash's own result will do: past what this reads as bash does
-    (_pattern; ASCII text, as bash's offsets and case changes depend on the locale past it), the
-    command cannot be read (#75). ampersand: a & in the replacement of ${p/x/y} is the text that
-    matched, as bash 5.2 has it with patsub_replacement on, its default; else a &."""
+def _param(value: str | None, op: str, arg, ampersand: bool = True) -> str | None:
+    """What ${NAME<op><arg>} gives for a NAME that holds value (None: not set); for ${p/x/y} arg is
+    (x, y), each with the variables in it put in. None where the result is what NAME or arg holds
+    and that is not known: the word then stays as it is written, and counts as fed from
+    elsewhere. Where the result is a part or a change of a known value, which the command names
+    nowhere else, only bash's own result will do (#75, #81-#83). This works it out for the forms
+    whose result is plain, as checked against bash: a prefix or suffix taken off by a pattern of
+    *, ? and other characters; a replacement of text without any of those; a case change of all
+    or the first character; an offset and a length in decimals. For any other the command cannot
+    be read. All only on ASCII text, past which bash's offsets and case changes depend on the
+    locale. ampersand: a & in the replacement is the text that matched, as bash 5.2 has it with
+    patsub_replacement on, its default; else a &."""
     unset = value is None
     null = unset or value == ""
-    if op in ("-", "=", ":-", ":=", "+", ":+", "?", ":?") and \
-            re.search(r"[$`\\'\"" + _LITERAL + _MARK + _OPAQUE + "]", arg):
-        return None
-    if op in ("-", "="):
-        return arg if unset else value
-    if op in (":-", ":="):
-        return arg if null else value
-    if op in ("+", ":+"):
-        return "" if (unset if op == "+" else null) else arg
+    if op in ("-", "=", ":-", ":=", "+", ":+"):
+        given = unset if op in ("-", "=", "+") else null
+        if op[-1] in "-=" and not given:
+            return value
+        if op[-1] == "+" and given:
+            return ""
+        return None if re.search(_UNREAD, arg) else arg
     if unset or op in ("?", ":?") or _OPAQUE in value:
-        return None if _OPAQUE in (value or "") else value
-    if re.search(r"[$`\\'\"" + _LITERAL + _MARK + _OPAQUE + "]", arg) or not (value.isascii() and arg.isascii()):
+        return None if unset or _OPAQUE in value else value
+    words = arg if isinstance(arg, tuple) else (arg,)
+    if not value.isascii() or any(re.search(_UNREAD, w) or not w.isascii() for w in words):
         raise ValueError("a ${...} whose result cannot be told")
-    if op in ("#", "##"):  # the shortest or longest start that matches, taken off
+    if op in ("#", "##", "%", "%%"):  # the shortest or longest start or end that matches, taken off
         rx = _pattern(arg)
-        for k in range(len(value) + 1) if op == "#" else range(len(value), -1, -1):
-            if re.fullmatch(rx, value[:k], re.S):
-                return value[k:]
-        return value
-    if op in ("%", "%%"):  # the shortest or longest end
-        rx = _pattern(arg)
-        for k in range(len(value), -1, -1) if op == "%" else range(len(value) + 1):
-            if re.fullmatch(rx, value[k:], re.S):
-                return value[:k]
-        return value
-    if op[0] == "/":  # the longest match where one begins first: at the start (/#), the end (/%), each (//)
-        pattern, _, put = arg.partition("/")
+        if op[0] == "#":
+            ks = range(len(value) + 1) if op == "#" else range(len(value), -1, -1)
+            return next((value[k:] for k in ks if re.fullmatch(rx, value[:k], re.S)), value)
+        ks = range(len(value), -1, -1) if op == "%" else range(len(value) + 1)
+        return next((value[:k] for k in ks if re.fullmatch(rx, value[k:], re.S)), value)
+    if op[0] == "/":  # text without *, ? or [: where it first stands, at the start, at the end, or each
+        pattern, put = arg
+        if re.search(r"[*?\[]", pattern):
+            raise ValueError("a ${.../.../...} pattern whose matches this does not work out")
+        put = put.replace("&", pattern) if ampersand else put
+        if op == "/#":
+            return put + value[len(pattern):] if value.startswith(pattern) else value
+        if op == "/%":
+            return value[:len(value) - len(pattern)] + put if value.endswith(pattern) else value
         if not pattern:
-            return put + value if op == "/#" else value + put if op == "/%" else value
-        rx, out, i = _pattern(pattern), [], 0
-        while i <= len(value):
-            ends = [] if op == "/#" and i else [len(value)] if op == "/%" else range(len(value), i - 1, -1)
-            end = next((k for k in ends if re.fullmatch(rx, value[i:k], re.S)), None)
-            if end is None:
-                out.append(value[i:i + 1])
-                i += 1
-                continue
-            out.append(put.replace("&", value[i:end]) if ampersand else put)
-            if op != "//":
-                return "".join(out) + value[end:]
-            if end == i:
-                out.append(value[i:i + 1])
-            i = max(end, i + 1)
-        return "".join(out)
-    if op in ("^", "^^", ",", ",,"):  # each character the pattern matches, or the first one
-        rx = _pattern(arg or "?")
+            return value
+        return value.replace(pattern, put, -1 if op == "//" else 1)
+    if op in ("^", "^^", ",", ",,"):
+        if arg:
+            raise ValueError("a ${...} case change of the characters a pattern matches")
         case = str.upper if op[0] == "^" else str.lower
-        span = len(value) if len(op) == 2 else 1
-        return "".join(case(c) if k < span and re.fullmatch(rx, c, re.S) else c for k, c in enumerate(value))
-    if op == ":":  # ${p:offset} and ${p:offset:length}
-        m = re.fullmatch(r"\s*\(?\s*(-?\d+)\s*\)?\s*(?::\s*\(?\s*(-?\d+)\s*\)?\s*)?", arg)
+        return case(value) if len(op) == 2 else case(value[:1]) + value[1:]
+    if op == ":":  # ${p:offset} and ${p:offset:length}, as decimals: 010 is eight to bash (#83)
+        number = r"\s*(?:\(\s*)?(-?(?:0|[1-9]\d*))\s*(?:\)\s*)?"
+        m = re.fullmatch(number + r"(?::" + number + r")?", arg)
         if not m:
-            raise ValueError("a ${...} whose result cannot be told")
+            raise ValueError("a ${...} offset that is not a decimal")
         start = int(m.group(1))
-        start = max(len(value) + start, 0) if start < 0 else start
+        if start < 0:
+            start += len(value)
+            if start < 0:  # further back than the start: nothing
+                return ""
         if m.group(2) is None:
             return value[start:]
         length = int(m.group(2))
-        return value[start:start + length] if length >= 0 else value[start:len(value) + length]
+        end = start + length if length >= 0 else len(value) + length
+        if end < start:  # bash: substring expression < 0, and nothing after it runs
+            raise ValueError("a ${...} length bash refuses")
+        return value[start:end]
     raise ValueError("a ${...} whose result cannot be told")
 
 
-# The ranges of the POSIX classes in a bracket of a pattern, for ASCII text.
-_CLASSES = {"alpha": "a-zA-Z", "digit": "0-9", "alnum": "a-zA-Z0-9", "upper": "A-Z", "lower": "a-z",
-            "xdigit": "0-9A-Fa-f", "space": " \\t\\n\\r\\f\\v", "blank": " \\t", "cntrl": "\\x00-\\x1f\\x7f",
-            "print": " -~", "graph": "!-~", "punct": "!-/:-@\\[-`{-~", "word": "a-zA-Z0-9_"}
+# What the word of a ${p<op>word} holds that this cannot read: a $ not put in, a quote, a
+# backslash, a command's output.
+_UNREAD = r"[$`\\'\"" + _LITERAL + _MARK + _OPAQUE + "]"
 
 
 def _pattern(pattern: str) -> str:
-    """bash's pattern as a regular expression, for ASCII text: * and ?, and a [...] with ! or ^
-    before it, ranges, POSIX classes, and a ] first that is one of its characters; a [ that no ]
-    closes is a [. An extended glob (@(...) and the like, which shopt extglob turns on), [=c=] and
-    [.c.] the command cannot be read with."""
-    if re.search(r"[?*+@!]\(", pattern):
-        raise ValueError("a pattern that may be an extended glob")
-    out, i = [], 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            out.append(".*")
-        elif c == "?":
-            out.append(".")
-        elif c == "[" and (bracket := _bracket(pattern, i + 1)):
-            out.append(bracket[0])
-            i = bracket[1]
-            continue
-        else:
-            out.append(re.escape(c))
-        i += 1
-    return "".join(out)
-
-
-def _bracket(pattern: str, j: int) -> tuple[str, int] | None:
-    """The [...] whose [ is just before j, as a regular expression, and where it ends; None if no
-    ] ends it."""
-    negate = pattern[j:j + 1] in ("!", "^")
-    j += negate
-    items, first = [], True
-    while j < len(pattern) and (pattern[j] != "]" or first):
-        first = False
-        if pattern.startswith(("[=", "[."), j):
-            raise ValueError("a pattern with an equivalence class or a collating symbol")
-        if pattern.startswith("[:", j):
-            end = pattern.find(":]", j + 2)
-            if end < 0 or pattern[j + 2:end] not in _CLASSES:
-                raise ValueError("a pattern with a class this does not know")
-            items.append(_CLASSES[pattern[j + 2:end]])
-            j = end + 2
-        elif pattern[j + 1:j + 2] == "-" and pattern[j + 2:j + 3] not in ("", "]"):
-            items.append(re.escape(pattern[j]) + "-" + re.escape(pattern[j + 2]))
-            j += 3
-        else:
-            items.append(re.escape(pattern[j]))
-            j += 1
-    if j >= len(pattern):
-        return None
-    return ("[^" if negate else "[") + "".join(items) + "]", j + 1
+    """bash's pattern of *, ? and other characters as a regular expression. A [...] and an
+    extended glob (@(...) and the like, which shopt extglob turns on) the command cannot be read
+    with."""
+    if re.search(r"\[|[?*+@!]\(", pattern):
+        raise ValueError("a pattern with a [...] or what may be an extended glob")
+    return "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
 
 
 def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split: bool = True) -> list[list[str]]:
@@ -1158,13 +1126,16 @@ def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split
             held.setdefault(key, _values(e, name))
             if m.group(4) and None in held[key] and _UNSET not in held[key]:
                 held[key] += (_UNSET,)  # ${p:-x} on what may not be known: read as unknown, and as not set
-            for inner in _SIMPLE.finditer(m.group(5) or ""):  # ${p#$q}: q is expanded first
-                held.setdefault((id(e), inner.group(1) or inner.group(2)), _values(e, inner.group(1) or inner.group(2)))
+            for inner in _EXPANSION.finditer(m.group(5) or ""):  # ${p#$q}, ${p:=${q:-x}}: q is expanded first
+                name = inner.group(1) or inner.group(2) or inner.group(3)
+                held.setdefault((id(e), name), _values(e, name))
+                if inner.group(4) and None in held[(id(e), name)] and _UNSET not in held[(id(e), name)]:
+                    held[(id(e), name)] += (_UNSET,)
             if m.start() in bare:
                 held.setdefault((id(e), _IFS), _ifs(e))
     keys = list(held)
     known = [tuple(v for v in held[k] if v is not None) or (None,) for k in keys]
-    patsub = (True, False) if any(m.group(4) and m.group(4)[0] == "/" and "&" in m.group(5)
+    patsub = (True, False) if any(m.group(4) and m.group(4)[0] == "/" and re.search(r"[&$]", m.group(5))
                                   for word in words for m in _EXPANSION.finditer(word)) else (True,)
     if math.prod(len(c) for c in known) * len(patsub) > _READINGS:
         raise ValueError("variables that may hold more values than can be read")
@@ -1177,9 +1148,8 @@ def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split
         value = dict(zip(keys, combination))
         reading = []
         for word, e, bare in zip(words, envs, splits):
-            def inner(m: re.Match, e=e) -> str:
-                v = value[(id(e), m.group(1) or m.group(2))]
-                return "$" + _OPAQUE + m.group(0)[1:] if v is None or v is _UNSET else v
+            def inner(text: str, e=e) -> str:  # the word of a ${p<op>word}, with what is in it put in, unsplit
+                return _EXPANSION.sub(lambda m: put(m, e, frozenset()), text)
 
             def put(m: re.Match, e=e, bare=bare) -> str:
                 v = value[(id(e), m.group(1) or m.group(2) or m.group(3))]
@@ -1187,13 +1157,26 @@ def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split
                     if v is not None and v is not _UNSET and _OPAQUE not in v and getattr(word, "muddled", False) and \
                             m.group(4).lstrip(":") not in ("-", "=", "+", "?"):
                         raise ValueError("a ${...} whose pattern is quoted in a way this cannot see")
-                    arg = _SIMPLE.sub(inner, m.group(5))
+                    if m.group(4)[0] == "/":  # where the pattern ends is in the word as written (#81)
+                        cut = re.match(r"(?:[^/$]|\$\{[^{}]*\}|\$(?!\{))*", m.group(5)).end()
+                        arg = (inner(m.group(5)[:cut]), inner(m.group(5)[cut + 1:]))
+                    else:
+                        arg = inner(m.group(5))
+                    if m.group(4) == ":" and "[" in m.group(0).partition(":")[0] and v is not None and v is not _UNSET:
+                        raise ValueError("a slice of an array")  # ${a[@]:1} takes elements, not characters
                     v = None if v is None else _param(None if v is _UNSET else v, m.group(4), arg, ampersand)
                 if v is None or v is _UNSET:
                     return "$" + _OPAQUE + m.group(0)[1:]
                 return _FIELD + v + _FIELD_END if m.start() in bare else v
             # after _EXPANSION: `$` and what follows the mark is no name. What is left that the
             # shell expands here (${!p}, ${p@Q}, $1) is not known either.
+            spans = [m.span() for m in _EXPANSION.finditer(word)]
+            for left in re.finditer(r"\$\{!?([A-Za-z_][A-Za-z0-9_]*)", word):
+                if any(a <= left.start() < b for a, b in spans):
+                    continue  # one this reads, or a ${...} in its word
+                if any(v is not None and _OPAQUE not in v for v in _values(e, left.group(1))):
+                    # ${!p}, ${p@L}, ${p:-${q}} of a known value: what it gives is named nowhere else
+                    raise ValueError("a ${...} of a known value that this does not work out")
             text = _LEFT.sub("$" + _OPAQUE, _RUN.sub(_OPAQUE, _EXPANSION.sub(put, word)))
             if _FIELD in text:
                 reading.extend(_fields(text, value[(id(e), _IFS)], not getattr(word, "plain", True)))
@@ -1202,8 +1185,6 @@ def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split
         readings.append(reading)
     return readings
 
-
-_SIMPLE = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")  # $NAME and ${NAME}, in the word of a ${p<op>word}
 
 # Around a value put in where its $ was in no quotes, until the word is split (_fields).
 _FIELD, _FIELD_END = "\x03", "\x04"
@@ -1216,6 +1197,14 @@ def _ifs(env: dict) -> tuple:
     if "IFS" not in env and "IFS" not in os.environ:
         return (" \t\n",)
     return tuple(dict.fromkeys(None if v is None or _OPAQUE in v else v for v in _values(env, "IFS")))
+
+
+def _pieces(text: str) -> list[str]:
+    """The words text may be split into where what IFS holds is not known here: at spaces and at
+    any character that is not part of a file name. Nothing where it has none of them. Not a lone
+    / (`a / b`, `s//x/`): in a text it is division or syntax far more often than the root."""
+    pieces = [p for p in re.split(r"[^A-Za-z0-9._~/+@%-]+", text) if p and p.strip("/")]
+    return [] if pieces == [text] else pieces
 
 
 def _fields(text: str, ifs: str | None, quoted: bool) -> list[str]:
@@ -1531,6 +1520,12 @@ def read(cmd: str, cwd: str = "") -> Command:
     used = {a or b for a, b in _VAR.findall(visible)}
     unset = used - set(env) - set(os.environ) | used & {"_"}  # $_: never known (_values)
     out.dynamic = bool(_DYNAMIC.search(visible) or unset)
+    # read, mapfile and readarray give variables words of what they read, which may be any text
+    # the command prints: each word it may be split into is a path the command names (#74)
+    if any(os.path.basename(argv[0]) in ("read", "mapfile", "readarray") for argv in out.programs):
+        for argv, dirs in zip(list(out.programs), list(out.program_dirs)):
+            for piece in {p for a in argv[1:] for p in _pieces(a)}:
+                _note_paths(piece, dirs, out.paths, out.globs)
     # The home that a script a shell or ssh runs names does not make that shell a change only if
     # the script cannot hand it to anything this does not read (_closed). A script made only of
     # programs that read cannot; what it prints can, through a file the command writes or a pipe
@@ -1671,7 +1666,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             for argv in readings:
                 for arg in argv[1:2] if argv[0] == "case" else argv[3:]:  # case WORD in, for NAME in WORDS
                     _note_paths(arg.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
-            if words[0] != "case" and len(words) > 1 and re.fullmatch(r"[A-Za-z_]\w*", words[1]):
+            if words[0] != "case" and len(words) > 1 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", words[1]):
                 # NAME holds each word in turn; without `in`, each argument the shell was given
                 each = [a for argv in readings for a in argv[3:]] if words[2:3] == ["in"] else [None]
                 env = {**env, words[1]: tuple(dict.fromkeys(each)) or (None,)}
@@ -1780,7 +1775,8 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 env = expand(value, env)
             values = tuple(dict.fromkeys(r[0] for r in _readings([value], env)))
         for v in values:
-            _note_paths(v.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
+            for piece in [v, *_pieces(v)]:  # and each word the shell may split it into (#74)
+                _note_paths(piece.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
         if plus and not index and word.array is None:  # p+=x: x after each value p may hold, and after ${p}
             values = tuple(dict.fromkeys((old if old is not None else "$" + _OPAQUE + "{" + name + "}") + v
                                          for old in _values(env, name) for v in values))
@@ -1811,7 +1807,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             elif word.array is not None or _ASSIGN_PARTS.fullmatch(word):
                 name, values, env = assign(word, env, False)
                 declared[name] = values
-            elif builtin in ("local", "declare", "typeset") and re.fullmatch(r"[A-Za-z_]\w*", word):
+            elif builtin in ("local", "declare", "typeset") and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
                 declared[word] = _merge(_values(env, word), (None,))  # in a function: a variable of its own
         return {**{name: values for name, values in env.items() if before.get(name) is not values}, **declared}
 
@@ -1866,7 +1862,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         for name in names:
             if "$" in name:
                 return _unknown(env)
-            m = re.match(r"[A-Za-z_]\w*", name)
+            m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", name)
             if m:
                 env[m.group(0)] = (None,) if program == "unset" else _merge(_values(env, m.group(0)), (None,))
         return env
@@ -2065,6 +2061,9 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 out.paths |= named
                 carried.update(p for p in named if under(home, p))
                 paths.update(p for p in named if not under(home, p))
+            if raw[i - 1] == "<<<":  # what read makes of a here-string or a here-document (#74)
+                for piece in _pieces(raw[i]):
+                    _note_paths(piece, out.dirs, out.paths, out.globs)
             if ">" in raw[i - 1] and set(raw[i - 1]) <= _REDIRECT_CHARS and not (
                     raw[i - 1].endswith("&") and (raw[i].isdigit() or raw[i] == "-")):  # 2>&1 writes no file
                 for target in expand_braces(raw[i]):
@@ -2470,7 +2469,7 @@ def _plain_name(name: str) -> bool:
 
 def _plain(env: dict) -> bool:
     """Whether every variable in env is one a program does not take instructions from (_PLAIN)."""
-    return all(_plain_name(name) for name in env if re.fullmatch(r"[A-Za-z_]\w*", name))
+    return all(_plain_name(name) for name in env if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
 
 
 def _closed(closed: list[bool], assigned: list[str], *texts: str) -> bool:
@@ -2489,7 +2488,7 @@ def resolve(name: str, dirs: list[str]) -> list[str]:
     return [canonical(name, d) for d in dirs]
 
 
-_OPERAND = re.compile(r"\$\{!?[A-Za-z_]\w*(?:\[[^\]]*\])?(:?[-=+?]|/[/#%]?|##?|%%?)([^{}]*)\}")
+_OPERAND = re.compile(r"\$\{!?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?(:?[-=+?]|/[/#%]?|##?|%%?)([^{}]*)\}")
 
 
 def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
