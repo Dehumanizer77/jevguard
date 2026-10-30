@@ -202,7 +202,9 @@ It does the following:
 - brings over the settings, the key, the quarantine and the release list of an installation in that user's home;
 - starts the service;
 - writes the agents' system settings;
-- takes the guard's hooks out of the user's own Claude Code and Codex settings, so that they do not run twice. Other hooks there stay.
+- checks, as that user, that the guard works for each agent: its system settings hold the hooks, the hook runs, and the service answers with a key;
+- only for the agents where it does, takes the guard's hooks out of the user's own settings, so that they do not run twice. Other hooks there stay. For any other agent they stay too, and setup ends with an error saying why;
+- if Grok is there, gives it hooks of its own (`~/.grok/hooks/jevguard.json`) first, since it runs the hooks in `~/.claude/settings.json` as well.
 
 Without a key from an earlier installation, put one in place (the owner types this, not an agent):
 
@@ -233,7 +235,7 @@ the user `jevguard` for you to delete.
 
 - **A user that is root in all but name.** If the agent's user is in the `docker` or `disk` group, or can use sudo without a password, it can still change all of this.
 - **ptrace.** With `kernel.yama.ptrace_scope` at 0, a process of the agent's user can attach to the agent and to its hooks, and change what they do. Set it to 1 to stop that.
-- **Asking the service.** The socket answers the agent's other processes as it answers the hook. They can have a text scored or sealed, or things recorded in a session's state. The service keeps its files from being read or changed, not from being asked.
+- **Asking the service.** The socket answers the agent's other processes as it answers the hook. They can have a text scored or sealed, add to a session's record of outside content, or leave the mark a shell wrapper leaves for output it judged. The service keeps its files from being read or changed, but not from being asked. It does refuse what a hook never sends: a count of tokens, a prune of every session, a quarantined result whose digest is not that of its text.
 - **The user's own settings `env`.** That block still reaches the hook's environment. `jevguard-shell` takes `SHELL` only when `/etc/shells` lists it, but a variable such as `LD_PRELOAD` set there is loaded into the hook.
 
 ## Reference

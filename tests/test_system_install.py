@@ -142,12 +142,35 @@ def test_the_service_answers_only_the_owners(sysguard):
 
 def test_the_service_does_not_release_discard_or_change_settings(sysguard):
     client = service.Client(sysguard.socket)
-    for name in ("release", "discard", "released_ids", "load", "mode", "_write"):
+    for name in ("release", "discard", "released_ids", "load", "mode", "_write", "usage_add"):
         with pytest.raises(service.ServiceError, match="does not answer"):
             client.call(name, "fw-20261030-abcdef")
     assert client.call("judged", "s1", "ls", mark=True, output="x") is True
     assert client.call("judged", "s1", "ls", output="x") is True and client.call("judged", "s1", "ls", output="x") is False
     assert client.call("released") == []
+
+
+def test_no_other_process_can_switch_scanning_off_through_the_service(sysguard):
+    """Any process of the owner can reach the socket, so the service takes only what a hook would
+    give it. It counts the tokens of its own scans: a call that spent the day's budget, or set the
+    pause after a failure, would stop every scan. It prunes sessions at its own age: one of 0
+    days would wipe what each session saw. And it keeps a withheld result only with the digest of
+    its text: one of other content would be released, unseen, by the owner's release."""
+    client = service.Client(sysguard.socket)
+    sysguard.configure(mode="block")
+    _fetch(sysguard, BENIGN)
+    assert json.loads((sysguard.state / "usage.json").read_text())["scans"] == 1
+    client.call("session_update", "s2", paths=["/work/downloaded.html"], external=True)
+    client.call("prune_sessions", days=0)
+    assert client.call("session", "s2")["paths"] == ["/work/downloaded.html"]
+    digest = store.content_hash("the text", [b"img"])
+    with pytest.raises(service.ServiceError, match="digest of that text"):
+        client.call("quarantine", "WebFetch", {}, "raw", {"verdict": "injection"}, store.content_hash("other", []),
+                    "the text", [b"img"])
+    with pytest.raises(service.ServiceError, match="digest of that text"):
+        client.call("quarantine", "WebFetch", {}, "raw", {"verdict": "injection"}, digest)
+    qid = client.call("quarantine", "WebFetch", {}, "raw", {"verdict": "injection"}, digest, "the text", [b"img"])
+    assert json.loads((sysguard.state / "quarantine" / f"{qid}.json").read_text())["content_sha256"] == digest
 
 
 def test_bytes_go_to_the_service_and_back():
@@ -227,13 +250,13 @@ def test_the_owners_own_hooks_are_taken_out_and_others_kept(tmp_path, monkeypatc
                   "PostToolUse": [{"matcher": "Read", "hooks": [ours]}]}}))
     (tmp_path / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [
         {"type": "command", "command": "/home/x/.local/share/jevguard/bin/jevguard-hook --agent codex"}]}]}}))
-    done = system._remove_user_hooks()
+    done = system._remove_user_hooks(["claude", "codex"])
     assert len(done) == 2
     claude = json.loads((tmp_path / ".claude" / "settings.json").read_text())
     assert claude == {"env": {"A": "b"}, "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
         {"type": "command", "command": "rtk hook claude"}]}]}}
     assert json.loads((tmp_path / ".codex" / "hooks.json").read_text()) == {}
-    assert system._remove_user_hooks() == []
+    assert system._remove_user_hooks(["claude", "codex"]) == []
 
 
 def test_the_owners_installation_is_read_without_following_a_link(tmp_path, monkeypatch):
@@ -347,3 +370,131 @@ def test_the_units_run_the_service_as_its_user_on_its_socket():
     assert f"User={system.USER}" in service_unit and "ProtectHome=yes" in service_unit
     assert f"ExecStart=/usr/bin/python3 -IS {system.CODE_ROOT}/bin/jevguard-service" in service_unit
     assert f"ReadWritePaths={system.STATE_DIR} {system.RELEASED_DIR}" in service_unit
+
+
+def test_the_code_check_looks_at_every_directory_and_file_in_the_tree(tmp_path):
+    """#88: the directories bin and jevguard themselves were not looked at, and a directory others
+    may write lets them replace the root-owned files in it. Here the tree is the test user's, and
+    the check is for that user (owner=); the directories above tmp_path are reported either way."""
+    code = tmp_path / "code"
+    for d in ("bin", "jevguard/agents", ".git/hooks"):
+        (code / d).mkdir(parents=True)
+    for f in ("bin/jevguard-hook", "jevguard/__init__.py", "jevguard/agents/claude.py", ".git/HEAD", "README.md"):
+        (code / f).write_text("x")
+    for p in [code, *code.rglob("*")]:
+        p.chmod(0o755 if p.is_dir() else 0o644)
+    above = system.check_code(code, owner=os.getuid())
+    assert not any(str(code) in f for f in above)
+    for loose in ("bin", "jevguard", "jevguard/agents", ".git/hooks", "README.md"):
+        (code / loose).chmod(0o777)
+        assert [f for f in system.check_code(code, owner=os.getuid()) if f not in above] == \
+            [f"{code / loose} is not root's alone (owner {os.getuid()}, mode 0o777)"], loose
+        (code / loose).chmod(0o755 if (code / loose).is_dir() else 0o644)
+    (code / "jevguard" / "agents" / "grok.py").symlink_to("/tmp/elsewhere.py")
+    assert [f for f in system.check_code(code, owner=os.getuid()) if f not in above] == \
+        [f"{code / 'jevguard' / 'agents' / 'grok.py'} is a symbolic link"]
+    assert any("not root's alone" in f for f in system.check_code(code))      # and for root, the test's user is not root
+
+
+@pytest.fixture
+def setup_env(tmp_path, monkeypatch):
+    """setup() as root would run it, in tmp_path: root, systemd, the accounts and the owner's
+    child process stood in for. What the agents would find when the owner runs them: works."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for name, path in (("CONFIG_DIR", "etc/jevguard"), ("STATE_DIR", "var/lib/jevguard"),
+                       ("RELEASED_DIR", "var/lib/jevguard-released"), ("UNITS", "etc/systemd/system"),
+                       ("CLAUDE_MANAGED", "etc/claude-code/managed-settings.json"),
+                       ("CODEX_REQUIREMENTS", "etc/codex/requirements.toml"), ("COMMAND_LINK", "usr/local/bin/jevguard"),
+                       ("SYSTEM_FILE", "etc/jevguard/system.json")):
+        monkeypatch.setattr(system, name, tmp_path / path)
+    for d in ("etc/systemd/system", "usr/local/bin"):
+        (tmp_path / d).mkdir(parents=True)
+    monkeypatch.setattr(system, "settings", lambda: json.loads(system.SYSTEM_FILE.read_text()))
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(os, "chown", lambda *a: None)
+    monkeypatch.setattr(system, "check_code", lambda *a, **k: [])
+    owner = type("pw", (), {"pw_uid": 1000, "pw_gid": 1000, "pw_name": "owner", "pw_dir": str(home)})()
+    service_user = type("pw", (), {"pw_uid": 999, "pw_gid": 999})()
+    monkeypatch.setattr(system.pwd, "getpwnam", lambda name: service_user if name == system.USER else owner)
+    monkeypatch.setattr(system.grp, "getgrnam", lambda name: None)
+    ran = []
+    monkeypatch.setattr(system.subprocess, "run", lambda argv, **k: ran.append(argv))
+    monkeypatch.setattr(system, "_as_owner", lambda pw, fn, *args: fn(*args))
+    works = {}
+    monkeypatch.setattr(system, "_works_for_owner", lambda agents: {a: works.get(a, "") for a in agents})
+    return type("env", (), {"home": home, "ran": ran, "works": works})()
+
+
+_OLD = "/home/owner/.local/share/jevguard/bin/jevguard-hook"
+
+
+def _user_hooks(home):
+    (home / ".claude" / "settings.json").write_text(json.dumps({
+        "env": {"CLAUDE_CODE_SHELL_PREFIX": "/home/owner/.local/share/jevguard/bin/jevguard-shell"},
+        "hooks": {"PostToolUse": [{"matcher": "Read", "hooks": [{"type": "command", "command": _OLD}]}],
+                  "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}]}}))
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": f"{_OLD} --agent codex"}]}]}}))
+
+
+def _commands(path):
+    return json.dumps(json.loads(path.read_text()))
+
+
+def test_setup_takes_out_only_the_selected_agents_own_hooks(setup_env, capsys):
+    """#89: setup took the owner's hooks out of both Claude Code's and Codex's settings, whichever
+    agents it was set up for. Set up for Claude Code, Codex keeps its own."""
+    _user_hooks(setup_env.home)
+    assert system.setup("owner", ["claude"]) == 0
+    assert _OLD not in _commands(setup_env.home / ".claude" / "settings.json")
+    assert "rtk hook claude" in _commands(setup_env.home / ".claude" / "settings.json")
+    assert f"{_OLD} --agent codex" in _commands(setup_env.home / ".codex" / "hooks.json")
+    assert not system.CODEX_REQUIREMENTS.exists()
+    assert system.holds_hooks("claude", config.load()) == ""
+    assert "rm -r" not in capsys.readouterr().out                         # no old copies to name here
+
+
+def test_setup_keeps_codexs_own_hooks_when_its_requirements_are_someone_elses(setup_env, capsys):
+    """#89: an administrator's requirements.toml is left alone, and then Codex's own hooks stay,
+    and setup says the installation is not complete."""
+    _user_hooks(setup_env.home)
+    system.CODEX_REQUIREMENTS.parent.mkdir(parents=True)
+    system.CODEX_REQUIREMENTS.write_text("[features]\nhooks = true\n")
+    assert system.setup("owner", ["codex"]) == 1
+    out = capsys.readouterr().out
+    assert "NOT DONE for codex" in out and "not complete" in out
+    assert f"{_OLD} --agent codex" in _commands(setup_env.home / ".codex" / "hooks.json")
+    assert _OLD in _commands(setup_env.home / ".claude" / "settings.json")  # not selected: untouched
+    assert system.CODEX_REQUIREMENTS.read_text() == "[features]\nhooks = true\n"
+
+
+def test_setup_keeps_the_owners_hooks_when_the_guard_does_not_work_for_the_owner(setup_env, capsys):
+    """The system settings may hold the hooks and still the guard not work as the agent runs it:
+    the service not answering, no key, the hook failing. Then nothing is taken out."""
+    _user_hooks(setup_env.home)
+    setup_env.works["claude"] = "the service does not answer the owner: [Errno 111] Connection refused"
+    setup_env.works["codex"] = "no API key"
+    assert system.setup("owner", ["claude", "codex"]) == 1
+    out = capsys.readouterr().out
+    assert "NOT DONE for claude: the service does not answer" in out and "NOT DONE for codex: no API key" in out
+    assert _OLD in _commands(setup_env.home / ".claude" / "settings.json")
+    assert "jevguard-shell" in _commands(setup_env.home / ".claude" / "settings.json")
+    assert f"{_OLD} --agent codex" in _commands(setup_env.home / ".codex" / "hooks.json")
+    setup_env.works.clear()
+    assert system.setup("owner", ["claude", "codex"]) == 0                # put right: done on the next run
+    assert _OLD not in _commands(setup_env.home / ".claude" / "settings.json")
+    assert json.loads((setup_env.home / ".codex" / "hooks.json").read_text()) == {}
+
+
+def test_setup_gives_grok_hooks_of_its_own_before_it_takes_claude_codes_out(setup_env):
+    """Grok runs the hooks in ~/.claude/settings.json too: taking the guard's out of there would
+    take the guard from Grok, which has no system settings of its own."""
+    _user_hooks(setup_env.home)
+    (setup_env.home / ".grok").mkdir()
+    assert system.setup("owner", ["claude"]) == 0
+    grok = (setup_env.home / ".grok" / "hooks" / "jevguard.json").read_text()
+    assert f"{system.CODE_ROOT}/bin/jevguard-hook --agent grok" in grok
+    assert _OLD not in _commands(setup_env.home / ".claude" / "settings.json")

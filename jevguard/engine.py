@@ -261,7 +261,8 @@ def after(call: Call, cfg, ctx: dict) -> Decision | None:
     ms = round((time.perf_counter() - t0) * 1000)
     # The scan has returned. From here on there is the verdict, the owner's policy for it, and
     # writing down what happened: the first two decide, the third goes through record().
-    record(store.usage_add, cfg, tokens=verdict.get("tokens") or 0, outage=bool(err is not None and err.outage))
+    if not remote:  # the service counts its own scans
+        record(store.usage_add, cfg, tokens=verdict.get("tokens") or 0, outage=bool(err is not None and err.outage))
     v = verdict.get("verdict")
     if err is not None and v != "injection":  # nothing conclusive found before the failure
         return unavailable(str(err), verdict, partial_verdict=v, outage=err.outage, ms=ms)

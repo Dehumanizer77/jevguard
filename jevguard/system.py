@@ -217,23 +217,26 @@ def _directory(path: Path, mode: int, uid: int = 0, gid: int = 0) -> None:
     os.chmod(path, mode)
 
 
-def check_code() -> list[str]:
-    """Why the code could be changed by someone other than root: every directory from / down to
-    it, and everything in it that is run or imported, has to be root's and writable by root
-    alone. Empty when it is out of reach."""
+def check_code(root: Path = CODE_ROOT, owner: int = 0) -> list[str]:
+    """Why the code could be changed by someone other than root. Every directory from / down to
+    it, and every directory and file in it, has to be root's and writable by root alone: a
+    directory others may write lets them replace what is in it, whoever owns that (#88). The
+    whole tree, not only what is run or imported: root runs `git pull` in it, and git runs what
+    lies in .git/hooks. And no link, which could lead anywhere. Empty when it is out of reach."""
     found = []
-    path = CODE_ROOT
-    for p in [path, *path.parents]:
+
+    def check(p: Path) -> None:
         st = p.lstat()
-        if st.st_uid != 0 or st.st_mode & 0o022:
+        if p.is_symlink():
+            found.append(f"{p} is a symbolic link")
+        elif st.st_uid != owner or st.st_mode & 0o022:
             found.append(f"{p} is not root's alone (owner {st.st_uid}, mode {oct(st.st_mode & 0o777)})")
-    for base in (CODE_ROOT / "bin", CODE_ROOT / "jevguard"):
-        for dirpath, dirnames, filenames in os.walk(base):
-            for name in [*dirnames, *filenames]:
-                p = Path(dirpath) / name
-                st = p.lstat()
-                if st.st_uid != 0 or st.st_mode & 0o022:
-                    found.append(f"{p} is not root's alone (owner {st.st_uid}, mode {oct(st.st_mode & 0o777)})")
+
+    for p in [*reversed(root.parents), root]:
+        check(p)
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in [*dirnames, *filenames]:
+            check(Path(dirpath) / name)
     return found
 
 
@@ -305,13 +308,21 @@ def _read_user_installation() -> dict:
             "paths": [str(cfg_dir / "typesafe.key"), str(state_dir), str(released_dir)]}
 
 
-def _remove_user_hooks() -> list[str]:
-    """Run as the owner (_as_owner): the guard's hooks taken out of the owner's own Claude Code
-    and Codex settings, so that they do not run a second time beside the system's. Other hooks
-    stay. What was changed, for the report."""
+def _remove_user_hooks(agents: list[str]) -> list[str]:
+    """Run as the owner (_as_owner): the guard's hooks taken out of the owner's own settings for
+    these agents, whose system settings run the guard now (and only for those, #89), so that they
+    do not run a second time beside the system's. Other hooks stay. What was changed, for the
+    report.
+
+    Grok runs the hooks in ~/.claude/settings.json as well. Where it is there and has no hooks of
+    the guard of its own, it gets them (~/.grok/hooks/jevguard.json, this code) before Claude
+    Code's are taken out: else it would lose the guard it had."""
     from .agents import setup as agent_setup
     done = []
-    for path in (Path.home() / ".claude" / "settings.json", Path.home() / ".codex" / "hooks.json"):
+    files = {"claude": Path.home() / ".claude" / "settings.json", "codex": Path.home() / ".codex" / "hooks.json"}
+    if "claude" in agents and (Path.home() / ".grok").is_dir() and not agent_setup.installed("grok"):
+        done.append(f"Grok runs Claude Code's hooks as well: {agent_setup.install('grok')}")
+    for path in (files[a] for a in agents if a in files):
         try:
             settings = json.loads(path.read_text())
         except (OSError, ValueError):
@@ -382,9 +393,34 @@ def _bring_over(found: dict, uid: int, gid: int, report) -> None:
                f"{', '.join(sorted(found.get('state', {}))) or 'no other files'}")
 
 
-def update_agents(cfg, agents: list[str], report=print) -> None:
+def holds_hooks(agent: str, cfg) -> str:
+    """Why the agent's system settings, as they are on disk, do not run the guard: empty when
+    they do. Read back after writing, so that setup never takes the owner's own hooks away for an
+    agent whose system settings did not get them (#89)."""
+    from . import cli
+    try:
+        if agent == "claude":
+            hooks = json.loads(CLAUDE_MANAGED.read_text()).get("hooks") or {}
+            missing = [event for event, (matchers, _, wanted) in cli.hook_plan(cfg).items() if wanted and not all(
+                any(g.get("matcher") == m and any(h.get("command") == hook_command("claude") for h in g.get("hooks", []))
+                    for g in hooks.get(event, [])) for m in matchers)]
+            return f"{CLAUDE_MANAGED} has no hook of the guard for {', '.join(missing)}" if missing else ""
+        import tomllib
+        req = tomllib.loads(CODEX_REQUIREMENTS.read_text())
+        hooks = req.get("hooks") or {}
+        missing = [event for event in ("PreToolUse", "PostToolUse") if not any(
+            h.get("command") == hook_command("codex") for g in hooks.get(event, []) for h in g.get("hooks", []))]
+        if missing:
+            return f"{CODEX_REQUIREMENTS} has no hook of the guard for {', '.join(missing)}"
+        return "" if (req.get("features") or {}).get("hooks") is True else f"{CODEX_REQUIREMENTS} does not pin hooks on"
+    except (OSError, ValueError, AttributeError, TypeError) as exc:
+        return f"its system settings could not be read: {exc}"
+
+
+def update_agents(cfg, agents: list[str], report=print) -> dict[str, str]:
     """Write the agents' system settings from the current settings (setup, and the owner's `mode`
-    and `gate`)."""
+    and `gate`). For each agent, why its system settings do not run the guard (holds_hooks):
+    empty where they do."""
     if "claude" in agents:
         try:
             current = json.loads(CLAUDE_MANAGED.read_text())
@@ -407,11 +443,40 @@ def update_agents(cfg, agents: list[str], report=print) -> None:
         except FileNotFoundError:
             current = None
         if current is not None and not current.startswith(_OURS):
-            report(f"left {CODEX_REQUIREMENTS} as it is: it was not written by jevguard. Add this to it:\n{text}")
+            if holds_hooks("codex", cfg):
+                report(f"left {CODEX_REQUIREMENTS} as it is: it was not written by jevguard. Add this to it, and "
+                       f"run setup again:\n{text}")
         elif current != text:
             _directory(CODEX_REQUIREMENTS.parent, 0o755)
             _write(CODEX_REQUIREMENTS, text, 0o644)
             report(f"wrote {CODEX_REQUIREMENTS}")
+    return {agent: holds_hooks(agent, cfg) for agent in agents}
+
+
+def _works_for_owner(agents: list[str]) -> dict[str, str]:
+    """Run as the owner (_as_owner): for each agent, why the guard does not work for it as that
+    agent will run it, empty when it does. The owner can read the agent's system settings, the
+    hook runs for that agent without an error, and the service answers the owner and has a key."""
+    try:
+        from .service import Client
+        service = Client(timeout=30).call("scanner_available")
+    except OSError as exc:
+        service = f"the service does not answer the owner: {exc}"
+    found = {}
+    for agent in agents:
+        path = CLAUDE_MANAGED if agent == "claude" else CODEX_REQUIREMENTS
+        event = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": "/dev/null"},
+                 "session_id": "jevguard-setup", "cwd": "/", "tool_use_id": "jevguard-setup"}
+        try:
+            path.read_text()
+            r = subprocess.run([str(CODE_ROOT / "bin" / "jevguard-hook"), "--agent", agent], input=json.dumps(event),
+                               text=True, capture_output=True, timeout=60,
+                               env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())})
+            hook = f"its hook failed: {(r.stderr or r.stdout).strip()[-300:]}" if r.returncode or r.stderr.strip() else ""
+        except (OSError, subprocess.SubprocessError) as exc:
+            hook = f"{type(exc).__name__}: {exc}"
+        found[agent] = hook or service
+    return found
 
 
 def _systemctl(*args: str) -> None:
@@ -467,18 +532,28 @@ def setup(owner: str, agents: list[str], report=print) -> int:
     _systemctl("try-restart", "jevguard.service")
     report(f"service: jevguard.socket and jevguard.service, as user {USER}")
     cfg = config.load()
-    update_agents(cfg, agents, report)
+    written = update_agents(cfg, agents, report)
     if COMMAND_LINK.is_symlink() or not COMMAND_LINK.exists():
         tmp = COMMAND_LINK.with_name(".jevguard.tmp")
         tmp.unlink(missing_ok=True)
         tmp.symlink_to(CODE_ROOT / "bin" / "jevguard")
         tmp.replace(COMMAND_LINK)
     subprocess.run(["/usr/bin/python3", "-I", "-m", "compileall", "-q", str(CODE_ROOT / "jevguard")], check=False)
-    for line in _as_owner(pw, _remove_user_hooks):
+    # The owner's own hooks come out only for an agent the system installation was seen to run
+    # the guard for: its system settings hold the hooks, and as the owner they can be read, the
+    # hook runs and the service answers (#89). For any other agent they stay as they are.
+    works = _as_owner(pw, _works_for_owner, [a for a in agents if not written[a]])
+    failed = {a: written[a] or works.get(a, "") for a in agents if written[a] or works.get(a)}
+    for agent, why in failed.items():
+        report(f"NOT DONE for {agent}: {why}. Its hooks in {owner}'s own settings were left as they are.")
+    for line in _as_owner(pw, _remove_user_hooks, [a for a in agents if a not in failed]):
         report(line)
     key_copy, state_copy, released_copy = found.get("paths", [None, None, None])
     left = [p for p, there in ((key_copy, found.get("key")), (state_copy, found.get("state") or found.get("quarantine")),
                                (released_copy, found.get("released"))) if p and there]
+    if failed:  # the hooks left in the owner's settings still use those copies
+        report("The installation is not complete: run setup again once the above is put right.")
+        return 1
     if left:
         report("The owner's own copies are still where they were, and the agent can read them. Once the system "
                "installation works, the owner removes them:")
@@ -518,4 +593,6 @@ def remove(report=print) -> int:
         COMMAND_LINK.unlink()
     report(f"stopped the service. Left in place: {CONFIG_DIR}, {STATE_DIR}, {RELEASED_DIR}, {CODE_ROOT}, and the "
            f"user {USER}")
+    report("The agents now run without the guard: setup took its hooks out of the owners' own settings. Install it "
+           "again, for the system or in a home (README, Install).")
     return 0

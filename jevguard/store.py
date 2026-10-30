@@ -19,9 +19,11 @@ _MAX_LOG = 20 * 1024 * 1024
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 QID = re.compile(r"fw-\d{8}-[0-9a-f]{6}")
 # What a hook of a system installation has the service do (service.py): the reads and writes of a
-# hook. Not release, discard or the release list's ids: those are the owner's, run as root.
+# hook. Not release, discard or the release list's ids: those are the owner's, run as root. Not
+# usage_add: the service counts the tokens of the scans it makes itself, so that no other process
+# can spend the day's budget or pause the scanner, and with it every scan.
 REMOTE = ("audit", "quarantine", "judged", "released", "released_artifact", "session", "session_update",
-          "prune_sessions", "usage", "scanner_available", "usage_add")
+          "prune_sessions", "usage", "scanner_available")
 
 
 _RAISE = object()
@@ -423,7 +425,6 @@ def scanner_available(cfg) -> str:
     return ""
 
 
-@_by_service()
 def usage_add(cfg, tokens: int = 0, outage: bool = False) -> None:
     with _locked(cfg.usage_file) as u:
         day = time.strftime("%Y-%m-%d")

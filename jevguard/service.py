@@ -8,6 +8,11 @@ What it answers: the reads and writes of the guard's state that a hook makes (st
 scan, and a seal. Nothing that changes the owner's decisions: a release, a discard and the
 settings are the owner's commands, run as root, and are not answered here. It answers root and
 the owners named in system.json, by the credentials the kernel gives for the socket.
+
+Every process of an owner can reach it, not only the hooks. So it takes only what a hook would
+give, and works out itself what it can: it counts the tokens of its own scans (a count sent in
+could spend the day's budget, or pause the scanner, and so stop every scan), prunes sessions at
+its own age, and keeps a withheld result only with the digest of its own text.
 """
 
 from __future__ import annotations
@@ -119,14 +124,33 @@ class Scanner:
 # ---- the service ---------------------------------------------------------------------------------
 
 def _scan(cfg, text: str, images: list) -> dict:
-    from . import config, scanner
+    """A scan, and its count against the day's budget, which only the service keeps."""
+    from . import config, scanner, store
     key = config.read_key(cfg)
     if not key:
         return {"verdict": {}, "error": {"message": "no API key", "outage": False}}
     sc = scanner.Scanner(cfg, key)
-    verdict, err = sc.scan(text, [i for i in images if isinstance(i, bytes)])
+    verdict, err = sc.scan(str(text), [i for i in images if isinstance(i, bytes)])
+    try:
+        store.usage_add(cfg, tokens=verdict.get("tokens") or 0, outage=bool(err is not None and err.outage))
+    except OSError:
+        pass  # a count not kept changes no verdict
     return {"verdict": verdict, "policy": sc.policy_id,
             "error": None if err is None else {"message": str(err), "outage": err.outage}}
+
+
+def _quarantine(cfg, args: list, kwargs: dict) -> str:
+    """A withheld result, kept only with the digest of what it holds: release puts the digest on
+    the release list, and the owner reads the text before releasing. A digest of anything else
+    would release that, unseen."""
+    import inspect
+    from . import store
+    given = inspect.signature(store.quarantine).bind(cfg, *args, **kwargs).arguments
+    text, images = given.get("text"), list(given.get("images") or [])
+    if not isinstance(text, str) or not all(isinstance(i, bytes) for i in images) or \
+            given.get("digest") != store.content_hash(text, images):
+        raise ValueError("a quarantined result needs its text, and the digest of that text")
+    return store.quarantine(cfg, *args, **kwargs)
 
 
 def _seal(cfg, text: str) -> str:
@@ -150,6 +174,10 @@ def dispatch(cfg, name: str, args: list, kwargs: dict):
         return _seal(cfg, *args, **kwargs)
     if name == "scanner_available":
         return _scanner_available(cfg)
+    if name == "quarantine":
+        return _quarantine(cfg, args, kwargs)
+    if name == "prune_sessions":
+        return store.prune_sessions(cfg)  # at the age the service keeps, not one a caller names
     if name in store.REMOTE:
         return getattr(store, name)(cfg, *args, **kwargs)
     raise ValueError(f"the service does not answer {name!r}")
