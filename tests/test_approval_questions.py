@@ -346,6 +346,33 @@ def test_scripts_that_name_nothing_of_the_guard_are_not_asked_about(guard, comma
     assert ask_reason(guard, command) == "", command
 
 
+# Asked about on 2026-10-29 as "python3 is given a text that mentions /, a directory that holds the
+# guard's files": a test case in a script, `${p//a\\//}`, was read as an expansion the shell left
+# in, and what follows its last / as an argument of its own. In a text a lone / or ~ names nothing.
+@pytest.mark.parametrize("command", [
+    "python3 - <<'EOF'\ncases = ['p=a/b; touch ${p//a\\\\//}']\nEOF",
+    "python3 -c 'print(\"${x:-/}\", \"${x:-~}\", \"${x/a/~}\")'",
+    "git commit -m 'Read ${p:-/} and ${p//x/~} as bash reads them'",
+    "gh pr create --title x --body 'In `${p//x//}` the third / starts what is put in'",
+])
+def test_a_lone_slash_in_an_expansion_inside_a_script_names_no_directory(guard, command):
+    assert ask_reason(guard, command) == "", command
+
+
+@pytest.mark.parametrize("command", [
+    # an argument of its own: the expansion is the shell's
+    "touch ${x:-/}",
+    "touch \"${x:-~}\"",
+    "touch ${x/a/~}",
+    # a path in it, inside a text
+    "python3 -c 'import os; os.utime(\"${x:-~/.claude}\")'",
+    "python3 -c 'import os; os.utime(\"${x/a/~/.claude/settings.json}\")'",
+    f"python3 - <<EOF\nimport os; os.utime('${{d:-{HOME}/.claude}}')\nEOF",
+])
+def test_a_path_in_an_expansion_is_still_asked_about(guard, command):
+    assert ask_reason(guard, command) != "", command
+
+
 def test_the_question_says_what_the_agent_claims_the_call_is_for(guard):
     reason = ask_reason(guard, "jevguard mode log", description="Switch the guard to log mode as you asked")
     assert 'Claude describes the call as: "Switch the guard to log mode as you asked"' in reason

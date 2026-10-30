@@ -2319,16 +2319,19 @@ def resolve(name: str, dirs: list[str]) -> list[str]:
 _OPERAND = re.compile(r"\$\{!?[A-Za-z_]\w*(?:\[[^\]]*\])?(:?[-=+?]|/[/#%]?|##?|%%?)([^{}]*)\}")
 
 
-def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
+def _note_paths(arg: str, dirs: list[str], paths: set, globs: list, text: bool = False) -> None:
     """Record the paths one argument names, and those in what an expansion left in it may give:
-    `${p/#0/x}` and `${p:+x}` on a value that is not known may be x."""
+    `${p/#0/x}` and `${p:+x}` on a value that is not known may be x. Inside a text (a script, a
+    message) such a part is read as the rest of the text is, where a lone / or ~ names nothing:
+    `${p//a\\//}` in a script given to python is no /."""
     arg = arg.replace(_OPAQUE, "")
+    word = not text and bool(arg) and len(arg) <= 300 and not re.search(r"[\s'\"();]", arg)
     for m in _OPERAND.finditer(arg):
         for operand in m.group(2).split("/", 1) if m.group(1)[0] == "/" else [m.group(2)]:
-            _note_paths(operand, dirs, paths, globs)
+            _note_paths(operand, dirs, paths, globs, not word)
     if "://" in arg and " " not in arg:
         return
-    if arg and len(arg) <= 300 and not re.search(r"[\s'\"();]", arg):
+    if word:
         if arg.startswith("--"):
             forms = [arg.split("=", 1)[1]] if "=" in arg else []
         elif arg.startswith("-"):
