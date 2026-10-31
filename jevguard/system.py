@@ -393,25 +393,69 @@ def _bring_over(found: dict, uid: int, gid: int, report) -> None:
                f"{', '.join(sorted(found.get('state', {}))) or 'no other files'}")
 
 
+_EVERY_TOOL = (None, "", "*")  # a matcher both agents take for every tool: none, empty, or *
+# What a handler of the guard may say besides its command: anything else could narrow when it
+# runs, or what it may answer, in a way this does not know of.
+_HANDLER_KEYS = {"type", "command", "timeout", "async", "statusMessage"}
+
+
+def _runs_guard(handler, agent: str, wait: bool, timeout: int) -> bool:
+    """The handler runs the guard's hook for the agent, waited for where its answer counts, and
+    given at least the time the guard is given (its own default where none is set)."""
+    return (isinstance(handler, dict) and set(handler) <= _HANDLER_KEYS and handler.get("type") == "command"
+            and handler.get("command") == hook_command(agent) and not (wait and handler.get("async"))
+            and isinstance(handler.get("timeout", timeout), (int, float)) and handler.get("timeout", timeout) >= timeout)
+
+
+def _covers(groups, matcher: str | None, agent: str, wait: bool, timeout: int) -> bool:
+    """A group for every tool, or for exactly the matcher the guard is set on, runs the guard."""
+    return isinstance(groups, list) and any(
+        isinstance(g, dict) and (g.get("matcher") in _EVERY_TOOL or g.get("matcher") == matcher)
+        and isinstance(g.get("hooks"), list) and any(_runs_guard(h, agent, wait, timeout) for h in g["hooks"])
+        for g in groups)
+
+
 def holds_hooks(agent: str, cfg) -> str:
-    """Why the agent's system settings, as they are on disk, do not run the guard: empty when
-    they do. Read back after writing, so that setup never takes the owner's own hooks away for an
-    agent whose system settings did not get them (#89)."""
+    """Why the agent's system settings, as they are on disk, do not run the guard where the
+    owner's own hooks ran it: empty when they do. Read back after writing, so that setup never
+    takes the owner's hooks away for an agent whose system settings did not get them (#89).
+
+    What counts is what the hooks cover, not that the guard's command is in the file: for each
+    event, a group for every tool (or, in Claude Code, for the very matcher `install` sets) with
+    a handler that runs the guard, waited for where its answer counts, and given its time. A group
+    for Read alone would leave Bash, apply_patch and MCP unguarded (#89, comment). And nothing at
+    the same level may switch the hooks off: Claude Code's `disableAllHooks` in the managed
+    settings or a drop-in beside them, or there in block mode a shell prefix other than the
+    guard's."""
     from . import cli
     try:
         if agent == "claude":
-            hooks = json.loads(CLAUDE_MANAGED.read_text()).get("hooks") or {}
-            missing = [event for event, (matchers, _, wanted) in cli.hook_plan(cfg).items() if wanted and not all(
-                any(g.get("matcher") == m and any(h.get("command") == hook_command("claude") for h in g.get("hooks", []))
-                    for g in hooks.get(event, [])) for m in matchers)]
-            return f"{CLAUDE_MANAGED} has no hook of the guard for {', '.join(missing)}" if missing else ""
+            files = [CLAUDE_MANAGED, *sorted(CLAUDE_MANAGED.with_suffix(".d").glob("*.json"))]
+            layers = [json.loads(p.read_text()) for p in files if p.exists()]
+            if not layers or not all(isinstance(layer, dict) for layer in layers):
+                return f"{CLAUDE_MANAGED} does not hold a JSON object"
+            off = next((p for p, layer in zip(files, layers) if layer.get("disableAllHooks")), None)
+            if off:
+                return f"{off} sets disableAllHooks, which switches the managed hooks off too"
+            prefix = str(CODE_ROOT / "bin" / "jevguard-shell")
+            other = next(((p, v) for p, layer in zip(files, layers) if isinstance(layer.get("env"), dict)
+                          for v in [layer["env"].get(cli.PREFIX_KEY)] if v is not None and v != prefix), None)
+            if cfg.mode == "block" and (other or (layers[0].get("env") or {}).get(cli.PREFIX_KEY) != prefix):
+                return (f"{other[0]} sets {cli.PREFIX_KEY} to {other[1]}" if other else
+                        f"{CLAUDE_MANAGED} does not set {cli.PREFIX_KEY}") + \
+                    ", so the output of a shell command that fails would not be scanned"
+            hooks = layers[0].get("hooks") or {}
+            missing = [f"{event} {m}" for event, (matchers, wait, wanted) in cli.hook_plan(cfg).items() if wanted
+                       for m in matchers if not _covers(hooks.get(event), m, "claude", wait, 40)]
+            return f"{CLAUDE_MANAGED} has no hook of the guard that covers {', '.join(missing)}" if missing else ""
         import tomllib
         req = tomllib.loads(CODEX_REQUIREMENTS.read_text())
         hooks = req.get("hooks") or {}
-        missing = [event for event in ("PreToolUse", "PostToolUse") if not any(
-            h.get("command") == hook_command("codex") for g in hooks.get(event, []) for h in g.get("hooks", []))]
+        missing = [event for event in ("PreToolUse", "PostToolUse")
+                   if not _covers(hooks.get(event), None, "codex", True, 60)]
         if missing:
-            return f"{CODEX_REQUIREMENTS} has no hook of the guard for {', '.join(missing)}"
+            return (f"{CODEX_REQUIREMENTS} has no hook of the guard for every tool on {', '.join(missing)} "
+                    "(a group without a matcher, or with \"\" or \"*\")")
         return "" if (req.get("features") or {}).get("hooks") is True else f"{CODEX_REQUIREMENTS} does not pin hooks on"
     except (OSError, ValueError, AttributeError, TypeError) as exc:
         return f"its system settings could not be read: {exc}"

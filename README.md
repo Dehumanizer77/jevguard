@@ -202,7 +202,11 @@ It does the following:
 - brings over the settings, the key, the quarantine and the release list of an installation in that user's home;
 - starts the service;
 - writes the agents' system settings;
-- checks, as that user, that the guard works for each agent: its system settings hold the hooks, the hook runs, and the service answers with a key;
+- checks, as that user, that the guard works for each agent:
+  - the agent's system settings hold the hooks for every tool the user's own hooks covered, waited for and given their time;
+  - nothing at that level switches them off;
+  - the hook runs;
+  - the service answers with a key;
 - only for the agents where it does, takes the guard's hooks out of the user's own settings, so that they do not run twice. Other hooks there stay. For any other agent they stay too, and setup ends with an error saying why;
 - if Grok is there, gives it hooks of its own (`~/.grok/hooks/jevguard.json`) first, since it runs the hooks in `~/.claude/settings.json` as well.
 
@@ -220,7 +224,8 @@ sudo jevguard status
 ```
 
 Start new agent sessions. In Claude Code `/status` lists `Enterprise managed settings (file)` among
-the setting sources. Setup prints the old copies in the user's home, which the agent can still
+the setting sources. If it names `(remote)` instead, an organization's settings reach Claude Code
+from its servers, and Claude Code does not read the file then: setup cannot see that, so check. Setup prints the old copies in the user's home, which the agent can still
 read; remove them once the system installation works.
 
 Every owner's command now runs with sudo: `sudo jevguard mode block`, `sudo jevguard log`,

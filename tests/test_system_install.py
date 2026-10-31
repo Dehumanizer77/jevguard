@@ -489,6 +489,83 @@ def test_setup_keeps_the_owners_hooks_when_the_guard_does_not_work_for_the_owner
     assert json.loads((setup_env.home / ".codex" / "hooks.json").read_text()) == {}
 
 
+def _admin_requirements(*, matcher=None, handler_extra=""):
+    """An administrator's requirements.toml with the guard's hooks as codex_requirements() writes
+    them, each group and handler narrowed as given. It parses: what fails is the coverage."""
+    groups = "".join(f"""
+[[hooks.{event}]]
+{f"matcher = {json.dumps(matcher)}" if matcher is not None else ""}
+
+[[hooks.{event}.hooks]]
+type = "command"
+command = {json.dumps(system.hook_command("codex"))}
+timeout = 60
+{handler_extra}""" for event in ("PreToolUse", "PostToolUse"))
+    text = f'# Administrator managed\n\n[features]\nhooks = true\n\n[hooks]\nmanaged_dir = "/opt/x"\n{groups}'
+    tomllib.loads(text)
+    return text
+
+
+@pytest.mark.parametrize("narrowed", [{"matcher": "^Read$"}, {"matcher": "Bash"}, {"matcher": "mcp__.*"},
+                                      {"handler_extra": "async = true\n"},
+                                      {"handler_extra": "additionalContextLimit = 10\n"}])
+def test_setup_keeps_codexs_own_hooks_where_the_system_hooks_cover_less(setup_env, capsys, narrowed):
+    """#89 (comment on cd6d757): an administrator's requirements.toml with the guard's command, but
+    in a group for Read alone, passed: setup took Codex's own hooks, which covered every tool, out,
+    and Bash, apply_patch and MCP went unguarded. What counts is what the hooks cover."""
+    _user_hooks(setup_env.home)
+    system.CODEX_REQUIREMENTS.parent.mkdir(parents=True)
+    system.CODEX_REQUIREMENTS.write_text(_admin_requirements(**narrowed))
+    assert "has no hook of the guard for every tool on PreToolUse, PostToolUse" in system.holds_hooks("codex", None)
+    assert system.setup("owner", ["codex"]) == 1
+    assert "NOT DONE for codex" in capsys.readouterr().out
+    assert f"{_OLD} --agent codex" in _commands(setup_env.home / ".codex" / "hooks.json")
+    assert "Administrator managed" in system.CODEX_REQUIREMENTS.read_text()
+
+
+@pytest.mark.parametrize("unrestricted", [None, "", "*"])
+def test_an_administrators_requirements_that_cover_every_tool_will_do(setup_env, unrestricted):
+    _user_hooks(setup_env.home)
+    system.CODEX_REQUIREMENTS.parent.mkdir(parents=True)
+    system.CODEX_REQUIREMENTS.write_text(_admin_requirements(matcher=unrestricted))
+    assert system.holds_hooks("codex", None) == ""
+    assert system.setup("owner", ["codex"]) == 0
+    assert json.loads((setup_env.home / ".codex" / "hooks.json").read_text()) == {}
+
+
+def test_a_codex_hook_given_less_time_than_the_guard_does_not_count(setup_env):
+    system.CODEX_REQUIREMENTS.parent.mkdir(parents=True)
+    system.CODEX_REQUIREMENTS.write_text(_admin_requirements(matcher="*").replace("timeout = 60", "timeout = 5"))
+    assert "for every tool" in system.holds_hooks("codex", None)
+    system.CODEX_REQUIREMENTS.write_text(_admin_requirements(matcher="*").replace("timeout = 60\n", ""))
+    assert system.holds_hooks("codex", None) == ""                         # Codex's own default: 600 seconds
+
+
+@pytest.mark.parametrize("where, layer, block", [
+    ("file", {"disableAllHooks": True}, False),
+    ("drop-in", {"disableAllHooks": True}, False),
+    ("drop-in", {"env": {"CLAUDE_CODE_SHELL_PREFIX": "/usr/local/bin/other-prefix"}}, True),
+])
+def test_claude_codes_managed_hooks_switched_off_beside_them_do_not_count(setup_env, capsys, where, layer, block):
+    """The same for Claude Code: its managed hooks are switched off by disableAllHooks at the
+    managed level, in the file or in a drop-in beside it; and in block mode a shell prefix of
+    another's leaves the output of a failing command unscanned."""
+    _user_hooks(setup_env.home)
+    system.CLAUDE_MANAGED.parent.mkdir(parents=True)
+    if where == "file":
+        system.CLAUDE_MANAGED.write_text(json.dumps(layer))
+    else:
+        (system.CLAUDE_MANAGED.parent / "managed-settings.d").mkdir()
+        (system.CLAUDE_MANAGED.parent / "managed-settings.d" / "50-admin.json").write_text(json.dumps(layer))
+    if block:
+        system.CONFIG_DIR.mkdir(parents=True)
+        (system.CONFIG_DIR / "config.json").write_text('{"mode": "block"}')
+    assert system.setup("owner", ["claude"]) == 1
+    out = capsys.readouterr().out
+    assert "NOT DONE for claude" in out and ("disableAllHooks" in out or "CLAUDE_CODE_SHELL_PREFIX" in out)
+    assert _OLD in _commands(setup_env.home / ".claude" / "settings.json")
+
+
 def test_setup_gives_grok_hooks_of_its_own_before_it_takes_claude_codes_out(setup_env):
     """Grok runs the hooks in ~/.claude/settings.json too: taking the guard's out of there would
     take the guard from Grok, which has no system settings of its own."""
