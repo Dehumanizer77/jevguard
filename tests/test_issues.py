@@ -1150,3 +1150,277 @@ def test_a_function_bash_takes_from_its_environment_cannot_be_read(guard, tmp_pa
     monkeypatch.setenv("BASH_FUNC_module%%", "() { :; }")
     for cmd in ("env -i FOO=1 bash -c 'cat notes'", "sudo bash -c 'cat notes'", "bash -c 'cat notes'"):
         assert ["cat", "notes"] in shell.read(cmd, "/w").programs, cmd
+
+
+def _seen_in_bash(tmp_path, cmd) -> set:
+    """The arguments bash gives the program `seen` in cmd, one tuple for each time it runs it:
+    `seen` only writes them down. bash runs with a home of its own in tmp_path."""
+    stub, log, work, home = tmp_path / "bin" / "seen", tmp_path / "seen.log", tmp_path / "work", tmp_path / "home"
+    if not stub.exists():
+        stub.parent.mkdir()
+        stub.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\037" "$a" >> "$SEENLOG"; done\n'
+                        'printf "\\n" >> "$SEENLOG"\n')
+        stub.chmod(0o755)
+        work.mkdir()
+        home.mkdir()
+    log.unlink(missing_ok=True)
+    subprocess.run(["bash", "-c", cmd], cwd=work, capture_output=True, timeout=10,
+                   env={**os.environ, "HOME": str(home), "PATH": f"{stub.parent}:{os.environ['PATH']}",
+                        "SEENLOG": str(log), "LC_ALL": "C.UTF-8"})
+    lines = log.read_text().split("\n")[:-1] if log.exists() else []
+    return {tuple(line.split("\x1f")[:-1]) for line in lines}
+
+
+def _seen_by_reader(cmd) -> set:
+    """The arguments the reader gives `seen` in cmd, in each reading of it where all of them are
+    known: a loop's body is also read with its variable as it may be before the loop."""
+    return {tuple(shell._operands(argv)[1:]) for argv in shell.read(cmd, "/work").programs
+            if argv[0] == "seen" and not any("$" in a for a in argv)}
+
+
+def test_a_known_value_is_split_where_the_shell_splits_it(guard, tmp_path):
+    """#74: a known value put in where its $ is in no quotes was one word. The shell splits it at
+    the characters of IFS, so `p='.claude notes'; rm -rf $p` removes .claude, and nothing was
+    asked. Now the reader splits it as bash does: spaces, tabs and newlines run together and make
+    no word at either end; another character of IFS ends a word, an empty one too; an empty IFS
+    splits nothing; a quoted $p, case WORD, [[ ]], a here-string and an assignment to export are
+    not split. Each case is checked against what bash gives a program that only writes its
+    arguments down. Nor did a quote or a backslash end a variable's name once the quotes were taken
+    away: `p='.claude '; touch $p""x` was read as $px."""
+    for cmd in ("p='.claude notes'; seen $p", "p='notes .claude'; seen $p", "IFS=:; p=notes:.claude; seen $p",
+                "p=$'.claude\\tnotes\\n'; seen $p", "IFS=': '; p='a : b'; seen $p", "IFS=:; p=':a::b:'; seen $p",
+                "IFS=' :'; p=' :a'; seen $p", "p='a  b '; seen x$p", "p='a b'; q=c; seen $q$p",
+                "p='a b'; seen ${p}", "p='a b'; seen ${p:-x}", "p=; seen $p x", "p=; seen \"\"$p",
+                "p='a b'; seen \"$p\"", "IFS=; p='a b'; seen $p", "IFS=:; p='a b'; seen $p",
+                "p='a b'; for f in $p; do seen \"$f\"; done", "p='seen a'; $p b",
+                "p='a b'; case $p in 'a b') seen yes;; esac", "p='a b'; [[ $p == 'a b' ]] && seen yes",
+                "p='a b'; seen <<< $p", "p='a b'; export q=$p; seen \"$q\"",
+                # a quote or a backslash ends the name: $p""x is $p and x, not $px
+                "p='.claude '; seen $p\"\"x", "p=.clau; seen \"$p\"de $p''de \"$p\"\"de\" $p\\de \"${p}\"de",
+                "p='a b'; seen \"\"$p\"\" ''$p''"):
+        assert _seen_by_reader(cmd) == _seen_in_bash(tmp_path, cmd), cmd
+    for cmd in ("p='.claude notes'; touch $p", "p='notes .claude'; touch $p", "IFS=:; p=notes:.claude; touch $p",
+                "p='a .claude'; touch x$p", "p='.claude notes'; for f in $p; do touch \"$f\"; done",
+                "p='.claude notes'; a=($p); touch \"${a[@]}\"", "p='touch .claude'; $p",
+                "p='.claude notes'; echo $p | xargs touch", "p='.claude '; touch $p\"\"x", 'p=.clau; touch "$p"de'):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("p='.claude notes'; touch \"$p\"", "IFS=; p='.claude notes'; touch $p",
+                "IFS=:; p='.claude notes'; touch $p", "p='.claude notes'; echo $p"):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_a_value_split_at_characters_that_are_not_known_cannot_be_read(guard):
+    """#74: where IFS holds what is not known, which words a value makes cannot be told: so after
+    IFS=$(...), and after anything that may set any variable (eval of what is not known, a
+    sourced file), for a known value put in where its $ is in no quotes."""
+    for cmd in ("IFS=$(printf :); p=notes:.claude; touch $p", 'eval "$(cat f)"; p=notes:.claude; touch $p',
+                "source ./vars; p=notes:.claude; touch $p", "read IFS < f; p=notes:.claude; touch $p"):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ('eval "$(cat f)"; p=notes; touch "$p"', "IFS=$(printf :); touch notes"):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_a_parameter_operator_gives_what_bash_gives_or_cannot_be_read(guard, tmp_path):
+    """#75, #81, #82, #83: the reader worked out ${p<op>x} with Python's semantics, which differ from
+    bash's: a & in the replacement (bash 5.2 puts the matched text there), a & or a / that a
+    variable puts in the word, a global replacement of *, an offset of 010 (eight to bash), an
+    offset further back than the start, [^x] and classes, extended globs, case changes past
+    ASCII. Each gave a known value bash does not give, with the real target named nowhere else.
+    Now it works out only plain forms, each checked here against bash: a prefix or suffix of *,
+    ? and other characters taken off, a replacement of text without them (a & read both ways,
+    the pattern ending where the word as written has its /), a case change of all or the first
+    character, decimal offsets. Anything else of a known value cannot be read, nor can ${!p},
+    ${p@L} and the like of one; the subscript of ${a[@]} gives each value the variable holds."""
+    for cmd in ('p=.claude; seen "${p/.claude/&}"', 'p=abc; seen "${p//b/&&}" "${p/#a/[&]}" "${p/%c/<&>}"',
+                'p=.claude; r="&"; seen "${p/.claude/$r}"', 'p=abc; seen "${p/#/X}" "${p/%/X}" "${p/}" "${p//}" "${p/b}"',
+                'p=; seen "${p//x/Y}" "${p/#/Y}" "${p/%/Y}"',
+                'p=abcabc; seen "${p//ab/X}" "${p/ab/X}" "${p/#ab/X}" "${p/%bc/X}" "${p/#bc/X}" "${p/%ab/X}"',
+                'p=aaa; seen "${p//aa/X}" "${p/%aa/X}"', 'p=.clx/aude; q=x/; seen ${p/$q/} "${p//$q/}" "${p/#.cl$q/.cl}"',
+                'shopt -u patsub_replacement; p=x; r="&claude"; q=${p/x/$r}; seen ".${q/&/}"',
+                'p=x.claude; seen "${p#?}" "${p#*.}" "${p##*.}" "${p%.*}" "${p%%.*}" "${p%?}"', 'p=x.claude; q=x; seen ${p#$q}',
+                'p=abcdef; seen "${p:2}" "${p: -2}" "${p:1:-1}" "${p:(-3):2}" "${p:9}" "${p: -9}" "${p:0:0}" "${p: -0}"',
+                'p=abcdef; seen "${p^}" "${p^^}"', 'p=ABC; seen "${p,}" "${p,,}"',
+                'h=/srv/x; seen "${h[0]}" "${h:-$x}"'):
+        assert _seen_in_bash(tmp_path, cmd) <= _seen_by_reader(cmd), cmd
+    # an array's values are read one at a time: each word bash gives is among them
+    cmd = 'a=(.claude notes); seen "${a[1]}" "${a[@]%s}"'
+    assert set().union(*_seen_in_bash(tmp_path, cmd)) <= set().union(*_seen_by_reader(cmd)), cmd
+    for cmd in ('p=.claude; touch "${p/.claude/&}"', "p=.claude; touch ${p//.claude/&}",
+                "shopt -u patsub_replacement\np=x\nr='&claude'\nq=${p/x/$r}\ntouch .${q/&/}",
+                "p=.clx/aude; q=x/; touch ${p/$q/}", "p=x.claude; q=x; touch ${p#$q}", "p=x.claude; touch ${p:1}",
+                "p=.cLAUDE; touch ${p,,}", "touch ${HOME:-$x}", "touch ${HOME:-${x}}", 'touch "${HOME[@]}"'):
+        assert "`touch` is given" in _reason(guard, cmd), cmd
+    for cmd in ("p=x; touch .${p//*/claude}", "p=x; touch .${p//*/claude}/settings.json",
+                "p=abcdefgh.claude; touch ${p:010}", "p=.copilotXX; touch ${p:0:010}", "p=x.claude; touch ${p:0x1}",
+                "p=x.claude; touch ${p#[x]}", "p=x.claude; touch ${p#[^y]}", "p=.cLAUDE; touch ${p,,[A-Z]}",
+                "shopt -s extglob; p=a.claude; touch ${p#@(a|b)}", "p=x.claude; touch ${p#$unknown}",
+                "p=.CLAUDE/SETT\u0130NGS.JSON; touch ${p,,}", "p=$'\\u00e9.claude'; touch ${p:1}",
+                "p=a/.claude; touch ${p//a\\//}", 'p=.claude; touch "${p/.claude/\'&\'}"', "p=abc; touch ${p:2:-2}",
+                "p=HOME; touch ${!p}", "touch ${HOME@L}", "p=.claude; touch ${p@Q}", "touch ${HOME:-${x:-${y}}}",
+                'a=(x.claude); touch "${a[@]:1}"'):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ('p=x; touch "${p/x/&y}"', "p=build; touch ${p/build/dist}", "f=report.txt; touch ${f%.txt}.md",
+                "touch ${PWD#$HOME/}.log", 'touch "${PWD##*/}.log"', 'b=$(git branch --show-current); touch "${b//\\//-}.log"',
+                'files=(a b); for f in "${files[@]}"; do touch "$f.log"; done', "touch ${#HOME}"):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_the_words_a_value_may_be_split_into_are_paths_the_command_names(guard, tmp_path):
+    """#74: where a value is not known here, a program given it is given every path the command
+    names; and a value's words were not among them where it sat in a longer text: an assignment
+    with spaces in it, a here-string, what echo prints into `| while read`. Now each word such a
+    text may be split into is a path the command names, except a lone / that no read or split
+    the command runs ends a word beside (division, s//x/; see the test of the root below). And a
+    name ends at the first character bash does not take for one: Python's \\w took é for one."""
+    cmd = "p='.claude '; seen $pé"
+    assert _seen_by_reader(cmd) == _seen_in_bash(tmp_path, cmd), cmd
+    for cmd in ("p='.claude '; touch $pé", "read a b <<< '.claude x'; touch $a",
+                "IFS=: read a b <<< '.claude:x'; touch $a", "echo '.claude x' | while read a b; do touch \"$a\"; done",
+                "printf '%s\\n' 'x .claude' | while read a b; do touch \"$b\"; done",
+                "p='.claude x'; read a b <<< \"$p\"; touch $a"):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("msg='a / b'; touch \"$out\"", "read a <<< 'x / y'; touch \"$a\"",
+                "git commit -m 'fix s//x/ in the parser'; touch \"$out\"", "p='notes x'; touch \"$p\""):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_the_elements_of_an_array_are_put_in_as_bash_puts_them_or_cannot_be_read(guard, tmp_path):
+    """#86: the reader put in each value an array may hold on its own, wherever its ${a[@]} or
+    ${a[*]} stood. bash joins the elements of a quoted ${a[*]}, and of any of them where it makes
+    no words (an assignment, [[ ]], case), at the first character of IFS: with IFS empty,
+    .cl au de is .claude, which none of them names. Beside other text only the first and the last
+    element take it: `a=(x .claude); touch "y${a[@]}"` touches .claude, and the reader, which had
+    the values of a since 45e8045, read y.claude and asked nothing, where main asked."""
+    assert _seen_in_bash(tmp_path, 'IFS=; a=(.cl au de); seen "${a[*]}"') == {(".claude",)}
+    assert _seen_in_bash(tmp_path, 'a=(x .claude); seen "y${a[@]}"') == {("yx", ".claude")}
+    assert _seen_in_bash(tmp_path, 'IFS=; set -- .cl aude; seen "$*"') == {(".claude",)}
+    # each element a word of its own, the expansion the whole word: each word bash gives is read
+    for cmd in ('a=(x "y z"); seen "${a[@]}"', 'a=(x "y z"); seen ${a[@]}', 'a=(x "y z"); seen ${a[*]}',
+                'IFS=; a=(x "y z"); seen ${a[*]}', 'IFS=:; a=(x "y:z"); seen ${a[@]}',
+                'a=(x y); for f in "${a[@]}"; do seen "$f"; done'):
+        assert set().union(*_seen_in_bash(tmp_path, cmd)) <= set().union(*_seen_by_reader(cmd)), cmd
+    for cmd in ('IFS=; a=(.cl au de); touch "${a[*]}"', 'a=(.cl au de); IFS=; touch "${a[*]}"',
+                'IFS=-; a=(.cl aude); touch "${a[*]}"', 'a=(x .claude); touch "y${a[@]}"',
+                'a=(.claude x); touch "${a[@]}y"', 'a=(.claude x); touch y${a[*]}',
+                'IFS=; a=(.cl aude); x=${a[*]}; touch "$x"', 'a=(.cl aude); IFS=; x="${a[@]}"; touch "$x"',
+                # the arguments, and an array that is not known: what they are joined at is named nowhere
+                'IFS=; set -- .cl aude; touch "$*"', 'f() { IFS=; touch "$*"; }; f .cl aude',
+                'IFS=; a=($(cat list)); touch "${a[*]}"'):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ('IFS=; a=(.claude); touch ${a[*]}', 'a=(.claude); touch "${a[*]}"', 'a=(.claude x); touch "${a[@]}"'):
+        assert ".claude" in _reason(guard, cmd), cmd
+    # joined at a space, two elements hold one, and no path does
+    for cmd in ('a=(x y); touch "${a[@]}"', 'a=(x y); echo "files: ${a[*]}"', 'a=(x y); msg="${a[*]}"; touch notes',
+                'files=(a b); for f in "${files[@]}"; do touch "$f.log"; done', 'touch "$@"', 'echo "$*" > notes'):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_a_read_splits_at_the_characters_it_is_given(guard, tmp_path):
+    """#74 (comment on 45e8045): the words of what a command may read were cut only where a
+    character is not part of a file name. IFS may hold one: `IFS=x read a b <<< notesx.claude`
+    gives b .claude, which no text in the command names. Now every character of a file name that
+    a read splits at (IFS as it runs, read -d, mapfile -d), or a value not known is split at, cuts
+    the texts of the command too, and what follows each cut is a word as well (read gives its last
+    variable the rest of the line). Where they are not known, the command cannot be read."""
+    assert _seen_in_bash(tmp_path, 'IFS=x read a b <<< "notesx.claude"; seen "$b"') == {(".claude",)}
+    assert _seen_in_bash(tmp_path, 'IFS=. read a b <<< "a..claude"; seen "$b"') == {(".claude",)}
+    for cmd in ('IFS=x read a b <<< "notesx.claude"; touch "$b"',
+                'IFS=x; printf "%s\\n" "notesx.claude" | while read a b; do touch "$b"; done',
+                'IFS=. read a b <<< "a..claude"; touch "$b"', 'read -d x a <<< ".claudexnotes"; touch "$a"',
+                'mapfile -t -d x a <<< "notesx.claude"; touch "${a[1]}"', 'IFS=x; touch $(echo notesx.claude)'):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ('IFS=$(printf x) read a b <<< "notesx.claude"; touch "$b"', 'read -d "$d" a <<< x; touch "$a"'):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ("IFS=: read a b <<< 'x:y'; touch \"$b\"", 'while IFS= read -r l; do touch "$l"; done < list.txt',
+                'IFS=. read -r major minor <<< "1.2"; touch "v$major"', 'IFS=- read -ra parts <<< "a-b"; touch "${parts[0]}"'):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_the_root_a_read_or_a_split_gives_is_a_path_the_command_names(guard, tmp_path):
+    """#74 (comment on dfcb6de): _pieces left out a word of only slashes, which in a text is
+    division or syntax far more often than the root. But where a read or a split ends a word on
+    each side of it, it is the root: `IFS=x read a b <<< notesx/` gives b /, and tar -C "$b"
+    extracts there. Now it is a path the command names where each side of it is the start or the
+    end of the text or a character the command splits at (Command.breaks), past the spaces and
+    tabs read takes off. A read into one name splits at no space: `read a <<< 'x / y'` gives none.
+    The same was missed, on main too, for the words a value not known is split into at the
+    spaces of IFS (`touch $(echo '.claude x')`), and for what printf and echo -e print of a
+    backslash escape (`printf 'x\\n.claude\\n' | while read a`)."""
+    for cmd in ('IFS=x read a b <<< notesx/; seen "$b"', 'read -d x a <<< /xrest; seen "$a"',
+                "read a b <<< 'notes /'; seen \"$b\"", "IFS=: read a b <<< 'notes:/'; seen \"$b\"",
+                'IFS=x read a <<< /x; seen "$a"', "read a <<< ' / '; seen \"$a\"",
+                "printf 'notes\\n/\\n' | while read a; do seen \"$a\"; done", "seen $(echo '/ notes')"):
+        assert "/" in set().union(*_seen_in_bash(tmp_path, cmd)), cmd
+    for cmd in ("seen $(echo '.claude x')", "printf 'x\\n.claude\\n' | while read a; do seen \"$a\"; done",
+                "echo -e 'x\\n.claude' | while read a; do seen \"$a\"; done",
+                "printf '\\056claude\\n' | while read a; do seen \"$a\"; done"):
+        assert ".claude" in set().union(*_seen_in_bash(tmp_path, cmd)), cmd
+    assert _seen_in_bash(tmp_path, "read a <<< 'x / y'; seen \"$a\"") == {("x / y",)}
+    for cmd in ('IFS=x read a b <<< notesx/; tar -xf fixture.tar -C "$b"',
+                'read -d x a <<< /xrest; tar -xf fixture.tar -C "$a"',
+                'IFS=x read a b <<< notesx/; touch "$b"', 'read -d x a <<< /xrest; touch "$a"',
+                "read a b <<< 'notes /'; touch \"$b\"", "IFS=: read a b <<< 'notes:/'; touch \"$b\"",
+                'IFS=x read a <<< /x; touch "$a"', "read a <<< ' / '; touch \"$a\"",
+                "printf 'notes\\n/\\n' | while read a; do touch \"$a\"; done", "touch $(echo '/ notes')",
+                'IFS=x read a b <<< notesx//; touch "$b"', 'mapfile -t -d x a <<< notesx/; touch "${a[1]}"',
+                "read -a a <<< 'x /'; touch \"${a[1]}\"", "read -d , a <<< '/,x'; touch \"$a\"",
+                "echo 'notes /' | while read a b; do touch \"$b\"; done", "IFS=x; touch $(echo /xnotes)",
+                "msg='a / b'; read x y z <<< \"$msg\"; touch \"$y\"", "read a <<< 'x / y'; touch $a",
+                "while read a b; do touch \"$b\"; done <<END\nnotes /\nEND"):
+        assert "names /," in _reason(guard, cmd), cmd
+    for cmd in ("touch $(echo '.claude x')", "printf 'x\\n.claude\\n' | while read a; do touch \"$a\"; done",
+                "echo -e 'x\\n.claude' | while read a; do touch \"$a\"; done",
+                "printf '\\056claude\\n' | while read a; do touch \"$a\"; done"):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("read a <<< 'x / y'; touch \"$a\"", "msg='a / b'; touch \"$out\"",
+                "find . -name '*.txt' | while read f; do sed -i 's|/|-|g' \"$f\"; done",
+                "find . -name '*.txt' | while read f; do echo \"$f / $n\"; mv \"$f\" done/; done",
+                "awk '{print $1 / $2}' data | while read r; do touch \"$r.out\"; done",
+                "printf 'a\\tb\\n' | while read x y; do touch \"$x\"; done"):
+        assert _reason(guard, cmd) == "", cmd
+
+
+def test_what_a_command_prints_is_read_as_bash_prints_it(guard, tmp_path):
+    """#74 (comment on 83ec9cf): in a %b argument and in echo -e, \\c ends all output, so
+    `read a < <(printf "%b" "/\\cfoo")` gives a /, and neither the text nor what _printed made of
+    it ended there. The same class, also on main: no shell value holds a NUL (`.cl\\0aude` is
+    .claude); read without -r takes a backslash off (`\\/` is /); read -n and -N take part of a
+    line; and printf's format joins and cuts its arguments (`%s%s`, `%.7s`, `%c`), also into a
+    variable (-v) or $(...), which takes the line breaks off the end. Now what printf prints is
+    worked out as bash prints it (_printf), and what a variable may be given of printed text
+    (_received) is a path the command names, whole and in words. read -n and -N cannot be read."""
+    quote = lambda args: " ".join("'" + a.replace("'", "'\\''") + "'" for a in args)  # noqa: E731
+    for args in (["%s%s\\n", ".cl", "aude"], ["%.7s", ".claudeX"], ["%c%c", "/x", ".y"], ["%5.1s|", "/x"],
+                 ["%-3s|", "/"], ["%b", "\\0056claude"], ["%b", "\\101"], ["%b%s", "/\\c", "x"], ["a%sb", "x", "y", "z"],
+                 ["%d|%s", "x", "/"], ["%x|%o|%#o|%i|%05.1f", "255", "8", "8", "010", "2.25"], ["%q|", "a b"],
+                 ["\\057"], ["%%s"], ["%*s|", "3", "/"], ["%.*s|", "1", "/x"], ["%s\\c|", "/", "x"], ["%z|", "x"],
+                 ["-v", "v", "%s"], ["--", "%s", "/"]):
+        assert _seen_in_bash(tmp_path, f'seen "$(printf {quote(args)})"') == \
+            {(shell._printf(args)[0].rstrip("\n"),)}, args
+    for cmd, given in (('read a < <(printf "%b" "/\\cfoo"); seen "$a"', "/"),
+                       ('read a < <(echo -e "/\\cfoo"); seen "$a"', "/"),
+                       ("read a < <(printf '%b' '/\\\\cfoo'); seen \"$a\"", "/cfoo"),
+                       ("read a < <(echo -e '/\\\\cfoo'); seen \"$a\"", "/cfoo"),
+                       ("printf '.cl\\0aude\\n' | { read a; seen \"$a\"; }", ".claude"),
+                       ("read a <<< '.cl\\aude'; seen \"$a\"", ".claude"), ("read a <<< '\\/'; seen \"$a\"", "/"),
+                       ("read -N 7 a <<< .claudeX; seen \"$a\"", ".claude"), ("seen \"$(printf '/\\0x')\"", "/x")):
+        assert _seen_in_bash(tmp_path, cmd) == {(given,)}, cmd
+    for cmd in ('read a < <(printf "%b" "/\\cfoo"); tar -xf fixture.tar -C "$a"',
+                'read a < <(echo -e "/\\cfoo"); tar -xf fixture.tar -C "$a"',
+                'read a < <(printf "%b" "/\\cfoo"); touch "$a"', "touch \"$(printf '%b' '/\\cfoo')\"",
+                "touch \"$(printf '%c' /x)\"", "touch \"$(echo -e '/\\n\\n')\"", "touch \"$(printf '\\057')\"",
+                "printf '%b x\\n' '/\\c' | { read a; touch \"$a\"; }", "read a <<< '\\/'; touch \"$a\"",
+                "printf '/\\0x' | { read -d '' a; touch \"$a\"; }"):
+        assert "names /," in _reason(guard, cmd), cmd
+    for cmd in ("printf -v x '%s%s' .cl aude; touch \"$x\"", "touch \"$(printf '%.7s' .claudeX)\"",
+                "printf '%s%s\\n' .cl aude | while read a; do touch \"$a\"; done", "touch \"$(printf '.cl\\0aude')\"",
+                "printf '.cl\\0aude\\n' | { read a; touch \"$a\"; }", "read a <<< '.cl\\aude'; touch \"$a\""):
+        assert ".claude" in _reason(guard, cmd), cmd
+    for cmd in ("read -n 1 a <<< /x; touch \"$a\"", "read -N 7 a <<< .claudeX; touch \"$a\""):
+        assert "could not be read" in _reason(guard, cmd), cmd
+    for cmd in ("read a < <(printf '%b' '/\\\\cfoo'); tar -xf fixture.tar -C \"$a\"",
+                "read a < <(echo -e '/\\\\cfoo'); tar -xf fixture.tar -C \"$a\"",
+                "read -r a < <(printf '%s\\n' 'x\\/'); touch \"$a\"", "touch \"$(printf '/\\0x')\"",
+                "find . -print0 | while IFS= read -r -d '' f; do touch \"$f.bak\"; done",
+                "touch \"$(printf '%s.log' notes)\"", "for f in *.md; do printf '%-20s %5d\\n' \"$f\" 3; done; touch \"$out\""):
+        assert _reason(guard, cmd) == "", cmd

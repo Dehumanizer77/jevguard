@@ -15,6 +15,7 @@ import math
 import os
 import re
 import shlex
+import time
 
 _REDIRECT_CHARS = set("<>&|")
 # Programs that only run another program: the command after them is what counts. For each, the
@@ -30,10 +31,10 @@ _TAKES_COMMAND = _SHELLS | {"su", "script"}
 # Programs that take their program from stdin when they are given none: through a pipe, that is
 # what the command before them prints.
 _INTERPRETER = re.compile(r"(?:python|pypy|perl|ruby|node|nodejs|php|lua|tclsh|Rscript)[\d.]*")
-_ASSIGN = re.compile(r"([A-Za-z_]\w*)=(.*)", re.S)
-_VAR = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+_ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.S)
+_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 # \0 is a $ quoted against expansion (_LITERAL): text, which a shell may expand later (_wider)
-_LITERAL_VAR = re.compile(r"\0(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+_LITERAL_VAR = re.compile(r"\0(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 _SINGLE_QUOTED = re.compile(r"'[^']*'")
 # Which files these read is decided when they run: substitution, xargs, find, eval, sourced files.
 _DYNAMIC = re.compile(r"\$\(|`|<\(|(?:^|[\s;|&(])(?:xargs|eval|source|find)\s|(?:^|[;|&(])\s*\.\s+\S")
@@ -121,6 +122,9 @@ class Command:
         self.program_carried: list[set[str]] = []
         self.assigned: list[str] = []        # the names of the variables it sets, in turn
         self.piping = False                  # a program in it is given its input through a pipe
+        # the characters that read, or the splitting of a value not known, may end a word at
+        # (IFS, read -d x, a line break): words of its texts cut there are paths it names (_pieces)
+        self.breaks: set[str] = set()
         self.writes: set[str] = set()        # canonical targets of > >> &> redirections
         self.dirs: list[str] = [canonical(cwd)] if cwd else []  # the starting directory and every `cd` target
         self.paths: set[str] = set()         # canonical paths the command names
@@ -338,7 +342,7 @@ def _heredoc(cmd: str, i: int, strip: bool, marker: str, quoted: bool) -> tuple[
     raise ValueError("a here-document that no line ends")
 
 
-_PARAMETER = re.compile(r"\$(?:[A-Za-z_]\w*|[0-9@*#?$!-])")
+_PARAMETER = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
 
 
 def _expanded(text: str) -> str:
@@ -664,12 +668,12 @@ _SHELL_OPS = sorted({"&&", "||", ";;&", ";;", ";&", "|&", ";", "&", "|", "(", ")
                      "<>", "<&", ">&", ">>", ">|", "&>>", "&>", "<", ">"}, key=len, reverse=True)
 # Those that join or end commands. The others are redirections, and part of the command they are in.
 _LIST_OPS = {"&&", "||", ";;&", ";;", ";&", "|&", ";", "&", "|", "(", ")"}
-_FD = re.compile(r"\d+|\{[A-Za-z_]\w*\}")              # 2>, {fd}>: the descriptor a redirection is for
+_FD = re.compile(r"\d+|\{[A-Za-z_][A-Za-z0-9_]*\}")              # 2>, {fd}>: the descriptor a redirection is for
 _REDIRECTION = re.compile(r"[<>&]*[<>][<>&|]*")
-_ARRAY = re.compile(r"[A-Za-z_]\w*\+?=")                 # NAME=( ... ), NAME+=( ... )
+_ARRAY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")                 # NAME=( ... ), NAME+=( ... )
 # An assignment as written: its name, any [index] and the = outside quotes. `'p=x'` and `p\=x` are programs.
-_ASSIGN_WORD = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
-_ASSIGN_PARTS = re.compile(r"([A-Za-z_]\w*)(\[[^\]]*\])?(\+?)=(.*)", re.S)
+_ASSIGN_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+_ASSIGN_PARTS = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+?)=(.*)", re.S)
 
 
 class _Token(str):
@@ -681,6 +685,8 @@ class _Token(str):
     plain = False  # nothing in it is quoted or escaped: if it is a reserved word, it is one
     raw = ""       # as written; empty where that cannot be told
     array = None   # NAME=( ... ): the words in the brackets
+    bare: frozenset = frozenset()  # where in it a $ stands outside quotes: what it expands to is split (_fields)
+    muddled = False  # a quote or a backslash inside a ${...}: _unquote has taken away what it quoted there
 
 
 def _token(text: str, raw: str, **how) -> _Token:
@@ -690,9 +696,10 @@ def _token(text: str, raw: str, **how) -> _Token:
     return token
 
 
-def _unquote(raw: str) -> str:
+def _unquote(raw: str, bare: list[int] | None = None) -> str:
     """A word as the shell has it once its quotes are taken away. A $ that was quoted or escaped
-    against expansion is _LITERAL: `\\$p` and `"\\$p"` are the text $p, as '$p' is."""
+    against expansion is _LITERAL: `\\$p` and `"\\$p"` are the text $p, as '$p' is. bare: where
+    in the result a $ stands that was in no quotes, whose expansion the shell splits (#74)."""
     out, i = [], 0
     while i < len(raw):
         ch = raw[i]
@@ -713,13 +720,33 @@ def _unquote(raw: str) -> str:
                     out.append(_LITERAL if nxt == "$" else "" if nxt == "\n" else nxt)
                     i += 2
                 else:
-                    out.append(raw[i])
-                    i += 1
+                    i = _unquoted_char(raw, i, out)
             i += 1
         else:
-            out.append(ch)
-            i += 1
+            if ch == "$" and bare is not None:
+                bare.append(sum(map(len, out)))
+            i = _unquoted_char(raw, i, out)
     return "".join(out)
+
+
+def _unquoted_char(raw: str, i: int, out: list[str]) -> int:
+    """The character at i, put on out, and where the next one is. A $NAME that a quote or a
+    backslash ends, and that a character of a name follows once they are gone, is put as ${NAME}:
+    else `"$p"de` and `$p''de` would be $pde, a variable of another name (#74)."""
+    name = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)['\"\\]+[A-Za-z0-9_]", raw[i:])
+    if name:
+        name = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)", raw[i:])
+        out.append("${" + name.group(1) + "}")
+        return i + name.end()
+    out.append(raw[i])
+    return i + 1
+
+
+def _bare_token(raw: str, **how) -> _Token:
+    """A word as _unquote has it, with where its $ outside quotes are (_Token.bare)."""
+    bare: list[int] = []
+    return _token(_unquote(raw, bare), raw, bare=frozenset(bare),
+                  muddled=bool(re.search(r"\$\{[^}]*[\\'\"]", raw)), **how)
 
 
 def _array(text: str, i: int) -> tuple[list[str], int]:
@@ -739,7 +766,7 @@ def _array(text: str, i: int) -> tuple[list[str], int]:
             end = _word_end(text, i)
             if end < 0:
                 break
-            words.append(_unquote(text[i:end]))
+            words.append(_bare_token(text[i:end]))
             i = end
     raise ValueError("an array that cannot be read")
 
@@ -776,7 +803,7 @@ def _tokens(text: str) -> list[_Token]:
                 words, end = _array(text, end + 1)
                 out.append(_token(raw, raw, array=words))
             else:
-                out.append(_token(_unquote(raw), raw, plain=not re.search(r"[\\'\"]", raw)))
+                out.append(_bare_token(raw, plain=not re.search(r"[\\'\"]", raw)))
             i = end
     return out
 
@@ -888,8 +915,9 @@ def _unknown(env: dict) -> dict:
     """What the variables may hold after something runs in this shell that may set any of them
     to anything, and that this cannot follow: a builtin whose name is made at run time, a
     sourced file, arithmetic on a value that is not known. Each may still hold what it held, or
-    a value that is not known; functions too."""
-    return {name: _merge(_values(env, name), (None,)) for name in {*env, *os.environ}}
+    a value that is not known; functions too. IFS as well, though neither set it: what the shell
+    splits words at is then not known (_fields)."""
+    return {name: _merge(_values(env, name), (None,)) for name in {*env, *os.environ, "IFS"}}
 
 
 def _cleared(env: dict) -> dict:
@@ -897,9 +925,11 @@ def _cleared(env: dict) -> dict:
     return {name: (None,) for name in {*env, *os.environ}}
 
 
-# $NAME, ${NAME}, and ${NAME} with an operator after the name: ${p:-x}, ${p%/*}, ${p//a/b}, ${p:1:2}
-_EXPANSION = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|\{([A-Za-z_]\w*)"
-                        r"(:?[-=+?]|##?|%%?|/[/#%]?|\^\^?|,,?|:)([^{}]*)\})")
+# $NAME, ${NAME}, and ${NAME} with an operator after the name: ${p:-x}, ${p%/*}, ${p//a/b}, ${p:1:2},
+# and a ${...} in the word after it: ${p:=${q:-x}}. A subscript, ${a[@]}, stands for each value.
+_EXPANSION = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]{}]*\])?\}|([A-Za-z_][A-Za-z0-9_]*)"
+                        r"|\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]{}]*\])?"
+                        r"(:?[-=+?]|##?|%%?|/[/#%]?|\^\^?|,,?|:)((?:[^{}]|\$\{[^{}]*\})*)\})")
 
 
 _LEFT = re.compile(r"\$(?=\{|[0-9@*#?$!-])")
@@ -908,8 +938,8 @@ _LEFT = re.compile(r"\$(?=\{|[0-9@*#?$!-])")
 _UNSET = object()
 
 
-_ARITHMETIC_SETS = re.compile(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?(?:<<|>>|[-+*/%&^|])?=(?!=)"
-                              r"|(?:\+\+|--)\s*([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)?(?:\+\+|--)")
+_ARITHMETIC_SETS = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?(?:<<|>>|[-+*/%&^|])?=(?!=)"
+                              r"|(?:\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?(?:\+\+|--)")
 _NUMBER = re.compile(r"\s*[-+]?\d*\s*")
 
 
@@ -924,7 +954,7 @@ def _arithmetic(text: str, env: dict) -> dict:
     for reading, in _readings([text], env):
         if re.search(r"[$`\x00]", reading):
             return _unknown(env)
-        names = set(re.findall(r"[A-Za-z_]\w*", re.sub(r"\b\d[\w#@]*", "", reading)))
+        names = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", re.sub(r"\b\d[\w#@]*", "", reading)))
         if any(v is None or not _NUMBER.fullmatch(v) for name in names for v in _values(env, name)):
             return _unknown(env)
         assigned |= {a or b or c for a, b, c in _ARITHMETIC_SETS.findall(reading)}
@@ -947,7 +977,7 @@ def _assigned(word: str, env: dict, runs: list[str]) -> dict:
         while end < len(word) and (depth or word[end] != "}"):
             depth += 1 if word.startswith("${", end) else -1 if word[end] == "}" else 0
             end += 1
-        m = re.fullmatch(r"(!?)([A-Za-z_]\w*)(?:\[([^\]]*)\])?(.*)", word[i + 2:end], re.S)
+        m = re.fullmatch(r"(!?)([A-Za-z_][A-Za-z0-9_]*)(?:\[([^\]]*)\])?(.*)", word[i + 2:end], re.S)
         if m:
             bang, name, index, rest = m.groups()
             if index and index not in ("@", "*"):
@@ -958,7 +988,7 @@ def _assigned(word: str, env: dict, runs: list[str]) -> dict:
             if given and bang:
                 return _unknown(env)
             if given:
-                values = tuple(r[0] for r in _readings([given.group(1)], env))
+                values = tuple(r[0] for r in _readings([given.group(1)], env, split=False))
                 if re.search(r"['\"\\{}" + _LITERAL + "]", re.sub(r"\$\{[^{}]*\}", "", given.group(1))):
                     values += (None,)
                 env = {**env, name: _merge(_values(env, name), values)}
@@ -982,60 +1012,121 @@ def _builtin(argv: list[str]) -> list[str]:
     return argv
 
 
-def _param(value: str | None, op: str, arg: str) -> str | None:
-    """What ${NAME<op><arg>} gives for a NAME that holds value (None: not set), or None where
-    that cannot be told: the word then stays as it is written, and counts as fed from elsewhere."""
-    if re.search(r"[$`\\'\"" + _LITERAL + _MARK + "]", arg):
-        return None
+def _param(value: str | None, op: str, arg, ampersand: bool = True) -> str | None:
+    """What ${NAME<op><arg>} gives for a NAME that holds value (None: not set); for ${p/x/y} arg is
+    (x, y), each with the variables in it put in. None where the result is what NAME or arg holds
+    and that is not known: the word then stays as it is written, and counts as fed from
+    elsewhere. Where the result is a part or a change of a known value, which the command names
+    nowhere else, only bash's own result will do (#75, #81-#83). This works it out for the forms
+    whose result is plain, as checked against bash: a prefix or suffix taken off by a pattern of
+    *, ? and other characters; a replacement of text without any of those; a case change of all
+    or the first character; an offset and a length in decimals. For any other the command cannot
+    be read. All only on ASCII text, past which bash's offsets and case changes depend on the
+    locale. ampersand: a & in the replacement is the text that matched, as bash 5.2 has it with
+    patsub_replacement on, its default; else a &."""
     unset = value is None
     null = unset or value == ""
-    if op in ("-", "="):
-        return arg if unset else value
-    if op in (":-", ":="):
-        return arg if null else value
-    if op in ("+", ":+"):
-        return "" if (unset if op == "+" else null) else arg
-    if unset or op in ("?", ":?"):
-        return value
-    if op in ("#", "##"):  # the shortest or longest start that matches, taken off
-        for k in range(len(value) + 1) if op == "#" else range(len(value), -1, -1):
-            if fnmatch.fnmatchcase(value[:k], arg):
-                return value[k:]
-        return value
-    if op in ("%", "%%"):  # the shortest or longest end
-        for k in range(len(value), -1, -1) if op == "%" else range(len(value) + 1):
-            if fnmatch.fnmatchcase(value[k:], arg):
-                return value[:k]
-        return value
-    if op[0] == "/":
-        pattern, _, put = arg.partition("/")
+    if op in ("-", "=", ":-", ":=", "+", ":+"):
+        given = unset if op in ("-", "=", "+") else null
+        if op[-1] in "-=" and not given:
+            return value
+        if op[-1] == "+" and given:
+            return ""
+        return None if re.search(_UNREAD, arg) else arg
+    if unset or op in ("?", ":?") or _OPAQUE in value:
+        return None if unset or _OPAQUE in value else value
+    words = arg if isinstance(arg, tuple) else (arg,)
+    if not value.isascii() or any(re.search(_UNREAD, w) or not w.isascii() for w in words):
+        raise ValueError("a ${...} whose result cannot be told")
+    if op in ("#", "##", "%", "%%"):  # the shortest or longest start or end that matches, taken off
+        rx = _pattern(arg)
+        if op[0] == "#":
+            ks = range(len(value) + 1) if op == "#" else range(len(value), -1, -1)
+            return next((value[k:] for k in ks if re.fullmatch(rx, value[:k], re.S)), value)
+        ks = range(len(value), -1, -1) if op == "%" else range(len(value) + 1)
+        return next((value[:k] for k in ks if re.fullmatch(rx, value[k:], re.S)), value)
+    if op[0] == "/":  # text without *, ? or [: where it first stands, at the start, at the end, or each
+        pattern, put = arg
+        if re.search(r"[*?\[]", pattern):
+            raise ValueError("a ${.../.../...} pattern whose matches this does not work out")
+        put = put.replace("&", pattern) if ampersand else put
+        if op == "/#":
+            return put + value[len(pattern):] if value.startswith(pattern) else value
+        if op == "/%":
+            return value[:len(value) - len(pattern)] + put if value.endswith(pattern) else value
         if not pattern:
             return value
-        rx = fnmatch.translate(pattern)[:-2]  # (?s:...) without its \Z
-        if op == "/#":
-            rx = "^" + rx
-        elif op == "/%":
-            rx = rx + "$"
-        return re.sub(rx, put.replace("\\", "\\\\"), value, count=0 if op == "//" else 1)
+        return value.replace(pattern, put, -1 if op == "//" else 1)
     if op in ("^", "^^", ",", ",,"):
         if arg:
-            return None
+            raise ValueError("a ${...} case change of the characters a pattern matches")
         case = str.upper if op[0] == "^" else str.lower
         return case(value) if len(op) == 2 else case(value[:1]) + value[1:]
-    if op == ":":  # ${p:offset} and ${p:offset:length}
-        m = re.fullmatch(r"\s*\(?\s*(-?\d+)\s*\)?\s*(?::\s*(-?\d+)\s*)?", arg)
+    if op == ":":  # ${p:offset} and ${p:offset:length}, as decimals: 010 is eight to bash (#83)
+        number = r"\s*(?:\(\s*)?(-?(?:0|[1-9]\d*))\s*(?:\)\s*)?"
+        m = re.fullmatch(number + r"(?::" + number + r")?", arg)
         if not m:
-            return None
+            raise ValueError("a ${...} offset that is not a decimal")
         start = int(m.group(1))
-        start = max(len(value) + start, 0) if start < 0 else start
+        if start < 0:
+            start += len(value)
+            if start < 0:  # further back than the start: nothing
+                return ""
         if m.group(2) is None:
             return value[start:]
         length = int(m.group(2))
-        return value[start:start + length] if length >= 0 else value[start:len(value) + length]
-    return None
+        end = start + length if length >= 0 else len(value) + length
+        if end < start:  # bash: substring expression < 0, and nothing after it runs
+            raise ValueError("a ${...} length bash refuses")
+        return value[start:end]
+    raise ValueError("a ${...} whose result cannot be told")
 
 
-def _readings(words: list[str], env: dict, envs: list[dict] | None = None) -> list[list[str]]:
+# What the word of a ${p<op>word} holds that this cannot read: a $ not put in, a quote, a
+# backslash, a command's output.
+_UNREAD = r"[$`\\'\"" + _LITERAL + _MARK + _OPAQUE + "]"
+
+
+def _pattern(pattern: str) -> str:
+    """bash's pattern of *, ? and other characters as a regular expression. A [...] and an
+    extended glob (@(...) and the like, which shopt extglob turns on) the command cannot be read
+    with."""
+    if re.search(r"\[|[?*+@!]\(", pattern):
+        raise ValueError("a pattern with a [...] or what may be an extended glob")
+    return "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
+
+
+# ${a[@]}, ${a[*]}, ${!a[@]}, and the arguments: $@, $*, ${@...}, ${*...}
+_ELEMENTS = re.compile(r"\$\{!?([A-Za-z_][A-Za-z0-9_]*)\[([@*])\]|\$\{?([@*])")
+
+
+def _elements(word: str, env: dict, bare: frozenset, apart: bool) -> None:
+    """Raises where the elements of an array or the arguments are put in in a way this does not
+    read (#86). In a word that is one of a command's (apart), "${a[@]}" and ${a[*]} make each
+    element a word of its own: _readings reads each value a may hold, which is right where the
+    expansion is the whole word. Beside other text only the first and the last element take it
+    (`a=(x .claude); touch "y${a[@]}"` touches yx and .claude). Quoted ${a[*]}, and any of them
+    where the shell makes no words (an assignment, [[ ]], case, a redirection), is one word: the
+    elements joined at the first character of IFS, which makes a path of pieces that each name
+    nothing (`IFS=; a=(.cl aude); touch "${a[*]}"` touches .claude). That this reads only where IFS
+    begins with a space, a tab or a newline: two elements joined then hold one, and no path does.
+    For the arguments and an array that is not known it holds as well: what they are joined at
+    is not named anywhere in the command."""
+    for m in _ELEMENTS.finditer(word):
+        joined = not apart or ("*" in (m.group(2) or m.group(3)) and m.start() not in bare)
+        if joined:
+            if not all(ifs is not None and ifs[:1] in (" ", "\t", "\n") for ifs in _ifs(env)):
+                raise ValueError("elements joined at a character that is not a space (IFS)")
+            continue
+        known = m.group(1) and not word.startswith("${!", m.start()) and \
+            any(v is not None and _OPAQUE not in v for v in _values(env, m.group(1)))
+        whole = _EXPANSION.match(word, m.start())
+        if known and not (m.start() == 0 and whole and whole.end() == len(word)):
+            raise ValueError("the elements of an array put in beside other text")
+
+
+def _readings(words: list[str], env: dict, envs: list[dict] | None = None, split: bool = True,
+              breaks: set[str] | None = None) -> list[list[str]]:
     """The words with the values of their variables put in, once for each combination of the
     values they may hold; envs gives each word an env of its own. Past _READINGS what the command
     is given cannot be told. A $ in single quotes (_LITERAL) is not filled in: it is text, and a
@@ -1044,39 +1135,326 @@ def _readings(words: list[str], env: dict, envs: list[dict] | None = None) -> li
     A value that is not known stays as it is written, with _OPAQUE after its $, and so does the
     output of a command: the word is fed from elsewhere, and a shell that reads it later does not
     take it for its own variable (#63). Such a word is fed whatever the others hold, so a variable
-    that may hold one is read so once, beside the combinations of the values that are known."""
+    that may hold one is read so once, beside the combinations of the values that are known.
+
+    A known value put in where the $ was in no quotes is split at the characters of IFS, as the
+    shell splits it (_fields, #74): `p='.claude notes'; rm -rf $p` removes .claude. Not where the
+    shell does not split (split=False: case WORD, [[ ]], the value of an assignment), in the word
+    of a redirection, nor in an assignment to export and the like. And where a replacement has a &
+    in it, once as bash 5.2 reads it, the text the pattern matched, and once as older shells do
+    (#75). The elements of an array, and the arguments, as _elements says (#86).
+
+    breaks: where given, the characters of IFS where a word has something in no quotes the shell
+    splits are added to it: a value not known is cut there (Command.breaks)."""
     envs = envs or [env] * len(words)
+    declaring = bool(words) and str(words[0]) in _DECLARE
+    splits = []
+    for k, word in enumerate(words):
+        before = words[k - 1] if k else ""
+        apart = split and not (getattr(before, "op", False) and _REDIRECTION.fullmatch(before)) and \
+            not (declaring and _ASSIGN_WORD.match(word))
+        splits.append(getattr(word, "bare", frozenset()) if apart else frozenset())
+        _elements(word, envs[k], splits[-1], apart)
+        if breaks is not None and (splits[-1] or apart and _RUN.search(word)):
+            breaks.update(ch for ifs in _ifs(envs[k]) for ch in ifs or "")
     held: dict[tuple, tuple] = {}
-    for word, e in zip(words, envs):
+    for word, e, bare in zip(words, envs, splits):
         for m in _EXPANSION.finditer(word):
             name = m.group(1) or m.group(2) or m.group(3)
             key = (id(e), name)
             held.setdefault(key, _values(e, name))
             if m.group(4) and None in held[key] and _UNSET not in held[key]:
                 held[key] += (_UNSET,)  # ${p:-x} on what may not be known: read as unknown, and as not set
+            for inner in _EXPANSION.finditer(m.group(5) or ""):  # ${p#$q}, ${p:=${q:-x}}: q is expanded first
+                name = inner.group(1) or inner.group(2) or inner.group(3)
+                held.setdefault((id(e), name), _values(e, name))
+                if inner.group(4) and None in held[(id(e), name)] and _UNSET not in held[(id(e), name)]:
+                    held[(id(e), name)] += (_UNSET,)
+            if m.start() in bare:
+                held.setdefault((id(e), _IFS), _ifs(e))
     keys = list(held)
     known = [tuple(v for v in held[k] if v is not None) or (None,) for k in keys]
-    if math.prod(len(c) for c in known) > _READINGS:
+    patsub = (True, False) if any(m.group(4) and m.group(4)[0] == "/" and re.search(r"[&$]", m.group(5))
+                                  for word in words for m in _EXPANSION.finditer(word)) else (True,)
+    if math.prod(len(c) for c in known) * len(patsub) > _READINGS:
         raise ValueError("variables that may hold more values than can be read")
     combinations = list(itertools.product(*known))
     if any(None in held[k] and c[0] is not None for k, c in zip(keys, known)):
         combinations.append(tuple(None if None in held[k] else c[0] for k, c in zip(keys, known)))
         combinations.sort(key=lambda c: [held[k].index(v) for k, v in zip(keys, c)])  # as the values come
     readings = []
-    for combination in combinations:
+    for combination, ampersand in itertools.product(combinations, patsub):
         value = dict(zip(keys, combination))
         reading = []
-        for word, e in zip(words, envs):
-            def put(m: re.Match, e=e) -> str:
+        for word, e, bare in zip(words, envs, splits):
+            def inner(text: str, e=e) -> str:  # the word of a ${p<op>word}, with what is in it put in, unsplit
+                return _EXPANSION.sub(lambda m: put(m, e, frozenset()), text)
+
+            def put(m: re.Match, e=e, bare=bare) -> str:
                 v = value[(id(e), m.group(1) or m.group(2) or m.group(3))]
                 if m.group(4):
-                    v = None if v is None else _param(None if v is _UNSET else v, m.group(4), m.group(5))
-                return "$" + _OPAQUE + m.group(0)[1:] if v is None or v is _UNSET else v
+                    if v is not None and v is not _UNSET and _OPAQUE not in v and getattr(word, "muddled", False) and \
+                            m.group(4).lstrip(":") not in ("-", "=", "+", "?"):
+                        raise ValueError("a ${...} whose pattern is quoted in a way this cannot see")
+                    if m.group(4)[0] == "/":  # where the pattern ends is in the word as written (#81)
+                        cut = re.match(r"(?:[^/$]|\$\{[^{}]*\}|\$(?!\{))*", m.group(5)).end()
+                        arg = (inner(m.group(5)[:cut]), inner(m.group(5)[cut + 1:]))
+                    else:
+                        arg = inner(m.group(5))
+                    if m.group(4) == ":" and "[" in m.group(0).partition(":")[0] and v is not None and v is not _UNSET:
+                        raise ValueError("a slice of an array")  # ${a[@]:1} takes elements, not characters
+                    v = None if v is None else _param(None if v is _UNSET else v, m.group(4), arg, ampersand)
+                if v is None or v is _UNSET:
+                    return "$" + _OPAQUE + m.group(0)[1:]
+                return _FIELD + v + _FIELD_END if m.start() in bare else v
             # after _EXPANSION: `$` and what follows the mark is no name. What is left that the
             # shell expands here (${!p}, ${p@Q}, $1) is not known either.
-            reading.append(_LEFT.sub("$" + _OPAQUE, _RUN.sub(_OPAQUE, _EXPANSION.sub(put, word))))
+            spans = [m.span() for m in _EXPANSION.finditer(word)]
+            for left in re.finditer(r"\$\{!?([A-Za-z_][A-Za-z0-9_]*)", word):
+                if any(a <= left.start() < b for a, b in spans):
+                    continue  # one this reads, or a ${...} in its word
+                if any(v is not None and _OPAQUE not in v for v in _values(e, left.group(1))):
+                    # ${!p}, ${p@L}, ${p:-${q}} of a known value: what it gives is named nowhere else
+                    raise ValueError("a ${...} of a known value that this does not work out")
+            text = _LEFT.sub("$" + _OPAQUE, _RUN.sub(_OPAQUE, _EXPANSION.sub(put, word)))
+            if _FIELD in text:
+                reading.extend(_fields(text, value[(id(e), _IFS)], not getattr(word, "plain", True)))
+            else:
+                reading.append(text)
         readings.append(reading)
     return readings
+
+
+# Around a value put in where its $ was in no quotes, until the word is split (_fields).
+_FIELD, _FIELD_END = "\x03", "\x04"
+_IFS = "\0IFS"  # the key under which _readings holds what IFS may be, beside the variable itself
+
+
+def _ifs(env: dict) -> tuple:
+    """What the shell may split words at: space, tab and newline where IFS is not set, and where
+    it may be not known, None: also where part of it is (`IFS=$(...)`)."""
+    if "IFS" not in env and "IFS" not in os.environ:
+        return (" \t\n",)
+    return tuple(dict.fromkeys(None if v is None or _OPAQUE in v else v for v in _values(env, "IFS")))
+
+
+_NAME_CHAR = re.compile(r"[A-Za-z0-9._~/+@%-]")  # what _pieces takes for part of a file name
+_HEX_ESCAPE = r"|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|(.))"
+# A backslash escape as bash reads it in printf's format (\056), in a %b argument (\0056, \056)
+# and in echo -e (\0056 only)
+_ESCAPES = {"format": re.compile(r"\\(?:([0-7]{1,3})" + _HEX_ESCAPE, re.S),
+            "%b": re.compile(r"\\(?:(0[0-7]{0,3}|[1-7][0-7]{0,2})" + _HEX_ESCAPE, re.S),
+            "echo": re.compile(r"\\(?:(0[0-7]{0,3})" + _HEX_ESCAPE, re.S)}
+_ESCAPED = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+            "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _unescape(text: str, escape: re.Pattern, cut: bool = False) -> str:
+    """text with the backslash escapes of one of _ESCAPES turned into the characters they
+    stand for. cut: up to the first \\c, after which %b and echo -e print nothing."""
+    out, at = [], 0
+    for m in escape.finditer(text):
+        out.append(text[at:m.start()])
+        at = m.end()
+        octal, hexa, short, long, other = m.groups()
+        if other == "c" and cut:
+            return "".join(out)
+        if other is not None:
+            out.append(_ESCAPED.get(other, m.group()))
+            continue
+        try:
+            out.append(chr(int(octal, 8) if octal is not None else int(hexa or short or long, 16)))
+        except (ValueError, OverflowError):
+            out.append(m.group())
+    return "".join(out) + text[at:]
+
+
+def _received(text: str) -> list[str]:
+    """What a variable may be given of printed text: no shell value holds a NUL, so read and
+    $(...) leave it out (`.cl\\0aude` is .claude); and read without -r takes a backslash off
+    the character after it, and with a line break off both (`\\/` is /, #74)."""
+    forms = [text, re.sub(r"\\(.)", lambda m: "" if m.group(1) == "\n" else m.group(1), text, flags=re.S)] \
+        if "\\" in text else [text]
+    return list(dict.fromkeys(f for form in forms for f in (form, form.replace("\0", ""))))
+
+
+def _printed(text: str) -> list[str]:
+    """What a variable may be given of a text the command prints (_received): the text, and
+    where it has a backslash, what printf and echo -e print of it (\\n is a line break, \\056 a
+    dot), also up to a \\c, where they stop (`printf %b '/\\cfoo'` prints /, #74)."""
+    forms = [text] + [_unescape(text, e, cut) for e in _ESCAPES.values() for cut in (False, True)] \
+        if "\\" in text else [text]
+    return list(dict.fromkeys(f for form in dict.fromkeys(forms) for f in _received(form)))
+
+
+_PRINTF = re.compile(r"(%%)|%([-+ #0]*)(\*|[0-9]*)(?:\.(\*|[0-9]*))?[hjlLtz]*(\([^)]*\))?(.?)"
+                     r"|(\\(?:[0-7]{1,3}|x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|.)?)|([^%\\]+)", re.S)
+
+
+def _printf(args: list[str]) -> list[str]:
+    """What printf prints given args, as bash 5.2 prints it: its format with the escapes in it,
+    each directive given the next argument, and the format again while arguments are left
+    (`printf '%s%s\\n' .cl aude` prints .claude). %b reads escapes as echo -e does, and a \\c
+    there ends all output; %c and a precision print part of an argument (`%.1s` of /x is /). A
+    number that cannot be read is 0, a time is now, an invalid directive ends the output. Where
+    the format has \\c, also what coreutils printf prints, which ends there."""
+    while args[:1] and args[0].startswith("-v"):  # -v NAME: printed into a variable
+        args = args[1 if len(args[0]) > 2 else 2:]
+    args = args[args[:1] == ["--"]:]
+    if not args:
+        return []
+    outs = []
+    for stop in (False, True) if "\\c" in args[0] else (False,):
+        out, left, size, done = [], list(args[1:]), 0, False
+
+        def take() -> str:
+            return left.pop(0) if left else ""
+        while not done:
+            before = len(left)
+            for m in _PRINTF.finditer(args[0]):
+                percent, flags, width, precision, when, conv, escape, text = m.groups()
+                if percent or text is not None:
+                    out.append(text or "%")
+                    continue
+                if escape is not None:
+                    if escape == "\\c" and stop:
+                        done = True
+                        break
+                    out.append(_unescape(escape, _ESCAPES["format"]))
+                    continue
+                if not conv or conv not in "sbqQcdiouxXeEfFgGaAT" or (when is not None) != (conv == "T"):
+                    done = True  # bash: an invalid format character, and nothing more is printed
+                    break
+                w = _number(take(), False) if width == "*" else int(width or 0)
+                p = (_number(take(), False) if precision == "*" else int(precision or 0)) \
+                    if precision is not None else None
+                flags += "-" * (w < 0)
+                w, p = min(abs(w), 4096), None if p is None or p < 0 else min(p, 4096)
+                if conv in "sqQc":
+                    s = take()
+                    s = s[:1] if conv == "c" else re.sub(r"([^A-Za-z0-9_./:@%+,=-])", r"\\\1", s) \
+                        if conv in "qQ" else s
+                elif conv == "b":
+                    arg = take()
+                    s = _unescape(arg, _ESCAPES["%b"], cut=True)
+                    done = s != _unescape(arg, _ESCAPES["%b"])  # a \c: nothing more is printed
+                elif conv == "T":
+                    take()
+                    try:
+                        s = time.strftime(when[1:-1] or "%X")
+                    except ValueError:
+                        s = when[1:-1]
+                else:
+                    s = _number_text(flags, w, p, conv, _number(take(), conv in "eEfFgGaA"))
+                if p is not None and conv in "sbqQT":
+                    s = s[:p]
+                if conv not in "diouxXeEfFgGaA":
+                    s = s.ljust(w) if "-" in flags else s.rjust(w)
+                out.append(s)
+                size += len(s)
+                if size > 100_000:
+                    raise ValueError("printf prints more than can be read")
+                if done:
+                    break
+            done = done or not left or len(left) == before
+        outs.append("".join(out))
+    return list(dict.fromkeys(outs))
+
+
+def _number(arg: str, real: bool) -> int | float:
+    """The number printf reads in arg: a character's code after a quote, an integer in C's
+    bases (0x1f, 017), or a real number. 0 where it reads none."""
+    s = arg.lstrip()
+    if s[:1] in ("'", '"'):
+        return ord(s[1]) if len(s) > 1 else 0
+    m = re.match(r"[-+]?(?:(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?|inf|nan)", s, re.I) if real else \
+        re.match(r"[-+]?(?:0[xX][0-9A-Fa-f]+|0[0-7]*|[1-9][0-9]*)", s)
+    if not m:
+        return 0.0 if real else 0
+    if real:
+        return float(m.group())
+    digits = m.group().lstrip("+-")
+    value = int(digits, 16) if digits[:2] in ("0x", "0X") else int(digits, 8) if digits[0] == "0" else int(digits)
+    return -value if m.group().startswith("-") else value
+
+
+def _number_text(flags: str, width: int, precision: int | None, conv: str, value: int | float) -> str:
+    """value as printf's directive % flags width .precision conv prints it."""
+    try:
+        if conv in "aA":
+            text = float(value).hex()
+            return text.upper() if conv == "A" else text
+        if conv in "ouxX" and value < 0:
+            value += 1 << 64
+        spec = "%" + flags + (str(width) if width else "") + ("." + str(precision) if precision is not None else "")
+        text = (spec + {"i": "d", "u": "d"}.get(conv, conv)) % value
+        return text.replace("0o", "0", 1) if conv == "o" else text
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
+def _pieces(text: str, breaks: set[str] | frozenset = frozenset(), forms: list[str] | None = None) -> list[str]:
+    """The words text may be split into where what IFS holds is not known here: at spaces and at
+    any character that is not part of a file name. Nothing where it has none of them. The same
+    of each of forms, by default what a variable may be given where the text is printed
+    (_printed); of what printf has printed, what a variable may be given of it (_received).
+
+    breaks: characters the command may also split at (Command.breaks). There a word is cut too,
+    and what follows each one is a word as well: read gives its last variable the rest of the
+    line (`IFS=x read a b <<< notesx.claude` gives b .claude, #74).
+
+    Only slashes are a word where the start or the end of the text or one of the breaks is on
+    each side, past the spaces and tabs read takes off: that is the root a read or a split gives
+    (`IFS=x read a b <<< notesx/`, `read a b <<< 'x /'`). Not elsewhere (`read a <<< 'x / y'`,
+    `s|/|-|`): no read or split the command runs gives it there."""
+    edge = "[" + "".join(re.escape(ch) for ch in sorted(breaks)) + "]" if breaks else None
+    root = re.compile(rf"(?:\A|(?<={edge}))[ \t]*(/+)[ \t]*(?={edge}|\Z)" if edge else r"\A[ \t]*(/+)[ \t]*\Z")
+    pieces, roots, count = [], [], 0
+    for form in _printed(text) if forms is None else forms:
+        for run in re.split(r"[^A-Za-z0-9._~/+@%-]+", form):
+            pieces.append(run)
+            cuts = [i for i, ch in enumerate(run) if ch in breaks]
+            count += len(cuts)
+            if count > 2000:
+                raise ValueError("a text split at more places than can be read")
+            if cuts:
+                pieces += re.split(edge, run)
+                pieces += [run[i + 1:] for i in cuts]
+        roots += [m.group(1) for m in root.finditer(form)]
+    pieces = list(dict.fromkeys([p for p in pieces if p.strip("/")] + roots))
+    return [] if pieces == [text] else pieces
+
+
+def _fields(text: str, ifs: str | None, quoted: bool) -> list[str]:
+    """The words the shell makes of text by splitting what stands between _FIELD and _FIELD_END
+    at the characters of ifs. A run of spaces, tabs and newlines in ifs is one break and makes no
+    word at either end; any other character of ifs ends a word, an empty one too, and the spaces
+    around it go with it. An empty ifs splits nothing. Nothing left is no word, unless part of it
+    was quoted. Where ifs is not known (None), which words there are cannot be told."""
+    if ifs is None:
+        if re.search(_FIELD + "[^" + _FIELD_END + "]", text):
+            raise ValueError("a value split at characters that are not known (IFS)")
+        ifs = ""
+    words: list[str] = []
+    word: list[str] = []
+    begun = after_space = inside = False
+    for ch in text:
+        if ch in (_FIELD, _FIELD_END):
+            inside = ch == _FIELD
+        elif inside and ch in ifs and ch in " \t\n":
+            if begun:
+                words.append("".join(word))
+                word, begun, after_space = [], False, True
+        elif inside and ch in ifs:
+            if not after_space:
+                words.append("".join(word))
+            word, begun, after_space = [], False, False
+        else:
+            word.append(ch)
+            begun, after_space = True, False
+    if begun:
+        words.append("".join(word))
+    return words or ([""] if quoted else [])
 
 
 def _wider(arg: str, env: dict) -> list[str]:
@@ -1352,7 +1730,7 @@ class _Frame:
 
 
 def read(cmd: str, cwd: str = "") -> Command:
-    cmd = cmd.replace("\0", "").replace(_MARK, "").replace(_OPAQUE, "")
+    cmd = "".join(ch for ch in cmd if ch not in ("\0", _MARK, _OPAQUE, _FIELD, _FIELD_END))
     # The hook runs in the environment Claude Code gives its commands, so a variable set there
     # has the value the command saw (_values). Only what neither that nor the command itself sets is unknown.
     out, env = _shell(cmd, cwd, {"HOME": (os.path.expanduser("~"),), "PWD": (cwd,)}, 0)
@@ -1360,6 +1738,21 @@ def read(cmd: str, cwd: str = "") -> Command:
     used = {a or b for a, b in _VAR.findall(visible)}
     unset = used - set(env) - set(os.environ) | used & {"_"}  # $_: never known (_values)
     out.dynamic = bool(_DYNAMIC.search(visible) or unset)
+    # read, mapfile and readarray give variables words of what they read, which may be any text
+    # the command prints: each word it may be split into is a path the command names (#74). So
+    # are the words a value not known may be split into at IFS (`touch $(echo '.claude x')`).
+    # What a program prints may differ from its words: escapes, a \c, a NUL (_printed), and
+    # printf's format, which joins or cuts them (_printf). The whole of each, without the line
+    # breaks $(...) takes off its end, is a path the command names too (`"$(printf '%b' '/\c')"`).
+    splits = out.breaks or any(os.path.basename(argv[0]) in ("read", "mapfile", "readarray") for argv in out.programs)
+    for argv, dirs in zip(list(out.programs), list(out.program_dirs)):
+        texts = [(a, _printed(a)) for a in argv[1:]]
+        texts += [(p, _received(p)) for p in (_printf(argv[1:]) if os.path.basename(argv[0]) == "printf" else [])]
+        named = {f.rstrip("\n") for text, forms in texts for f in forms} - set(argv[1:]) - {""}
+        if splits:
+            named |= {p for text, forms in texts for p in _pieces(text, out.breaks, forms)}
+        for piece in named:
+            _note_paths(piece, dirs, out.paths, out.globs)
     # The home that a script a shell or ssh runs names does not make that shell a change only if
     # the script cannot hand it to anything this does not read (_closed). A script made only of
     # programs that read cannot; what it prints can, through a file the command writes or a pipe
@@ -1413,6 +1806,7 @@ def _add(out: Command, there: Command) -> None:
                       (out.assigned, there.assigned)):
         mine.extend(its)
     out.piping = out.piping or there.piping
+    out.breaks |= there.breaks
     out.writes |= there.writes
     out.paths |= there.paths
     out.globs += there.globs
@@ -1496,11 +1890,11 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             env = env_in(f)
             for word in words:
                 env = expand(word, env)
-            readings = _readings(words, env)
+            readings = _readings(words, env, split=words[0] != "case", breaks=out.breaks)  # case WORD is not split
             for argv in readings:
                 for arg in argv[1:2] if argv[0] == "case" else argv[3:]:  # case WORD in, for NAME in WORDS
                     _note_paths(arg.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
-            if words[0] != "case" and len(words) > 1 and re.fullmatch(r"[A-Za-z_]\w*", words[1]):
+            if words[0] != "case" and len(words) > 1 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", words[1]):
                 # NAME holds each word in turn; without `in`, each argument the shell was given
                 each = [a for argv in readings for a in argv[3:]] if words[2:3] == ["in"] else [None]
                 env = {**env, words[1]: tuple(dict.fromkeys(each)) or (None,)}
@@ -1603,13 +1997,14 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         if word.array is not None:
             for element in word.array:
                 env = expand(element, env)
-            values = tuple(dict.fromkeys(r[0] for e in word.array for r in _readings([e], env))) or ("",)
+            values = tuple(dict.fromkeys(f for e in word.array for r in _readings([e], env) for f in r)) or ("",)
         else:
             if expanding:
                 env = expand(value, env)
-            values = tuple(dict.fromkeys(r[0] for r in _readings([value], env)))
+            values = tuple(dict.fromkeys(r[0] for r in _readings([value], env, split=False)))
         for v in values:
-            _note_paths(v.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
+            for piece in [v, *_pieces(v)]:  # and each word the shell may split it into (#74)
+                _note_paths(piece.replace(_LITERAL, "$"), out.dirs, out.paths, out.globs)
         if plus and not index and word.array is None:  # p+=x: x after each value p may hold, and after ${p}
             values = tuple(dict.fromkeys((old if old is not None else "$" + _OPAQUE + "{" + name + "}") + v
                                          for old in _values(env, name) for v in values))
@@ -1640,7 +2035,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             elif word.array is not None or _ASSIGN_PARTS.fullmatch(word):
                 name, values, env = assign(word, env, False)
                 declared[name] = values
-            elif builtin in ("local", "declare", "typeset") and re.fullmatch(r"[A-Za-z_]\w*", word):
+            elif builtin in ("local", "declare", "typeset") and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
                 declared[word] = _merge(_values(env, word), (None,))  # in a function: a variable of its own
         return {**{name: values for name, values in env.items() if before.get(name) is not values}, **declared}
 
@@ -1659,14 +2054,19 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 env = {**env, m.group(1): _merge(_values(env, m.group(1)), (m.group(4),))}
         return env
 
-    def sets(argv: list[str], env: dict) -> dict:
+    def sets(argv: list[str], env: dict, scope: dict) -> dict:
         """read, mapfile, getopts, printf -v, wait -p, unset: variables given values the command
-        does not show. A name that is not known (`read "$x"`) may be any variable's."""
+        does not show. A name that is not known (`read "$x"`) may be any variable's. Where read
+        ends a value, at the characters of IFS as it runs (scope), at a line break or the
+        delimiter of -d, a word of what it reads ends: they are among out.breaks (#74). Where
+        they are not known, which words it gives cannot be told."""
         program, args = argv[0], _operands(argv)[1:]
         if program in ("mapfile", "readarray") and any(a.startswith("-") and "C" in a for a in args):
             raise ValueError("a callback the shell runs")
         valued = {"read": "adinNptu", "mapfile": "dnOsuc", "readarray": "dnOsuc", "printf": "v", "wait": "p"}
         naming = {"read": "a", "printf": "v", "wait": "p"}  # options whose value is a variable
+        ifs = list(_ifs(scope)) if program == "read" else []
+        ends = ["\n"] if program in ("read", "mapfile", "readarray") else []
         named, operands, k = [], [], 0
         while k < len(args):
             a, k = args[k], k + 1
@@ -1679,8 +2079,21 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 if letter in valued.get(program, ""):
                     if letter in naming.get(program, ""):
                         named.append(a[j:] or (args[k] if k < len(args) else ""))
+                    if letter == "d" and program in ("read", "mapfile", "readarray"):  # -d '': at a NUL
+                        ends.append(a[j:] or (args[k] if k < len(args) else "") or "\0")
+                    if letter in "nN" and program == "read":  # read -n 1 a <<< /x gives /
+                        raise ValueError("a read of a number of characters, which may end anywhere")
                     k += not a[j:]
                     break
+        for chars in ifs + ends:
+            if chars is None or "$" in chars or _OPAQUE in chars:
+                raise ValueError("a read that ends words at characters that are not known")
+        # A read into one name does not split the line: it takes off the spaces, tabs and
+        # newlines of IFS at either end, and one other character of IFS at the end (`IFS=x read
+        # a <<< /x` gives /). Into more, or an array, it splits at each character of IFS.
+        words = bool(named) or len(operands) > 1 or any("$" in a or _OPAQUE in a for a in operands)
+        out.breaks.update(ch for chars in ends for ch in chars)
+        out.breaks.update(ch for chars in ifs for ch in chars if words or ch not in " \t\n")
         if program == "read":
             names = named + operands or ["REPLY"]
         elif program in ("mapfile", "readarray"):
@@ -1695,7 +2108,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         for name in names:
             if "$" in name:
                 return _unknown(env)
-            m = re.match(r"[A-Za-z_]\w*", name)
+            m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", name)
             if m:
                 env[m.group(0)] = (None,) if program == "unset" else _merge(_values(env, m.group(0)), (None,))
         return env
@@ -1757,7 +2170,8 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
             return made[0]
         written = all(_as_written(w) for w in command)
         return _union(*[run(argv, env, scope, child, declared, bool(assigns), written)
-                        for argv in _readings(command + redirects, env, envs)])
+                        for argv in _readings(command + redirects, env, envs, split=command[0] != "[[",
+                                              breaks=out.breaks)])
 
     def run(argv: list[str], start: dict, scope: dict, child, declared: dict | None, prefixed: bool,
             written: bool = False) -> dict:
@@ -1765,6 +2179,8 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         words is one word as written, with nothing in it the shell expands (_as_written)."""
         while len(argv) > 1 and argv[0] == "":  # a variable that holds nothing, unquoted, is no word
             argv = argv[1:]
+        if not argv:  # nothing left to run (`$empty`): the assignments in front stay in this shell
+            return _union(start, scope) if prefixed else start
         builtin = _builtin(argv)
         name, after = (builtin[0] if builtin else ""), start
         if prefixed and os.path.basename(name) in _SPECIAL_BUILTINS:
@@ -1774,7 +2190,7 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
         if name in _DECLARE:
             after = declared_as_run(builtin, after)
         elif name in _SETS:
-            after = sets(builtin, after)
+            after = sets(builtin, after, scope)
         elif name in _LEAVES:
             leave(name)
         elif name == "trap":
@@ -1892,6 +2308,9 @@ def _walk(toks: list[_Token], runs: list[str], ctx: _Context, env: dict, depth: 
                 out.paths |= named
                 carried.update(p for p in named if under(home, p))
                 paths.update(p for p in named if not under(home, p))
+            if raw[i - 1] == "<<<":  # what read makes of a here-string or a here-document (#74)
+                for piece in _pieces(raw[i]):
+                    _note_paths(piece, out.dirs, out.paths, out.globs)
             if ">" in raw[i - 1] and set(raw[i - 1]) <= _REDIRECT_CHARS and not (
                     raw[i - 1].endswith("&") and (raw[i].isdigit() or raw[i] == "-")):  # 2>&1 writes no file
                 for target in expand_braces(raw[i]):
@@ -2297,7 +2716,7 @@ def _plain_name(name: str) -> bool:
 
 def _plain(env: dict) -> bool:
     """Whether every variable in env is one a program does not take instructions from (_PLAIN)."""
-    return all(_plain_name(name) for name in env if re.fullmatch(r"[A-Za-z_]\w*", name))
+    return all(_plain_name(name) for name in env if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
 
 
 def _closed(closed: list[bool], assigned: list[str], *texts: str) -> bool:
@@ -2316,7 +2735,7 @@ def resolve(name: str, dirs: list[str]) -> list[str]:
     return [canonical(name, d) for d in dirs]
 
 
-_OPERAND = re.compile(r"\$\{!?[A-Za-z_]\w*(?:\[[^\]]*\])?(:?[-=+?]|/[/#%]?|##?|%%?)([^{}]*)\}")
+_OPERAND = re.compile(r"\$\{!?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?(:?[-=+?]|/[/#%]?|##?|%%?)([^{}]*)\}")
 
 
 def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
