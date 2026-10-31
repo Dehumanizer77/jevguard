@@ -379,7 +379,7 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
         if under(path, released) or shell.glob_reaches(path, released):
             return "the directory of originals the owner released (the agent reads those unscanned)"
         if above(path):
-            return "a directory that holds the guard's files or an agent's hooks"
+            return "a directory above the guard's files or an agent's hooks"
         return "a file an agent's hooks are set in (the hooks that run the guard)"
 
     # Every reason names the program and the exact path that set it off. The person asked to
@@ -410,7 +410,7 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
             if any(under(path, r) for r in keys):
                 return f"{tool} reads {_show(path)}, one of the guard's own files (the API key is kept there)"
             if tool == "Grep" and any(under(r, path) for r in keys):
-                return f"{tool} searches {_show(path)}, which holds the guard's own files (the API key is kept there)"
+                return f"{tool} searches {_show(path)}, which is above the guard's own files (the API key is kept there)"
         return ""
     if tool in ("WebFetch", "WebSearch"):
         return ""
@@ -480,7 +480,7 @@ def guard_change(tool: str, tool_input: dict, cfg, cwd: str = "") -> str:
         hit = next((p for p in sorted(paths) if above(p)), None) or \
             next((g for g in globs if any(shell.glob_reaches_above(g, t) for t in targets) or _holds_hooks(g)), None)
         if hit:
-            return (f"`{program}` {_names(argv, hit, given)} {_show(hit)}, a directory that holds the guard's files "
+            return (f"`{program}` {_names(argv, hit, given)} {_show(hit)}, a directory above the guard's files "
                     "or an agent's hooks, and it is not a program that only reads")
     return ""
 

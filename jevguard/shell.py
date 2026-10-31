@@ -2740,7 +2740,8 @@ _OPERAND = re.compile(r"\$\{!?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?(:?[-=+?]|/[/
 
 def _note_paths(arg: str, dirs: list[str], paths: set, globs: list) -> None:
     """Record the paths one argument names, and those in what an expansion left in it may give:
-    `${p/#0/x}` and `${p:+x}` on a value that is not known may be x."""
+    `${p/#0/x}` and `${p:+x}` on a value that is not known may be x. Also inside a text given to
+    a program: a script may hand it to a shell (`os.system("tar -C ${x:-~} ...")`, #85)."""
     arg = arg.replace(_OPAQUE, "")
     for m in _OPERAND.finditer(arg):
         for operand in m.group(2).split("/", 1) if m.group(1)[0] == "/" else [m.group(2)]:
