@@ -78,8 +78,9 @@ another agent its adapter translates them.
    two parts scored and nothing else, the address also with its `%` escapes decoded. A notice
    with a word added, another prompt or a second address is scored whole, as before.
 
-Every scan is one line in `~/.local/state/jevguard/scans.jsonl`: tool, origin, verdict, score,
-size, timing, a hash. The log never holds the content.
+Every scan is one line in `~/.local/state/jevguard/scans.jsonl` (in a
+[system installation](#system-installation), `/var/lib/jevguard/scans.jsonl`): tool, origin,
+verdict, score, size, timing, a hash. The log never holds the content.
 
 **PreToolUse** (before a tool runs)
 
@@ -91,7 +92,10 @@ Two checks read the call itself and use no model:
   Claude Code `settings*.json`, the hook files the guard installs into for the other agents,
   and each agent's own switches for hooks (`~/.grok/disabled-hooks` and Grok's `*.toml`,
   `~/.codex/config.toml`, `~/.copilot/config.json`, `~/.hermes/config.yaml`), in the home
-  directory and in a project. That holds whether the
+  directory and in a project; and the system files of a
+  [system installation](#system-installation): `/etc/claude-code/managed-settings.json` and
+  the drop-ins beside it, `/etc/codex/requirements.toml`, `/etc/jevguard` and the service's
+  units. That holds whether the
   file is named directly, by glob or brace expansion (`rm ~/.claude/settings*.json`),
   through a directory above it (`rm -rf ~/.claude`, `mv ~/.grok/hooks x`), or as the place a command writes to in
   any spelling (`curl -o/path`, `--output-dir` with `-O`, `cd` there and download,
@@ -253,6 +257,75 @@ shows nothing for such a session, restart Claude Code. From then on, a call made
 Code that would change the guard (`jevguard mode`, an update, an edit to `settings.json`) asks
 the owner for approval.
 
+### System installation
+
+`sudo jevguard setup-system --user NAME --agent claude --agent codex` installs the guard out of
+the reach of the user the agents run as (`--user`). The steps are in the
+[README](../README.md#system-installation). This is what it changes:
+
+| What | Where | Owner, mode |
+|---|---|---|
+| code | where root cloned it, e.g. `/opt/jevguard`; setup refuses it unless every directory and file in it, `.git` included, and every directory above it is root's and writable by root alone, with no link in it | root |
+| settings | `/etc/jevguard/config.json`, and `/etc/jevguard/system.json` naming the code and the owners | root, 644 |
+| API key | `/etc/jevguard/typesafe.key` | root:jevguard, 640 |
+| seal key, scan log, quarantine, release list, the sessions' state | `/var/lib/jevguard` | jevguard, 700 |
+| released originals | `/var/lib/jevguard-released` | jevguard, 755, files 644 |
+| Claude Code's hooks and, in `block` mode, its shell prefix | `/etc/claude-code/managed-settings.json`; other keys in it stay | root, 644 |
+| Codex's hooks | `/etc/codex/requirements.toml`, with `[features] hooks = true`; a file there that jevguard did not write is left alone | root, 644 |
+| the service | `jevguard.socket` (`/run/jevguard/hook.sock`) and `jevguard.service` in `/etc/systemd/system` | runs as jevguard |
+| the command | `/usr/local/bin/jevguard` | link |
+
+Claude Code reads its managed settings above every other settings file. A `disableAllHooks`
+in the user's or a project's settings does not reach the hooks there. Codex runs hooks from
+its requirements without the review step, and `[features] hooks = false` in the user's
+`config.toml` does not switch them off.
+
+The hook still runs as the agent's user, so that it reads the files the agent reads. What
+needs the key or the guard's state it has the service do over the socket:
+- a scan;
+- a seal;
+- the reads and writes of the log, the quarantine, the release list and the sessions' state.
+
+When the service cannot answer:
+- a scan is a failure, and `on_error` decides;
+- a read gives the stricter answer: nothing released, no wrapper mark.
+
+The service answers root and the owners named in `system.json`, by the credentials the kernel
+gives for the socket. Other processes of an owner can reach it as the hook does, so it takes
+only what a hook would give it:
+- it counts the tokens of its own scans;
+- it prunes the sessions' state at its own age;
+- it keeps a quarantined result only with the digest of its own text.
+
+It does no release, discard or change of settings. Those are the owner's commands, run as
+root, and for the state they go on as the user jevguard.
+
+Setup also:
+- brings over the settings, key, quarantine, release list and log of an installation in the
+  owner's home, where the system has none yet. It reads them in a process that runs as the
+  owner, not as root, and without following links.
+- checks for each agent, as the owner, that the guard works for it:
+  - the system settings hold hooks covering every tool the owner's own hooks covered, waited for and given their time;
+  - nothing at the managed level switches them off (`disableAllHooks`, in block mode another shell prefix);
+  - the hook runs;
+  - the service answers with a key.
+- only for those agents, takes the guard's hooks and shell prefix out of the owner's own
+  settings (`~/.claude/settings.json`, `~/.codex/hooks.json`), so that they do not run twice.
+  For any other agent they stay, and setup ends with an error saying why.
+- gives Grok hooks of its own first, if it is there: Grok runs the hooks in
+  `~/.claude/settings.json` as well.
+- prints the old copies in the owner's home, which the agent can still read, for the owner to
+  remove.
+
+Run it again after each update. It changes only what is not as it should be, and restarts the
+service. `sudo jevguard remove-system` takes the hooks out of the system settings and stops the
+service. The settings, the key, the state and the code stay, and the agents then run without
+the guard.
+
+`bin/jevguard-shell` takes the user's `SHELL` only when `/etc/shells` lists it, since hooks run
+in the environment the agent's user sets. What a system installation does not stop is under
+[What it does not cover](#what-it-does-not-cover).
+
 ## Everyday use
 
 ```bash
@@ -269,6 +342,10 @@ jevguard own 'acme/*' solo/tool                  # your own GitHub repositories 
 jevguard mode block             # start withholding; `jevguard mode log` to go back
 jevguard gate ask-flagged       # ask before risky actions once something was flagged
 ```
+
+In a [system installation](#system-installation) each of these runs as root: `sudo jevguard
+log`, `sudo jevguard release fw-…`. Without sudo they say so and do nothing. Released
+originals are then in `/var/lib/jevguard-released/`.
 
 When a result is withheld, Claude says the source was blocked and names a quarantine id
 (`fw-…`). If you think it was harmless, read it with `jevguard show <id>` and, if so, run
@@ -423,6 +500,9 @@ depends on what that agent lets a hook do:
 
 How to put the guard into each of them is in the [README](../README.md#install), step 4. Settings, log,
 quarantine and release are the same for all of them: one `jevguard status`, one `jevguard log`.
+A [system installation](#system-installation) covers Claude Code and Codex only, the two with
+system settings for hooks that the user's own settings cannot switch off. For the others the
+installation in the home stays as it is.
 
 - **Grok** also runs the hooks in `~/.claude/settings.json`, so with the guard installed for
   Claude Code it is started by Grok too and recognises it. Installing for Grok as well gives it
@@ -436,7 +516,8 @@ quarantine and release are the same for all of them: one `jevguard status`, one 
   `decision: "block"`, Codex puts the hook's words in place of the tool's result, so the guard
   hands it the notice that way. The hook runs outside Codex's sandbox, so this holds whatever
   the sandbox allows the command. Where the guard would ask, the call is refused with the
-  reason. Codex runs a hook only after you have reviewed it (`/hooks`).
+  reason. Codex runs a hook only after you have reviewed it (`/hooks`), except the hooks of a
+  [system installation](#system-installation), which come from its requirements.
 - **Cursor** and **Copilot CLI** adapters are written from the documentation and have not been
   run against the programs. Cursor lets a hook replace only MCP results, so there a shell
   command whose output the guard would look at is rewritten to run through `bin/jevguard-run`,
@@ -454,7 +535,10 @@ quarantine and release are the same for all of them: one `jevguard status`, one 
 
 ## Settings
 
-`~/.config/jevguard/config.json`; every key is optional. Defaults and their reasons are in
+`~/.config/jevguard/config.json`, or `/etc/jevguard/config.json` in a
+[system installation](#system-installation), where only root changes it (`sudo jevguard mode
+block`, or an edit followed by `sudo jevguard setup-system ...` when a change concerns the
+hooks). Every key is optional. Defaults and their reasons are in
 [`jevguard/config.py`](../jevguard/config.py).
 
 | Key | Default | |
@@ -476,7 +560,7 @@ quarantine and release are the same for all of them: one `jevguard status`, one 
 | `daily_token_budget` | 5,000,000 | scanning stops for the day beyond this |
 | `model` | `jev-1.13.0` | pinned; the thresholds were fitted on this version |
 | `url` | `https://api.typesafe.ai/v1/systemone` | where the text is sent for scoring |
-| `key_file` | `~/.config/jevguard/typesafe.key` | the file holding the API key |
+| `key_file` | `~/.config/jevguard/typesafe.key` | the file holding the API key; in a system installation always `/etc/jevguard/typesafe.key` |
 
 Everything that is scanned is sent to TypeSafe. The defaults keep local files, private-network
 fetches and the private connectors out of that; each switch above widens it.
@@ -538,13 +622,25 @@ fetches and the private connectors out of that; each switch above widens it.
   benign items blocked on its 718-item test set, through Venice with `jev-latest`; those numbers
   have not been re-measured through this code path.
 - An agent that sets out to get around it. The agent runs as the same operating-system user
-  as you. The checks before a call read the command as written, so a command that hides what
-  it does (encoded, or put in a script first) is not recognised, and anything the agent can
-  run can also edit the guard's files or fake a terminal. To make the guard's files a real
-  boundary, take them away from that user: run Claude Code in its
-  [sandbox](https://code.claude.com/docs/en/sandboxing) with `~/.config/jevguard`,
-  `~/.local/state/jevguard`, the checkout and `~/.claude/settings.json` denied for writing, or
-  make them root-owned so that changing them takes `sudo`.
+  as you. The checks before a call read the command as written. A command that hides what it
+  does is not recognised: encoded, put in a script first, or working a path out at run time
+  (`tar -C "$(dirname /x)"`, a name read from a file). In an installation in the home,
+  anything the agent can run can also edit the guard's files or fake a terminal.
+  The [system installation](#system-installation) takes the guard's files, its settings and
+  the hooks that run it away from that user. It still does not stop:
+  - a user that is root in all but name: in the `docker` or `disk` group, or with sudo that
+    asks for no password;
+  - a process of that user that may ptrace the agent and its hooks (`kernel.yama.ptrace_scope`
+    0) and change what they do;
+  - other processes of that user asking the service what the hook asks it: a text scored or
+    sealed, a session's record of outside content added to, a wrapper's mark left;
+  - `LD_PRELOAD` and the like set in the user's settings `env`, which reach the hook;
+  - Claude Code settings an organization sends from its servers: Claude Code then does not
+    read the managed settings file at all (`/status` names the source).
+
+  Claude Code's [sandbox](https://code.claude.com/docs/en/sandboxing), with the guard's
+  directories and `~/.claude/settings.json` denied for writing, is another way to take them
+  away from the agent.
 
 ## Tests
 
@@ -556,7 +652,10 @@ tests/e2e_codex.py              # the same against Codex CLI (optionally: a sand
 ```
 
 The first needs pytest (`python3-pytest`) and, for one image test, Pillow; neither needs the
-API key or the network. The others start the real agent (`claude -p`, `grok -p`, `codex exec`)
+API key or the network. Its system installation tests (`tests/test_system_install.py`) run the
+service in the test process on a socket of their own and the hook as a system installation's
+hook. Setup is run there with root, systemd and the accounts stood in for: `setup-system`
+itself, as root, is not tested. The others start the real agent (`claude -p`, `grok -p`, `codex exec`)
 with temporary hooks and a stand-in scoring API, so each needs that agent logged in and costs a
 few cents of usage, but no API key and no installation of the guard. The Codex one puts a
 `~/.codex/hooks.json` in place while it runs and refuses to start if you have one.
