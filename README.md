@@ -195,7 +195,23 @@ installation above stays as it is.
 ### Set it up
 
 ```bash
-sudo git clone https://github.com/Dehumanizer77/jevguard /opt/jevguard
+sudo sh -c 'umask 022 && git clone https://github.com/Dehumanizer77/jevguard /opt/jevguard'
+sudo bash /opt/jevguard/install.sh
+```
+
+`install.sh` does the whole installation:
+- it brings the clone to the newest `main` (`--ref` for another branch, tag or commit);
+- it runs `jevguard setup-system` for the user who ran sudo (`--user` for another), for Claude Code and, if that user has a `~/.codex`, for Codex (`--agent` to choose);
+- it asks for the API key if setup found none to bring over;
+- it runs `status` and `selftest`, and says what to do next.
+
+`bash /opt/jevguard/install.sh --dry-run` says what it would do. The script deletes nothing.
+It runs only from a place only root can write: a copy downloaded into a home directory could be
+changed by the agent between the download and sudo.
+
+Without the script, the same is:
+
+```bash
 sudo /opt/jevguard/bin/jevguard setup-system --user "$USER" --agent claude --agent codex
 ```
 
@@ -213,7 +229,7 @@ It does the following:
 - only for the agents where it does, takes the guard's hooks out of the user's own settings, so that they do not run twice. Other hooks there stay. For any other agent they stay too, and setup ends with an error saying why;
 - if Grok is there, gives it hooks of its own (`~/.grok/hooks/jevguard.json`) first, since it runs the hooks in `~/.claude/settings.json` as well.
 
-Without a key from an earlier installation, put one in place (the owner types this, not an agent):
+Without a key from an earlier installation, and without the script, put one in place (the owner types this, not an agent):
 
 ```bash
 sudo sh -c 'umask 027; cat > /etc/jevguard/typesafe.key' && sudo chgrp jevguard /etc/jevguard/typesafe.key
@@ -234,7 +250,8 @@ read; remove them once the system installation works.
 Every owner's command now runs with sudo: `sudo jevguard mode block`, `sudo jevguard log`,
 `sudo jevguard release <id>`.
 
-Update with `sudo git -C /opt/jevguard pull --ff-only` and the same `setup-system` line.
+Update with `sudo bash /opt/jevguard/install.sh`, or with `sudo git -C /opt/jevguard pull --ff-only`
+and the same `setup-system` line.
 `sudo jevguard remove-system` takes the hooks out of the system settings and stops the service.
 It leaves `/etc/jevguard`, `/var/lib/jevguard`, `/var/lib/jevguard-released`, `/opt/jevguard` and
 the user `jevguard` for you to delete.
