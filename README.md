@@ -27,6 +27,9 @@ under [What it does not cover](docs/REFERENCE.md#what-it-does-not-cover).
 The steps below are the ones used for the first installation (Debian 12, Claude Code 2.1.295,
 Python 3.11). macOS should work and has not been tried; Windows needs WSL.
 
+This installs the guard in your home directory. To put it out of the agent's reach instead
+(Claude Code and Codex), see [System installation](#system-installation).
+
 Steps 1 to 3 are done once, whichever agents the guard is for. Step 4 puts the hooks into an
 agent, one command per agent. Settings, log and quarantine are shared by all of them.
 
@@ -250,7 +253,8 @@ the user `jevguard` for you to delete.
 - [How it works](docs/REFERENCE.md#how-it-works): what counts as outside content, how a result
   is scored and replaced, and the checks before a call.
 - [Installation details](docs/REFERENCE.md#installation-details): what `install` changes in
-  each agent, and the shell prefix Claude Code gets in `block` mode.
+  each agent, the shell prefix Claude Code gets in `block` mode, and what a
+  [system installation](docs/REFERENCE.md#system-installation) changes.
 - [Everyday use](docs/REFERENCE.md#everyday-use): the commands, releasing a withheld result,
   trusted addresses and your own GitHub repositories.
 - [Other agents](docs/REFERENCE.md#other-agents): what each agent lets the guard do.
