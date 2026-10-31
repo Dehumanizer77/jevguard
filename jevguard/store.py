@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import json
 import os
 import re
@@ -17,6 +18,39 @@ from pathlib import Path
 _MAX_LOG = 20 * 1024 * 1024
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
 QID = re.compile(r"fw-\d{8}-[0-9a-f]{6}")
+# What a hook of a system installation has the service do (service.py): the reads and writes of a
+# hook. Not release, discard or the release list's ids: those are the owner's, run as root. Not
+# usage_add: the service counts the tokens of the scans it makes itself, so that no other process
+# can spend the day's budget or pause the scanner, and with it every scan.
+REMOTE = ("audit", "quarantine", "judged", "released", "released_artifact", "session", "session_update",
+          "prune_sessions", "usage", "scanner_available")
+
+
+_RAISE = object()
+
+
+def _by_service(result=None, failed=_RAISE):
+    """In a hook of a system installation (cfg.service) the files are the service's, and it does
+    this with them. result: what the answer is made into on this side. failed: what a read gives
+    when the service cannot be asked, as the function gives for a file it cannot read: the
+    stricter answer (nothing released, no mark). Without it the error is raised, as an OSError."""
+    def wrap(fn):
+        assert fn.__name__ in REMOTE
+
+        @functools.wraps(fn)
+        def run(cfg, *args, **kwargs):
+            client = getattr(cfg, "service", None)
+            if client is None:
+                return fn(cfg, *args, **kwargs)
+            try:
+                out = client.call(fn.__name__, *args, **kwargs)
+            except OSError:
+                if failed is _RAISE:
+                    raise
+                return failed
+            return result(out) if result else out
+        return run
+    return wrap
 
 
 def _private_dir(p: Path) -> Path:
@@ -74,6 +108,7 @@ class _locked:
             os.close(self.lock)
 
 
+@_by_service()
 def audit(cfg, **rec) -> None:
     """One JSON line per scan. Never the content."""
     path = cfg.scan_log
@@ -98,6 +133,7 @@ def content_hash(text: str, images: list) -> str:
     return h.hexdigest()
 
 
+@_by_service()
 def quarantine(cfg, tool: str, tool_input: dict, raw, verdict: dict, digest: str,
                text: str | None = None, images: list = ()) -> str:
     """Keep a withheld result. raw is the result as the agent gave it; text and images are what
@@ -125,6 +161,7 @@ def printed(text) -> str:
     return hashlib.sha256("".join(str(text or "").split()).encode("utf-8", "replace")).hexdigest()[:32]
 
 
+@_by_service(failed=False)
 def judged(cfg, session: str, command: str, mark: bool = False, output: str = "") -> bool:
     """Whether a wrapper (`jevguard-run`, `jevguard-shell`) has judged what this command printed.
     The wrapper leaves a mark when it has (mark=True); the agent's hook after the call asks, and
@@ -154,6 +191,7 @@ def judged(cfg, session: str, command: str, mark: bool = False, output: str = ""
         return False
 
 
+@_by_service(frozenset, failed=frozenset())
 def released(cfg) -> frozenset:
     """Content hashes the owner released after reading the quarantined original."""
     try:
@@ -204,7 +242,8 @@ def release(cfg, qid: str) -> tuple[str, list[Path]]:
             kind = next((ext for magic, ext in _IMAGE_TYPES if image.startswith(magic)), "bin")
             contents[cfg.released_dir / f"{qid}-{n}.{kind}"] = image
         for path, data in contents.items():
-            _write_private(path, data)
+            # In a system installation the copies are the service user's, and the agent's user reads them.
+            _write_private(path, data, 0o644 if getattr(cfg, "system", None) else 0o600)
         # The record of what was written goes into the closed state directory. Being in the released
         # directory exempts nothing by itself; matching this record does.
         with _locked(cfg.released_manifest) as manifest:
@@ -279,13 +318,14 @@ def discard(cfg, qid: str) -> dict:
     return did
 
 
-def _write_private(path: Path, data: bytes) -> None:
+def _write_private(path: Path, data: bytes, mode: int = 0o600) -> None:
     """Write a new file and move it into place in one step. The name was known to the agent
     before the release (the notice gives it), so something may already sit there: a link planted
     to send the original elsewhere is replaced, never followed."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.replace(tmp, path)
@@ -294,6 +334,7 @@ def _write_private(path: Path, data: bytes) -> None:
         raise
 
 
+@_by_service(failed=False)
 def released_artifact(cfg, path: str) -> bool:
     """The file is one the owner's release command wrote, and it still holds what was written:
     its name is in the record, it is a plain file in the released directory, and the hash of the
@@ -321,6 +362,7 @@ def _session_file(cfg, session_id: str) -> Path:
 UNREADABLE_SESSION = {"external": 1, "flagged": 1, "flagged_reason": "session state was unreadable"}
 
 
+@_by_service()
 def session(cfg, session_id: str) -> dict:
     """What the session has seen. Raises ValueError or OSError for a file that exists but cannot
     be read: that is not an empty session, and callers decide what the unknown costs them."""
@@ -333,6 +375,7 @@ def session(cfg, session_id: str) -> dict:
     return data
 
 
+@_by_service()
 def session_update(cfg, session_id: str, *, paths: list = (), external: bool = False,
                    flagged: str = "", tasks: list = ()) -> None:
     """tasks: background tasks whose command was outside content. What they print is that too,
@@ -349,6 +392,7 @@ def session_update(cfg, session_id: str, *, paths: list = (), external: bool = F
             s["flagged_reason"] = flagged
 
 
+@_by_service(failed=None)
 def prune_sessions(cfg, days: int = 14) -> None:
     cutoff = time.time() - days * 86400
     try:
@@ -362,6 +406,7 @@ def prune_sessions(cfg, days: int = 14) -> None:
 
 # ---- daily token budget and the pause after an API failure ----
 
+@_by_service(failed={})
 def usage(cfg) -> dict:
     try:
         return json.loads(cfg.usage_file.read_text())
@@ -369,6 +414,7 @@ def usage(cfg) -> dict:
         return {}
 
 
+@_by_service()
 def scanner_available(cfg) -> str:
     """Empty when scanning may go ahead, else the reason it may not."""
     u = usage(cfg)
