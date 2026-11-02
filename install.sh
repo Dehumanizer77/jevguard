@@ -8,8 +8,8 @@
 #
 # Not from a copy in a home directory: the agent runs as that user, and could change the script
 # between the download and sudo. Run from such a place, it refuses. So it does for a clone that
-# anyone but root could write, .git included, before git runs in it: git takes programs to run
-# from there, and root would run them.
+# anyone but root could write, .git included, or whose .git holds anything `git clone` does not
+# put there, before git runs in it: git takes programs to run from there, and root would run them.
 #
 # It puts the code in /opt/jevguard (a clone only root can write), runs
 # `jevguard setup-system` for the user the agents run as (the one who ran sudo), asks for the
@@ -87,6 +87,36 @@ check_tree() {
     fi
 }
 
+# The clone's .git holds what `git clone` puts there and nothing else. What it may name can lead
+# out of the tree check_tree has looked at, to a file others may write (#92, include.path), or
+# run a program (uploadpack, core.hooksPath, core.sshCommand, ...). Git has many such settings
+# and gets more, so what is allowed is listed, not what is not. Read without following includes;
+# `git config --file` runs nothing of what it reads.
+check_git() {
+    local g=$1/.git line bad list
+    bad=$(find -P "$g" -mindepth 1 -maxdepth 1 ! -name HEAD ! -name config ! -name description ! -name hooks \
+        ! -name info ! -name logs ! -name objects ! -name refs ! -name index ! -name packed-refs ! -name ORIG_HEAD \
+        ! -name FETCH_HEAD ! -name branches ! -name gc.log ! -name gc.pid -print -quit)
+    [ -z "$bad" ] || die "$bad is not what git clone makes, so git was not run in $1; clone the code anew as root"
+    bad=$(find -P "$g/hooks" -mindepth 1 ! -name '*.sample' -print -quit)
+    [ -z "$bad" ] || die "$bad is a hook git would run as root, so git was not run in $1; clone the code anew as root"
+    bad=$(find -P "$g/info" "$g/objects/info" -mindepth 1 ! -name exclude ! -name refs ! -name packs \
+        ! -name 'commit-graph*' ! -name 'multi-pack-index*' -print -quit)
+    [ -z "$bad" ] || die "$bad is not what git clone makes, so git was not run in $1; clone the code anew as root"
+    list=$(git config --file "$g/config" --no-includes --list) || die "$g/config could not be read"
+    while IFS= read -r line; do
+        case "$line" in
+            core.repositoryformatversion=0|core.filemode=true|core.filemode=false|core.bare=false) continue ;;
+            core.logallrefupdates=true|'remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*') continue ;;
+            "remote.origin.url=$repo") continue ;;
+        esac
+        if [[ $line =~ ^branch\.[^=]+\.remote=origin$ ]] || [[ $line =~ ^branch\.[^=]+\.merge=refs/heads/[^[:space:]]+$ ]]; then
+            continue
+        fi
+        die "$g/config sets ${line%%=*}, which git clone does not, so git was not run in $1; clone the code anew as root"
+    done <<< "$list"
+}
+
 # This script, as it was called and as it resolves: whoever could write there could have changed
 # what root is running now.
 check_self() {
@@ -161,10 +191,9 @@ check_chain "$dir"
 jevguard="$dir/bin/jevguard"
 if [ -e "$dir" ]; then check_tree "$dir"; fi
 if [ -d "$dir/.git" ]; then
-    # A .git that takes its settings from elsewhere is not what check_tree has looked at.
-    [ ! -e "$dir/.git/commondir" ] || die "$dir/.git takes its settings from another directory (commondir)"
+    check_git "$dir"
     echo "updating $dir"
-    git -C "$dir" fetch --quiet --tags origin
+    git -C "$dir" fetch --quiet --tags --no-recurse-submodules origin
 else
     [ ! -e "$dir" ] || die "$dir is there and is not a clone of jevguard"
     echo "cloning $repo into $dir"
@@ -176,6 +205,7 @@ else
     git -C "$dir" checkout --quiet --detach "$ref"
 fi
 check_tree "$dir"
+check_git "$dir"
 echo "code at $(git -C "$dir" log -1 --format='%h %s')"
 
 # ---- the installation -------------------------------------------------------------------------

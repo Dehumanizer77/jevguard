@@ -264,8 +264,10 @@ the reach of the user the agents run as (`--user`). The steps are in the
 [README](../README.md#system-installation). There `install.sh` does them: it brings a clone only
 root can write to the ref asked for, runs setup-system, asks for the API key if setup found none,
 and runs `status` and `selftest`. It deletes nothing. It refuses to run from anywhere the agent's
-user could have changed it, and refuses a clone, `.git` included, that anyone but root could
-write, before git runs in it, as git takes programs to run from `.git`. It clears what root would
+user could have changed it. Before git runs in the clone, it refuses one that anyone but root
+could write, `.git` included, or whose `.git` holds anything `git clone` does not put there: a
+setting, a hook, alternates. Git takes programs to run from `.git`, and its config can lead to
+files outside it, so what is allowed is listed. It clears what root would
 otherwise take from the caller's environment (`PATH`, `HOME`, `GIT_*`, `LD_*`). This is what
 setup-system changes:
 

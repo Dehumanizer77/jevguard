@@ -209,8 +209,9 @@ sudo bash /opt/jevguard/install.sh
 
 It runs only from a place only root can write: a copy downloaded into a home directory could be
 changed by the agent between the download and sudo. Before git runs in the clone, it checks that
-the clone, `.git` included, and every directory above it are root's and writable by root alone:
-git takes programs to run from `.git`. It clears what root would otherwise take from the caller's
+the clone, `.git` included, and every directory above it are root's and writable by root alone,
+and that `.git` holds only what `git clone` puts there: git takes programs to run from `.git`, and
+its config can lead to files outside it. It clears what root would otherwise take from the caller's
 environment (`PATH`, `HOME`, `GIT_*`, `LD_*`). Without sudo, run it from `su -`, not `su -c`: the
 shell that starts the script already reads that environment.
 
@@ -255,8 +256,8 @@ read; remove them once the system installation works.
 Every owner's command now runs with sudo: `sudo jevguard mode block`, `sudo jevguard log`,
 `sudo jevguard release <id>`.
 
-Update with `sudo bash /opt/jevguard/install.sh`, or with `sudo git -C /opt/jevguard pull --ff-only`
-and the same `setup-system` line.
+Update with `sudo bash /opt/jevguard/install.sh`, not with `git` by hand: the script looks at the
+clone before git runs in it as root.
 `sudo jevguard remove-system` takes the hooks out of the system settings and stops the service.
 It leaves `/etc/jevguard`, `/var/lib/jevguard`, `/var/lib/jevguard-released`, `/opt/jevguard` and
 the user `jevguard` for you to delete.
