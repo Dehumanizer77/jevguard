@@ -195,7 +195,29 @@ installation above stays as it is.
 ### Set it up
 
 ```bash
-sudo git clone https://github.com/Dehumanizer77/jevguard /opt/jevguard
+sudo sh -c 'umask 022 && git clone https://github.com/Dehumanizer77/jevguard /opt/jevguard'
+sudo bash /opt/jevguard/install.sh
+```
+
+`install.sh` does the whole installation:
+- it brings the clone to the newest `main` (`--ref` for another branch, tag or commit);
+- it runs `jevguard setup-system` for the user who ran sudo (`--user` for another), for Claude Code and, if that user has a `~/.codex`, for Codex (`--agent` to choose);
+- it asks for the API key if setup found none to bring over;
+- it runs `status` and `selftest`, and says what to do next.
+
+`bash /opt/jevguard/install.sh --dry-run` says what it would do. The script deletes nothing.
+
+It runs only from a place only root can write: a copy downloaded into a home directory could be
+changed by the agent between the download and sudo. Before git runs in the clone, it checks that
+the clone, `.git` included, and every directory above it are root's and writable by root alone,
+and that `.git` holds only what `git clone` puts there: git takes programs to run from `.git`, and
+its config can lead to files outside it. It clears what root would otherwise take from the caller's
+environment (`PATH`, `HOME`, `GIT_*`, `LD_*`). Without sudo, run it from `su -`, not `su -c`: the
+shell that starts the script already reads that environment.
+
+Without the script, the same is:
+
+```bash
 sudo /opt/jevguard/bin/jevguard setup-system --user "$USER" --agent claude --agent codex
 ```
 
@@ -213,7 +235,7 @@ It does the following:
 - only for the agents where it does, takes the guard's hooks out of the user's own settings, so that they do not run twice. Other hooks there stay. For any other agent they stay too, and setup ends with an error saying why;
 - if Grok is there, gives it hooks of its own (`~/.grok/hooks/jevguard.json`) first, since it runs the hooks in `~/.claude/settings.json` as well.
 
-Without a key from an earlier installation, put one in place (the owner types this, not an agent):
+Without a key from an earlier installation, and without the script, put one in place (the owner types this, not an agent):
 
 ```bash
 sudo sh -c 'umask 027; cat > /etc/jevguard/typesafe.key' && sudo chgrp jevguard /etc/jevguard/typesafe.key
@@ -234,7 +256,8 @@ read; remove them once the system installation works.
 Every owner's command now runs with sudo: `sudo jevguard mode block`, `sudo jevguard log`,
 `sudo jevguard release <id>`.
 
-Update with `sudo git -C /opt/jevguard pull --ff-only` and the same `setup-system` line.
+Update with `sudo bash /opt/jevguard/install.sh`, not with `git` by hand: the script looks at the
+clone before git runs in it as root.
 `sudo jevguard remove-system` takes the hooks out of the system settings and stops the service.
 It leaves `/etc/jevguard`, `/var/lib/jevguard`, `/var/lib/jevguard-released`, `/opt/jevguard` and
 the user `jevguard` for you to delete.
@@ -242,6 +265,7 @@ the user `jevguard` for you to delete.
 ### What it does not stop
 
 - **A user that is root in all but name.** If the agent's user is in the `docker` or `disk` group, or can use sudo without a password, it can still change all of this.
+- **Your own terminal.** The agent's user can edit that user's `~/.bashrc`, and the shell in which you type `sudo` reads it: a `sudo` defined there gets your password. Type root's commands somewhere that user cannot change, such as a console login as root, if the agent may be working against you.
 - **ptrace.** With `kernel.yama.ptrace_scope` at 0, a process of the agent's user can attach to the agent and to its hooks, and change what they do. Set it to 1 to stop that.
 - **Asking the service.** The socket answers the agent's other processes as it answers the hook. They can have a text scored or sealed, add to a session's record of outside content, or leave the mark a shell wrapper leaves for output it judged. The service keeps its files from being read or changed, but not from being asked. It does refuse what a hook never sends: a count of tokens, a prune of every session, a quarantined result whose digest is not that of its text.
 - **The user's own settings `env`.** That block still reaches the hook's environment. `jevguard-shell` takes `SHELL` only when `/etc/shells` lists it, but a variable such as `LD_PRELOAD` set there is loaded into the hook.

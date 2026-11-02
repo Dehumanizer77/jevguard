@@ -404,6 +404,7 @@ def setup_env(tmp_path, monkeypatch):
     (home / ".claude").mkdir(parents=True)
     (home / ".codex").mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", os.environ["PATH"])                         # setup sets its own; put back after the test
     for name, path in (("CONFIG_DIR", "etc/jevguard"), ("STATE_DIR", "var/lib/jevguard"),
                        ("RELEASED_DIR", "var/lib/jevguard-released"), ("UNITS", "etc/systemd/system"),
                        ("CLAUDE_MANAGED", "etc/claude-code/managed-settings.json"),
