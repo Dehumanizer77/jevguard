@@ -263,8 +263,11 @@ the owner for approval.
 the reach of the user the agents run as (`--user`). The steps are in the
 [README](../README.md#system-installation). There `install.sh` does them: it brings a clone only
 root can write to the ref asked for, runs setup-system, asks for the API key if setup found none,
-and runs `status` and `selftest`. It refuses to run from anywhere the agent's user could have
-changed it, and deletes nothing. This is what setup-system changes:
+and runs `status` and `selftest`. It deletes nothing. It refuses to run from anywhere the agent's
+user could have changed it, and refuses a clone, `.git` included, that anyone but root could
+write, before git runs in it, as git takes programs to run from `.git`. It clears what root would
+otherwise take from the caller's environment (`PATH`, `HOME`, `GIT_*`, `LD_*`). This is what
+setup-system changes:
 
 | What | Where | Owner, mode |
 |---|---|---|
@@ -633,6 +636,8 @@ fetches and the private connectors out of that; each switch above widens it.
   the hooks that run it away from that user. It still does not stop:
   - a user that is root in all but name: in the `docker` or `disk` group, or with sudo that
     asks for no password;
+  - that user's `~/.bashrc`, read by the shell in which you type `sudo`: a `sudo` defined there
+    gets your password;
   - a process of that user that may ptrace the agent and its hooks (`kernel.yama.ptrace_scope`
     0) and change what they do;
   - other processes of that user asking the service what the hook asks it: a text scored or
@@ -658,8 +663,8 @@ The first needs pytest (`python3-pytest`) and, for one image test, Pillow; neith
 API key or the network. Its system installation tests (`tests/test_system_install.py`) run the
 service in the test process on a socket of their own and the hook as a system installation's
 hook. Setup is run there with root, systemd and the accounts stood in for: `setup-system`
-itself, as root, is not tested. `tests/test_install_script.py` runs `install.sh` up to the
-point where it would change anything: its dry run, and what it refuses. The others start the real agent (`claude -p`, `grok -p`, `codex exec`)
+itself, as root, is not tested. `tests/test_install_script.py` runs `install.sh` with what only
+root has stood in for: git runs in real fixtures, with a stand-in for the code. The others start the real agent (`claude -p`, `grok -p`, `codex exec`)
 with temporary hooks and a stand-in scoring API, so each needs that agent logged in and costs a
 few cents of usage, but no API key and no installation of the guard. The Codex one puts a
 `~/.codex/hooks.json` in place while it runs and refuses to start if you have one.

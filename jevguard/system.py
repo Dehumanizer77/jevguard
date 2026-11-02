@@ -44,6 +44,8 @@ CLAUDE_MANAGED = Path("/etc/claude-code/managed-settings.json")
 CODEX_REQUIREMENTS = Path("/etc/codex/requirements.toml")
 COMMAND_LINK = Path("/usr/local/bin/jevguard")
 _OURS = "# Written by jevguard setup-system, which rewrites this file. Add nothing here: it would be lost.\n"
+# Where root finds useradd and systemctl: not on a PATH `su` kept from the agent's user (#92).
+_ROOT_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 def settings() -> dict | None:
@@ -534,6 +536,7 @@ def setup(owner: str, agents: list[str], report=print) -> int:
     if os.geteuid() != 0:
         report("setup-system has to be run as root: sudo jevguard setup-system --user NAME")
         return 1
+    os.environ["PATH"] = _ROOT_PATH
     problems = check_code()
     if problems:
         report("the code is not out of the agent's reach, so nothing was installed:")
@@ -612,6 +615,7 @@ def remove(report=print) -> int:
     if os.geteuid() != 0:
         report("remove-system has to be run as root")
         return 1
+    os.environ["PATH"] = _ROOT_PATH
     try:
         current = json.loads(CLAUDE_MANAGED.read_text())
     except (OSError, ValueError):

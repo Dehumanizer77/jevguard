@@ -7,7 +7,9 @@
 #   bash /opt/jevguard/install.sh --dry-run        say what it would do, and do nothing
 #
 # Not from a copy in a home directory: the agent runs as that user, and could change the script
-# between the download and sudo. Run from such a place, it refuses.
+# between the download and sudo. Run from such a place, it refuses. So it does for a clone that
+# anyone but root could write, .git included, before git runs in it: git takes programs to run
+# from there, and root would run them.
 #
 # It puts the code in /opt/jevguard (a clone only root can write), runs
 # `jevguard setup-system` for the user the agents run as (the one who ran sudo), asks for the
@@ -42,9 +44,64 @@ JEVGUARD_USAGE_END
 
 die() { echo "install.sh: $*" >&2; exit 1; }
 
+root_uid=0
+am_root() { [ "$EUID" -eq 0 ]; }
+
+# Root takes nothing from the environment it was started in: su keeps the caller's, and sudo may
+# keep HOME. A program found on the agent's user's PATH, or git reading that user's ~/.gitconfig
+# (core.sshCommand, core.fsmonitor, ...), would run as root (#92).
+clean_environment() {
+    local v
+    for v in $(compgen -e); do
+        case "$v" in GIT_*|LD_*|PYTHON*|BASH_ENV|ENV|XDG_*) unset "$v" ;; esac
+    done
+    export PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+    cd /
+}
+
+# The path, or as much of it as exists, and every directory above it: root's, and writable by
+# root alone. A link is judged by its owner: its own mode means nothing, and what it points to
+# is checked by giving this the resolved path as well.
+check_chain() {
+    local p=$1 uid mode
+    while [ ! -e "$p" ] && [ ! -L "$p" ]; do p=$(dirname "$p"); done
+    while :; do
+        read -r uid mode < <(stat -c '%u %a' "$p")
+        if [ "$uid" -ne "$root_uid" ] || { [ ! -L "$p" ] && [ $((8#$mode & 8#022)) -ne 0 ]; }; then
+            die "$p is not root's alone (owner $uid, mode $mode); clone the code as root and run its install.sh (see the top of the script)"
+        fi
+        if [ "$p" = / ]; then break; fi
+        p=$(dirname "$p")
+    done
+}
+
+# Everything in the directory, .git included: root's, writable by root alone, and no link. As
+# system.check_code does, but here, before git runs in it or anything of it is run: git takes
+# programs to run from .git/config and .git/hooks, and root would run them (#92).
+check_tree() {
+    local bad
+    bad=$(find -P "$1" \( -type l -o ! -uid "$root_uid" -o -perm /022 \) -printf '%p (owner %U, mode %m, type %y)' -quit) \
+        || die "$1 could not be read whole"
+    if [ -n "$bad" ]; then
+        die "$bad is not root's alone, so nothing was run from $1 (git takes programs to run from its .git); clone the code anew as root"
+    fi
+}
+
+# This script, as it was called and as it resolves: whoever could write there could have changed
+# what root is running now.
+check_self() {
+    local self=${BASH_SOURCE[0]:-}
+    [ -f "$self" ] || die "run it from a file in a clone only root can write, not from a pipe (see the top of the script)"
+    case "$self" in /*) ;; *) self=$PWD/$self ;; esac
+    check_chain "$self"
+    check_chain "$(readlink -f "$self")"
+}
+
 # All of it in one function, read whole before it runs: updating the clone may replace this
 # very file while it runs.
 main() {
+local start=$PWD
+if am_root; then clean_environment; cd "$start"; fi
 while [ $# -gt 0 ]; do
     case "$1" in
         --user) owner=${2:?--user needs a name}; shift 2 ;;
@@ -59,6 +116,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$dir" in /*) ;; *) die "--dir takes an absolute path" ;; esac
+case "$ref" in -*) die "--ref takes a branch, tag or commit" ;; esac
 [ -n "$owner" ] || die "name the user the agents run as: --user NAME"
 [ "$owner" != root ] || die "the user the agents run as is not root: --user NAME"
 home=$(getent passwd "$owner" | cut -d: -f6) || die "no user $owner"
@@ -86,28 +144,25 @@ if $dry; then
     exit 0
 fi
 
-[ "$(id -u)" -eq 0 ] || die "run it as root: sudo bash install.sh"
-# This script, and every directory above it, root's and writable by root alone: else whoever
-# could write there could have changed what root is running now.
-self=${BASH_SOURCE[0]:-}
-[ -f "$self" ] || die "run it from a file in a clone only root can write, not from a pipe (see the top of the script)"
-p=$(readlink -f "$self")
-while :; do
-    read -r uid mode < <(stat -c '%u %a' "$p")
-    if [ "$uid" -ne 0 ] || [ $((8#$mode & 8#022)) -ne 0 ]; then
-        die "$p is not root's alone; clone the code as root and run its install.sh (see the top of the script)"
-    fi
-    [ "$p" = / ] && break
-    p=$(dirname "$p")
-done
+am_root || die "run it as root: sudo bash install.sh"
+check_self
+cd /
 for tool in git systemctl getent; do
     command -v "$tool" >/dev/null || die "$tool is needed"
 done
-/usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
+/usr/bin/python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null \
     || die "/usr/bin/python3 has to be 3.11 or newer"
 
 # ---- the code: a clone only root can write ----------------------------------------------------
+# Checked before git runs in it, and again before anything of it is run.
+check_chain "$dir"
+dir=$(readlink -m "$dir")
+check_chain "$dir"
+jevguard="$dir/bin/jevguard"
+if [ -e "$dir" ]; then check_tree "$dir"; fi
 if [ -d "$dir/.git" ]; then
+    # A .git that takes its settings from elsewhere is not what check_tree has looked at.
+    [ ! -e "$dir/.git/commondir" ] || die "$dir/.git takes its settings from another directory (commondir)"
     echo "updating $dir"
     git -C "$dir" fetch --quiet --tags origin
 else
@@ -120,6 +175,7 @@ if git -C "$dir" rev-parse --quiet --verify "refs/remotes/origin/$ref" >/dev/nul
 else
     git -C "$dir" checkout --quiet --detach "$ref"
 fi
+check_tree "$dir"
 echo "code at $(git -C "$dir" log -1 --format='%h %s')"
 
 # ---- the installation -------------------------------------------------------------------------
@@ -170,5 +226,8 @@ fi
 echo "To update later: sudo bash $dir/install.sh"
 }
 
-main "$@"
-exit
+# Read as a library only by its tests. From a pipe there is no file name, and main refuses.
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+    main "$@"
+    exit
+fi

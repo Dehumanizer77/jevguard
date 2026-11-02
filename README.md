@@ -206,8 +206,13 @@ sudo bash /opt/jevguard/install.sh
 - it runs `status` and `selftest`, and says what to do next.
 
 `bash /opt/jevguard/install.sh --dry-run` says what it would do. The script deletes nothing.
+
 It runs only from a place only root can write: a copy downloaded into a home directory could be
-changed by the agent between the download and sudo.
+changed by the agent between the download and sudo. Before git runs in the clone, it checks that
+the clone, `.git` included, and every directory above it are root's and writable by root alone:
+git takes programs to run from `.git`. It clears what root would otherwise take from the caller's
+environment (`PATH`, `HOME`, `GIT_*`, `LD_*`). Without sudo, run it from `su -`, not `su -c`: the
+shell that starts the script already reads that environment.
 
 Without the script, the same is:
 
@@ -259,6 +264,7 @@ the user `jevguard` for you to delete.
 ### What it does not stop
 
 - **A user that is root in all but name.** If the agent's user is in the `docker` or `disk` group, or can use sudo without a password, it can still change all of this.
+- **Your own terminal.** The agent's user can edit that user's `~/.bashrc`, and the shell in which you type `sudo` reads it: a `sudo` defined there gets your password. Type root's commands somewhere that user cannot change, such as a console login as root, if the agent may be working against you.
 - **ptrace.** With `kernel.yama.ptrace_scope` at 0, a process of the agent's user can attach to the agent and to its hooks, and change what they do. Set it to 1 to stop that.
 - **Asking the service.** The socket answers the agent's other processes as it answers the hook. They can have a text scored or sealed, add to a session's record of outside content, or leave the mark a shell wrapper leaves for output it judged. The service keeps its files from being read or changed, but not from being asked. It does refuse what a hook never sends: a count of tokens, a prune of every session, a quarantined result whose digest is not that of its text.
 - **The user's own settings `env`.** That block still reaches the hook's environment. `jevguard-shell` takes `SHELL` only when `/etc/shells` lists it, but a variable such as `LD_PRELOAD` set there is loaded into the hook.
